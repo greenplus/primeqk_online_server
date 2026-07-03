@@ -988,6 +988,86 @@ def find_prime_realizations(
     limit: int = ASSIST_REALIZATIONS_PER_NUMBER,
 ) -> List[dict]:
     text = str(number)
+    rank_counts = [0] * 14
+    available_jokers = 0
+    for card in source_cards:
+        if card.get("is_joker") or card.get("suit") == "X":
+            available_jokers += 1
+            continue
+        try:
+            rank = int(card.get("rank"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= rank <= 13:
+            rank_counts[rank] += 1
+
+    rank_options = tuple(
+        (str(rank), rank)
+        for rank, count in enumerate(rank_counts)
+        if count > 0
+    )
+    joker_options = tuple(str(value) for value in range(14))
+    impossible = len(source_cards) + 1
+
+    @lru_cache(maxsize=None)
+    def min_jokers_to_match(
+        index: int,
+        counts: tuple[int, ...],
+        jokers_left: int,
+        used_count: int,
+    ) -> int:
+        if required_card_count is not None:
+            if used_count > required_card_count:
+                return impossible
+            if used_count + (len(text) - index) < required_card_count:
+                return impossible
+            if used_count + sum(counts) + jokers_left < required_card_count:
+                return impossible
+        if index == len(text):
+            if required_card_count is None or used_count == required_card_count:
+                return 0
+            return impossible
+
+        best = impossible
+        for option, rank in rank_options:
+            if counts[rank] <= 0 or not text.startswith(option, index):
+                continue
+            next_counts = list(counts)
+            next_counts[rank] -= 1
+            best = min(
+                best,
+                min_jokers_to_match(
+                    index + len(option),
+                    tuple(next_counts),
+                    jokers_left,
+                    used_count + 1,
+                ),
+            )
+
+        if jokers_left > 0:
+            for option in joker_options:
+                if not text.startswith(option, index):
+                    continue
+                tail = min_jokers_to_match(
+                    index + len(option),
+                    counts,
+                    jokers_left - 1,
+                    used_count + 1,
+                )
+                if tail != impossible:
+                    best = min(best, 1 + tail)
+
+        return best
+
+    minimum_joker_count = min_jokers_to_match(
+        0,
+        tuple(rank_counts),
+        available_jokers,
+        0,
+    )
+    if minimum_joker_count == impossible:
+        return []
+
     used: list[dict] = []
     assigned_by_card_id: dict[str, str] = {}
     results: list[dict] = []
@@ -1003,6 +1083,9 @@ def find_prime_realizations(
         return tuple(pattern)
 
     def collect_result() -> None:
+        joker_count = assist_joker_count(used)
+        if joker_count != minimum_joker_count:
+            return
         pattern = card_pattern()
         if pattern in seen_patterns:
             return
@@ -1018,11 +1101,13 @@ def find_prime_realizations(
             "cards": cards,
             "assigned_numbers": assigned_numbers,
             "visible_text": assist_card_text(cards, assigned_numbers),
-            "joker_count": assist_joker_count(cards),
+            "joker_count": joker_count,
         })
 
-    def visit(index: int, remaining: list[dict]) -> None:
+    def visit(index: int, remaining: list[dict], used_joker_count: int = 0) -> None:
         if len(results) >= limit:
+            return
+        if used_joker_count > minimum_joker_count:
             return
         if required_card_count is not None and len(used) > required_card_count:
             return
@@ -1045,12 +1130,17 @@ def find_prime_realizations(
             for option in options:
                 if not text.startswith(option, index):
                     continue
+                is_joker = card.get("is_joker") or card.get("suit") == "X"
                 used.append(card)
-                if card.get("is_joker") or card.get("suit") == "X":
+                if is_joker:
                     assigned_by_card_id[card["card_id"]] = option
                 next_remaining = remaining[:i] + remaining[i + 1:]
-                visit(index + len(option), next_remaining)
-                if card.get("is_joker") or card.get("suit") == "X":
+                visit(
+                    index + len(option),
+                    next_remaining,
+                    used_joker_count + (1 if is_joker else 0),
+                )
+                if is_joker:
                     assigned_by_card_id.pop(card["card_id"], None)
                 used.pop()
                 if len(results) >= limit:
@@ -1185,6 +1275,63 @@ def assist_efficiency_score(candidate: dict) -> float:
     card_count = max(1, len(candidate.get("cards") or []))
     return candidate["number"] / (10 ** (card_count - 1))
 
+def assist_redundant_joker_key(candidate: dict) -> Optional[tuple]:
+    cards = candidate.get("cards") or []
+    joker_count = candidate.get("joker_count", assist_joker_count(cards))
+    if joker_count <= 0:
+        return None
+    non_joker_ids = tuple(
+        card.get("card_id")
+        for card in cards
+        if not (card.get("is_joker") or card.get("suit") == "X")
+    )
+    if not non_joker_ids:
+        return None
+    return (
+        candidate.get("kind"),
+        joker_count,
+        non_joker_ids,
+    )
+
+def assist_joker_position_key(candidate: dict) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, card in enumerate(candidate.get("cards") or [])
+        if card.get("is_joker") or card.get("suit") == "X"
+    )
+
+def assist_redundant_joker_choice_key(candidate: dict, prefer_low_number: bool = False) -> tuple:
+    number = candidate.get("number", 0)
+    return (
+        -number if prefer_low_number else number,
+        tuple(-position for position in assist_joker_position_key(candidate)),
+        -len(candidate.get("cards") or []),
+        candidate.get("visible_text", ""),
+    )
+
+def deduplicate_redundant_joker_assist_candidates(
+    candidates: list[dict],
+    prefer_low_number: bool = False,
+) -> list[dict]:
+    indexed_candidates = list(enumerate(candidates))
+    best_by_key: dict[tuple, tuple[int, dict]] = {}
+    passthrough: list[tuple[int, dict]] = []
+    for index, candidate in indexed_candidates:
+        key = assist_redundant_joker_key(candidate)
+        if key is None:
+            passthrough.append((index, candidate))
+            continue
+        current = best_by_key.get(key)
+        if current is None or assist_redundant_joker_choice_key(
+            candidate,
+            prefer_low_number,
+        ) > assist_redundant_joker_choice_key(current[1], prefer_low_number):
+            best_by_key[key] = (index, candidate)
+
+    kept = passthrough + list(best_by_key.values())
+    kept.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in kept]
+
 def finalize_assist_candidates(
     candidates: list[dict],
     limit: int,
@@ -1192,7 +1339,12 @@ def finalize_assist_candidates(
     truncated: bool,
     scan_limit: Optional[int] = None,
     order: str = "weak",
+    prefer_low_number: bool = False,
 ) -> dict:
+    candidates = deduplicate_redundant_joker_assist_candidates(
+        candidates,
+        prefer_low_number=prefer_low_number,
+    )
     if order == "efficient":
         candidates = sorted(
             candidates,
@@ -1204,8 +1356,8 @@ def finalize_assist_candidates(
                 candidate.get("visible_text", ""),
             ),
         )
-        truncated = truncated or len(candidates) > limit
-        candidates = candidates[:limit]
+    truncated = truncated or len(candidates) > limit
+    candidates = candidates[:limit]
     payload = {"candidates": candidates, "truncated": truncated, "source": source}
     if scan_limit is not None:
         payload["scan_limit"] = scan_limit
@@ -1243,7 +1395,6 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
 
     count_scope = assist_filter_value(data, "count_scope", "field")
     order = assist_filter_value(data, "order", "weak")
-    defer_limit_until_sorted = order == "efficient"
     specified_card_count = assist_card_count_from_filters(data) if count_scope == "specified" else None
     required_card_count = None
     if room.field and count_scope == "field":
@@ -1281,6 +1432,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 truncated=True,
                 scan_limit=scan_limit,
                 order=order,
+                prefer_low_number=room.reverse_order,
             )
         realizations = find_prime_realizations(
             number,
@@ -1302,14 +1454,6 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
             )
             if kind != "composite":
                 candidates.append(realization)
-                if not defer_limit_until_sorted and len(candidates) >= limit:
-                    return finalize_assist_candidates(
-                        candidates,
-                        limit,
-                        source,
-                        truncated=True,
-                        order=order,
-                    )
                 continue
 
             material_pool = source_cards if source in ("selected", "unselected", "all") else player.hand
@@ -1324,14 +1468,6 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 expression["assigned_numbers"],
             )
             candidates.append(realization)
-            if not defer_limit_until_sorted and len(candidates) >= limit:
-                return finalize_assist_candidates(
-                    candidates,
-                    limit,
-                    source,
-                    truncated=True,
-                    order=order,
-                )
 
     return finalize_assist_candidates(
         candidates,
@@ -1339,6 +1475,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         source,
         truncated=False,
         order=order,
+        prefer_low_number=room.reverse_order,
     )
 ################################################
 # Webhook
