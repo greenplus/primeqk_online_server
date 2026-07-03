@@ -1365,12 +1365,19 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     selected_ids = data.get("selected_card_ids") or []
     if not isinstance(selected_ids, list):
         selected_ids = []
+    composite_ids = data.get("composite_card_ids") or []
+    if not isinstance(composite_ids, list):
+        composite_ids = []
 
     hand_by_id = {card["card_id"]: card for card in player.hand}
-    selected_id_set = {cid for cid in selected_ids if cid in hand_by_id}
+    selected_and_composite_ids = []
+    for cid in selected_ids + composite_ids:
+        if cid in hand_by_id and cid not in selected_and_composite_ids:
+            selected_and_composite_ids.append(cid)
+    selected_id_set = set(selected_and_composite_ids)
     target_scope = assist_filter_value(data, "target_scope", "auto")
     if target_scope == "selected":
-        source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
+        source_cards = [hand_by_id[cid] for cid in selected_and_composite_ids]
         source = "selected"
     elif target_scope == "unselected":
         source_cards = [card for card in player.hand if card["card_id"] not in selected_id_set]
@@ -1379,7 +1386,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         source_cards = player.hand[:]
         source = "all"
     else:
-        source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
+        source_cards = [hand_by_id[cid] for cid in selected_and_composite_ids]
         source = "selected" if source_cards else "unselected"
     if not source_cards and source != "selected":
         source_cards = player.hand[:]
