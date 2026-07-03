@@ -1275,22 +1275,14 @@ def assist_efficiency_score(candidate: dict) -> float:
     card_count = max(1, len(candidate.get("cards") or []))
     return candidate["number"] / (10 ** (card_count - 1))
 
-def assist_redundant_joker_key(candidate: dict) -> Optional[tuple]:
+def assist_duplicate_card_set_key(candidate: dict) -> Optional[tuple]:
     cards = candidate.get("cards") or []
-    joker_count = candidate.get("joker_count", assist_joker_count(cards))
-    if joker_count <= 0:
+    if not cards:
         return None
-    non_joker_ids = tuple(
-        card.get("card_id")
-        for card in cards
-        if not (card.get("is_joker") or card.get("suit") == "X")
-    )
-    if not non_joker_ids:
-        return None
+    card_ids = tuple(sorted(str(card.get("card_id")) for card in cards))
     return (
         candidate.get("kind"),
-        joker_count,
-        non_joker_ids,
+        card_ids,
     )
 
 def assist_joker_position_key(candidate: dict) -> tuple[int, ...]:
@@ -1300,7 +1292,7 @@ def assist_joker_position_key(candidate: dict) -> tuple[int, ...]:
         if card.get("is_joker") or card.get("suit") == "X"
     )
 
-def assist_redundant_joker_choice_key(candidate: dict, prefer_low_number: bool = False) -> tuple:
+def assist_duplicate_card_set_choice_key(candidate: dict, prefer_low_number: bool = False) -> tuple:
     number = candidate.get("number", 0)
     return (
         -number if prefer_low_number else number,
@@ -1309,7 +1301,7 @@ def assist_redundant_joker_choice_key(candidate: dict, prefer_low_number: bool =
         candidate.get("visible_text", ""),
     )
 
-def deduplicate_redundant_joker_assist_candidates(
+def deduplicate_duplicate_card_set_assist_candidates(
     candidates: list[dict],
     prefer_low_number: bool = False,
 ) -> list[dict]:
@@ -1317,15 +1309,15 @@ def deduplicate_redundant_joker_assist_candidates(
     best_by_key: dict[tuple, tuple[int, dict]] = {}
     passthrough: list[tuple[int, dict]] = []
     for index, candidate in indexed_candidates:
-        key = assist_redundant_joker_key(candidate)
+        key = assist_duplicate_card_set_key(candidate)
         if key is None:
             passthrough.append((index, candidate))
             continue
         current = best_by_key.get(key)
-        if current is None or assist_redundant_joker_choice_key(
+        if current is None or assist_duplicate_card_set_choice_key(
             candidate,
             prefer_low_number,
-        ) > assist_redundant_joker_choice_key(current[1], prefer_low_number):
+        ) > assist_duplicate_card_set_choice_key(current[1], prefer_low_number):
             best_by_key[key] = (index, candidate)
 
     kept = passthrough + list(best_by_key.values())
@@ -1341,7 +1333,7 @@ def finalize_assist_candidates(
     order: str = "weak",
     prefer_low_number: bool = False,
 ) -> dict:
-    candidates = deduplicate_redundant_joker_assist_candidates(
+    candidates = deduplicate_duplicate_card_set_assist_candidates(
         candidates,
         prefer_low_number=prefer_low_number,
     )
