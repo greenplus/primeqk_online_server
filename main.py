@@ -387,12 +387,6 @@ ROOM_CONFIG = [
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
-    ("event_1", PRESETS["half-7-1-c"], "Events"),
-    ("event_2", PRESETS["half-7-1-c"], "Events"),
-    ("event_3", PRESETS["half-7-1-c"], "Events"),
-    ("event_4", PRESETS["semiprime-11-1-c"], "Events"),
-    ("event_5", PRESETS["semiprime-11-1-c"], "Events"),
-    ("event_6", PRESETS["semiprime-11-1-c"], "Events"),
 ]
 ROOM_CATEGORY_DESCRIPTIONS = {
     "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。",
