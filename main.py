@@ -1387,6 +1387,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         source = "unselected"
 
     count_scope = assist_filter_value(data, "count_scope", "field")
+    kind_scope = assist_filter_value(data, "kind_scope", "all")
     order = assist_filter_value(data, "order", "weak")
     specified_card_count = assist_card_count_from_filters(data) if count_scope == "specified" else None
     required_card_count = None
@@ -1401,8 +1402,10 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
 
     candidates = []
     scanned = 0
-    registered_numbers = [("prime", number, None) for number in player.registered_primes]
-    if room.rule.allow_composite:
+    registered_numbers = []
+    if kind_scope in ("all", "prime"):
+        registered_numbers.extend(("prime", number, None) for number in player.registered_primes)
+    if room.rule.allow_composite and kind_scope in ("all", "composite"):
         registered_numbers.extend(
             ("composite", entry.value, entry)
             for entry in player.registered_composite_entries
@@ -1446,6 +1449,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 or len(realization["cards"]) == len(room.field)
             )
             if kind != "composite":
+                realization["finishes_hand"] = len(remove_cards_by_id(player.hand, realization["cards"])) == 0
                 candidates.append(realization)
                 continue
 
@@ -1460,6 +1464,8 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 expression["cards"],
                 expression["assigned_numbers"],
             )
+            used_cards = realization["cards"] + expression["cards"]
+            realization["finishes_hand"] = len(remove_cards_by_id(player.hand, used_cards)) == 0
             candidates.append(realization)
 
     return finalize_assist_candidates(

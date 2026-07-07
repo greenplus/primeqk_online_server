@@ -519,6 +519,47 @@ def parse_registered_composite_expression(expression: str) -> tuple[RegisteredCo
     return tuple(tokens)
 
 
+def generate_explicit_composite_expression_entries(
+    value: int,
+    pattern: str,
+    source_line: int,
+    expression: str,
+) -> tuple[RegisteredCompositeEntry, ...]:
+    expression_tokens = parse_registered_composite_expression(expression)
+    token_options: list[list[str]] = []
+
+    for token in expression_tokens:
+        if token.kind == "op":
+            token_options.append([token.text])
+            continue
+
+        options = [token.text]
+        if any(char in FACE_VALUES for char in token.text.lower()):
+            token_value = registered_number_pattern_value(token.text)
+            options.extend(
+                registered_cards_label(cards)
+                for cards in registered_value_encodings(token_value)
+            )
+        token_options.append(list(dict.fromkeys(options)))
+
+    entries = []
+    seen_expressions = set()
+    for parts in product(*token_options):
+        expanded_expression = "".join(parts)
+        normalized_expression = expanded_expression.lower()
+        if normalized_expression in seen_expressions:
+            continue
+        seen_expressions.add(normalized_expression)
+        entries.append(RegisteredCompositeEntry(
+            source_line=source_line,
+            pattern=pattern,
+            value=value,
+            expression=expanded_expression,
+            expression_tokens=parse_registered_composite_expression(expanded_expression),
+        ))
+    return tuple(entries)
+
+
 def generate_composite_expression_entries(
     value: int,
     pattern: str,
@@ -680,17 +721,16 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
             expression = stripped.split("=", 1)[1].split("|", 1)[0].strip()
             if expression:
                 try:
-                    expression_tokens = parse_registered_composite_expression(expression)
+                    explicit_entries = generate_explicit_composite_expression_entries(
+                        value,
+                        token,
+                        line_number,
+                        expression,
+                    )
                 except ValueError:
                     errors.append(RegisteredPrimeError(line_number, expression, "invalid expression"))
                 else:
-                    entries.append(RegisteredCompositeEntry(
-                        source_line=line_number,
-                        pattern=token,
-                        value=value,
-                        expression=expression,
-                        expression_tokens=expression_tokens,
-                    ))
+                    entries.extend(explicit_entries)
                     explicit_entry_added = True
         if not explicit_entry_added:
             entries.extend(generate_composite_expression_entries(value, token, line_number))
