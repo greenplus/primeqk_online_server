@@ -389,7 +389,7 @@ ROOM_CONFIG = [
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
 ]
 ROOM_CATEGORY_DESCRIPTIONS = {
-    "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。",
+    "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。今までの記録はこちら。",
 }
 ROOM_DESCRIPTIONS = {
     "room_15": (
