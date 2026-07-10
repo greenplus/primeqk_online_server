@@ -55,6 +55,21 @@ ASSIST_SCAN_LIMITS = {
     "many": 2000,
 }
 ASSIST_REALIZATIONS_PER_NUMBER = 4
+CHEF_CARD_RANK = 593
+CHEF_CARD_SUIT = "🧑‍🍳"
+JOKER_ASSIGNABLE_VALUES = {str(value) for value in range(14)}
+
+
+def invalid_joker_assignments(values: List[str]) -> List[str]:
+    return [
+        str(value)
+        for value in values
+        if str(value) != "inf" and str(value) not in JOKER_ASSIGNABLE_VALUES
+    ]
+
+
+def joker_assignment_error_message() -> str:
+    return "ジョーカーは0〜13にのみ割り当てできます。"
 
 ################################################
 # 素数判定
@@ -387,11 +402,17 @@ ROOM_CONFIG = [
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
+    ("event_1", PRESETS["event-chef-11-1-c"], "Events"),
+    ("event_2", PRESETS["event-chef-11-1-c"], "Events"),
+    ("event_3", PRESETS["event-chef-11-1-c"], "Events"),
 ]
 ROOM_CATEGORY_DESCRIPTIONS = {
     "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。今までの記録はこちら。",
 }
 ROOM_DESCRIPTIONS = {
+    "event_1": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
+    "event_2": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
+    "event_3": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
     "room_15": (
         "登録した素数・合成数をもとにアシスト候補を表示する部屋です。"
         "登録リストによる使用制限はないため、登録していない素数も通常通り出せます。\n"
@@ -538,7 +559,7 @@ def score_value_symbol(value) -> str:
 
 def score_sort_key(card: dict) -> int:
     if card.get("is_joker") or card.get("suit") == "X":
-        return 14
+        return 10_000
     return int(card.get("rank", 0))
 
 def score_cards_text(cards: List[dict], sort_cards: bool = False) -> str:
@@ -644,16 +665,30 @@ def generate_deck() -> List[dict]:
 
 def build_deck(rule: RulePreset) -> List[dict]:
     deck = generate_deck()
-    if rule.deck_rule is DeckRule.EVEN_HALVED:
-        # 偶数で、かつスートが D/H のカードだけを除去（Jokerは除外）
-        deck = [
-            c for c in deck
-            if not (
-                (not c["is_joker"]) and
-                (c["rank"] % 2 == 0) and
-                (c["suit"] in ("D", "H"))
+    if rule.deck_rule in (DeckRule.EVEN_HALVED, DeckRule.EVEN_HALVED_WITH_CHEFS):
+        kept = []
+        removed_count = 0
+        for card in deck:
+            remove_even_card = (
+                (not card["is_joker"])
+                and (card["rank"] % 2 == 0)
+                and (card["suit"] in ("D", "H"))
             )
-        ]
+            if remove_even_card:
+                removed_count += 1
+            else:
+                kept.append(card)
+        deck = kept
+        if rule.deck_rule is DeckRule.EVEN_HALVED_WITH_CHEFS:
+            deck.extend(
+                {
+                    "card_id": str(uuid.uuid4()),
+                    "suit": CHEF_CARD_SUIT,
+                    "rank": CHEF_CARD_RANK,
+                    "is_joker": False,
+                }
+                for _ in range(removed_count)
+            )
     random.shuffle(deck)
     return deck
 
@@ -2142,6 +2177,12 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
                 "message": "複数枚出し時に「∞」指定はできません。"
             })
             return
+        if invalid_joker_assignments(assigned_numbers):
+            await player.ws.send_json({
+                "type": "error",
+                "message": joker_assignment_error_message()
+            })
+            return
         ranks = []
         joker_i = 0
         for c in played_cards:
@@ -2331,6 +2372,8 @@ def map_joker_values_in_cards(cards: List[dict], assigned: List[str], allow_inf_
     if any(v == "inf" for v in assigned):
         if not (allow_inf_singleton and len(cards) == 1 and len(jokers) == 1):
             raise CompositeError("この状況で∞は使用できません。")
+    if invalid_joker_assignments(assigned):
+        raise CompositeError(joker_assignment_error_message())
 
     out = []
     ji = 0
@@ -2540,6 +2583,9 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             if c and c.get("is_joker"): comp_joker_count += 1
     if comp_joker_count != len(comp_assigned) or any(v=="inf" for v in comp_assigned):
         await player.ws.send_json({"type":"error","message":"合成数内のジョーカー指定が不正です。"})
+        return
+    if invalid_joker_assignments(comp_assigned):
+        await player.ws.send_json({"type":"error","message":joker_assignment_error_message()})
         return
 
     # 3) token_card_ranks を作る（合成数トークンの “card_id → ランク”）

@@ -7,6 +7,7 @@ from typing import Dict
 class DeckRule(Enum):
     DEFAULT = auto()       # 通常の54枚デッキ
     EVEN_HALVED = auto()   # 偶数カードを半分に間引く
+    EVEN_HALVED_WITH_CHEFS = auto()
 
 class PenaltyRule(Enum):
     ALWAYS_1 = auto()      # 必ず1枚
@@ -103,6 +104,14 @@ PRESETS: Dict[str, RulePreset] = {
         label="7枚 / 偶数半減 / ペナ1",
         deck_rule=DeckRule.EVEN_HALVED,
         hand_size=7,
+        penalty_rule=PenaltyRule.ALWAYS_1,
+        allow_composite=True,
+    ),
+    "event-chef-11-1-c": RulePreset(
+        key="event-chef-11-1-c",
+        label="偶数の半分がコックさんに / 11枚 / ペナ1",
+        deck_rule=DeckRule.EVEN_HALVED_WITH_CHEFS,
+        hand_size=11,
         penalty_rule=PenaltyRule.ALWAYS_1,
         allow_composite=True,
     ),
