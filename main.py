@@ -349,6 +349,7 @@ class Room:
             "state": self.state,
             "category": self.category,
             "current_turn": current_name,
+            "current_turn_id": self.current_turn_id,
             "revolution": self.reverse_order,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
@@ -1866,7 +1867,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         # 自分のIDを通知
-        await websocket.send_json({"type": "your_id", "id": player.id})
+        await websocket.send_json({"type": "your_id", "id": player.id, "name": player.name})
 
         while True:
             data = await websocket.receive_json()
@@ -1875,9 +1876,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "set_name":
                 # クライアントから名前を受け取る
-                player.name = data.get("name", "").strip() or f"プレイヤー{player.id}"
+                player.name = data.get("name", "").strip() or player.name
                 # 必要なら acknowledgment を返す
-                await player.send_json({"type": "name_set", "name": player.name})
+                await player.send_json({"type": "name_set", "id": player.id, "name": player.name})
+                if player.room:
+                    await player.room.update_room_status()
                 continue
             elif msg_type in ("set_registered_numbers", "set_registered_primes"):
                 if player.room and player.room.state == "playing":
@@ -2803,6 +2806,7 @@ async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer
     await room.broadcast({
         "type": "turn_update",
         "current_turn": current_turn_name,
+        "current_turn_id": room.current_turn_id,
         "reset_timer": reset_timer,
     })
 
