@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
 from registered_primes import parse_registered_composite_text, parse_registered_prime_text
+from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from cpu_player import (
     CpuPlayer,
     CpuProfile,
@@ -318,6 +319,7 @@ class Room:
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
             "registration_enabled": self.rule.registration_enabled,
+            "hnp_challenge_enabled": self.rule.hnp_challenge_enabled,
             "cpu_profiles": available_cpu_profile_payloads(self.rule),
             "count": len(self.players),
             "player_list": [
@@ -355,6 +357,7 @@ class Room:
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
             "registration_enabled": self.rule.registration_enabled,
+            "hnp_challenge_enabled": self.rule.hnp_challenge_enabled,
             "deck_count": len(self.deck),
             "field": self.field,
             "player_list": [
@@ -437,6 +440,7 @@ def room_counts_payload() -> dict:
         "prime_rules": {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()},
         "assist_enabled": {rid: room.rule.assist_enabled for rid, room in rooms.items()},
         "registration_enabled": {rid: room.rule.registration_enabled for rid, room in rooms.items()},
+        "hnp_challenge_enabled": {rid: room.rule.hnp_challenge_enabled for rid, room in rooms.items()},
         "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms},
         "registered_sample_options": registered_sample_options(),
         "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()},
@@ -1952,6 +1956,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "prime_rule": room.rule.prime_rule.name.lower(),
                         "assist_enabled": room.rule.assist_enabled,
                         "registration_enabled": room.rule.registration_enabled,
+                        "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
                         "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
                         "cpu_profiles": available_cpu_profile_payloads(room.rule),
                     })
@@ -1984,6 +1989,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "prime_rule": room.rule.prime_rule.name.lower(),
                     "assist_enabled": room.rule.assist_enabled,
                     "registration_enabled": room.rule.registration_enabled,
+                    "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
                     "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
                     "cpu_profiles": available_cpu_profile_payloads(room.rule),
                 })
@@ -2279,8 +2285,35 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # 通常の素数出しと同じく次のターンへ
         await next_turn(room)
         return
+
+    submitted_number = number
+    hnp_challenge = False
+    if (
+        room.rule.hnp_challenge_enabled
+        and room.rule.prime_rule is PrimeRule.REGISTERED
+        and len(played_cards) >= 2
+        and not player.can_use_registered_prime(number)
+    ):
+        hnp_tokens = build_hnp_tokens(played_cards, assigned_numbers)
+        hnp_result = choose_hnp_permutation(
+            hnp_tokens,
+            field_number=room.last_number if room.field else None,
+            reverse_order=room.reverse_order,
+        )
+        if hnp_result is None:
+            await player.ws.send_json({
+                "type": "error",
+                "message": "場に合法的に出せるHNPの並びがありません。",
+            })
+            return
+        hnp_challenge = True
+        played_cards = hnp_result.cards
+        assigned_numbers = hnp_result.assigned_numbers
+        number = hnp_result.number
+
     # 素数判定
-    if not is_valid_prime_for_player(number, player, room.rule):
+    is_valid_play = is_prime(number) if hnp_challenge else is_valid_prime_for_player(number, player, room.rule)
+    if not is_valid_play:
         # ペナルティ
         # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
         penalty_cards = get_penalty_card_count(
@@ -2300,16 +2333,27 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
 
         await player.send_hand_update()
         await room.update_game_state()
-        await room.broadcast( {
+        penalty_payload = {
             "type": "penalty",
             "player_id": player.id,
             "played_cards": played_cards,
-            "number": number
-        })
+            "number": number,
+        }
+        if hnp_challenge:
+            penalty_payload.update({
+                "hnp_challenge": True,
+                "submitted_number": submitted_number,
+                "assigned_numbers": assigned_numbers,
+            })
+        await room.broadcast(penalty_payload)
 
         # チャットにペナルティのログを流す
-        rule_name = rule_display_name(room.rule.prime_rule)
-        await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は{rule_name}ではありません")
+        if hnp_challenge:
+            await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は素数ではありません")
+            await room.log_chat("HNP失敗！")
+        else:
+            rule_name = rule_display_name(room.rule.prime_rule)
+            await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は{rule_name}ではありません")
         play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
         record_score_play_line(
             room,
@@ -2330,16 +2374,25 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     await player.send_hand_update()
 
     await room.update_game_state()
-    await room.broadcast({
+    action_payload = {
         "type": "action_result",
         "action": "play_card",
         "player_id": player.id,
         "played_cards": played_cards,
-        "number": number
-    })
+        "number": number,
+    }
+    if hnp_challenge:
+        action_payload.update({
+            "hnp_challenge": True,
+            "submitted_number": submitted_number,
+            "assigned_numbers": assigned_numbers,
+        })
+    await room.broadcast(action_payload)
 
     # チャットに「素数を出した」ログを流す
     await room.log_chat(f"{player.name}が{number}を出しました")
+    if hnp_challenge:
+        await room.log_chat("HNP！")
     await maybe_log_talkative_fish_sashimi(room, number)
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
     record_score_play_line(room, player, f"{score_prefix}{play_text}{score_win_suffix(player)}")
@@ -2792,6 +2845,7 @@ async def start_game(room):
         "prime_rule": room.rule.prime_rule.name.lower(),
         "assist_enabled": room.rule.assist_enabled,
         "registration_enabled": room.rule.registration_enabled,
+        "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
     })
     await room.update_game_state()
     # チャットにログを流す
