@@ -406,6 +406,7 @@ ROOM_CONFIG = [
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
+    ("room_16", PRESETS["half-7-1-c-assist"], "Neo"),
     ("event_1", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_2", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_3", PRESETS["event-chef-11-1-c"], "Events"),

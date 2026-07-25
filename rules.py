@@ -108,6 +108,16 @@ PRESETS: Dict[str, RulePreset] = {
         penalty_rule=PenaltyRule.ALWAYS_1,
         allow_composite=True,
     ),
+    "half-7-1-c-assist": RulePreset(
+        key="half-7-1-c-assist",
+        label="初級: 7枚 / 偶数半減 / ペナ1 / アシストあり",
+        deck_rule=DeckRule.EVEN_HALVED,
+        hand_size=7,
+        penalty_rule=PenaltyRule.ALWAYS_1,
+        allow_composite=True,
+        assist_enabled=True,
+        registration_enabled=True,
+    ),
     "event-chef-11-1-c": RulePreset(
         key="event-chef-11-1-c",
         label="偶数の半分がコックさんに / 11枚 / ペナ1",
