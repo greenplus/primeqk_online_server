@@ -2168,6 +2168,14 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
         record_score_play_line(room, player, f"{score_prefix}X[IN]{score_win_suffix(player)}")
         await room.update_game_state()
+        await room.broadcast({
+            "type": "action_result",
+            "action": "field_flow",
+            "player_id": player.id,
+            "played_cards": played_cards,
+            "number": "X",
+            "flow_reason": "infinity",
+        })
         if await room.try_end_game():
             await room.update_room_status()
         else:
@@ -2260,6 +2268,14 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
         record_score_play_line(room, player, f"{score_prefix}{play_text}[GC]{score_win_suffix(player)}")
         await room.update_game_state()
+        await room.broadcast({
+            "type": "action_result",
+            "action": "field_flow",
+            "player_id": player.id,
+            "played_cards": played_cards,
+            "number": 57,
+            "flow_reason": "grotan_cut",
+        })
         if await room.try_end_game():
             await room.update_room_status()
             return
