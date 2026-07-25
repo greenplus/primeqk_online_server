@@ -2002,6 +2002,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:  # 部屋にいなければ無視
                     continue
                 room = player.room
+                if room.state == "playing":
+                    await player.send_json({
+                        "type": "error",
+                        "message": "対戦中は観戦状態に変更できません。退室する場合は退室してください。",
+                    })
+                    continue
                 new_status = data["status"]
                 player.status = new_status
                 if new_status != "waiting":
