@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from cpu_player import evaluate_gold_plan
+from cpu_player import evaluate_gold_plan, gold_plan_evaluation_config
 
 
 MAX_RECOMMENDATION_CANDIDATES_PER_COUNT = 24
 MAX_RECOMMENDATION_RALLY_PLAYS = 3
+MAX_STRATEGIC_RESERVES_PER_COUNT = 3
 INFINITY_STRENGTH = 10**100
+RECOMMENDATION_CACHE_VERSION = 3
 
 TIER_ORDER = {
     "finish": 0,
@@ -112,17 +114,13 @@ def rank_recommended_assist_candidates(
         for record in records
         if candidate_is_cut(record.candidate)
     ]
-    cut_57_masks = [
-        record.mask
-        for record in cut_records
-        if record.candidate.get("special_effect") == "cut"
-    ]
     ordinary_records = [
         record
         for record in records
         if not candidate_is_special(record.candidate)
     ]
     ordinary_by_count = _group_by_count(ordinary_records)
+    resource_context = _build_resource_context(records, ordinary_by_count)
     legal_ordinary_by_count = _group_by_count(
         record
         for record in legal_records
@@ -146,10 +144,15 @@ def rank_recommended_assist_candidates(
     selected_records: list[AssistRecord] = []
     for count, legal_group in sorted(legal_ordinary_by_count.items()):
         all_group = ordinary_by_count.get(count, [])
-        trump = _strongest_available(all_group, full_mask)
         for opener in legal_group:
             if opener.fingerprint in metadata:
                 continue
+            opening_resources = _opening_resource_metadata(
+                opener,
+                all_group,
+                resource_context,
+                full_mask,
+            )
             route = _best_gold_route(
                 opener,
                 all_group,
@@ -161,36 +164,30 @@ def rank_recommended_assist_candidates(
             if route is not None:
                 metadata[opener.fingerprint] = {
                     **_metadata("gold_route"),
+                    **opening_resources,
                     "gold_score": route["gold_score"],
+                    "strategic_score": _strategic_gold_score(
+                        route["gold_score"],
+                        opening_resources,
+                    ),
                     "route_length": route["route_length"],
                 }
                 continue
 
-            stronger_followups = [
-                follower
-                for follower in all_group
-                if follower.strength > opener.strength
-                and not follower.mask & opener.mask
-            ]
-            preserves_trump = bool(
-                trump
-                and trump.fingerprint != opener.fingerprint
-                and not trump.mask & opener.mask
-            )
-            preserves_57 = not any(opener.mask & mask for mask in cut_57_masks)
-            if stronger_followups and preserves_trump:
+            if (
+                opening_resources["stronger_followups"]
+                and opening_resources["preserves_trump"]
+            ):
                 metadata[opener.fingerprint] = {
                     **_metadata("preserve_trump"),
-                    "stronger_followups": len(stronger_followups),
-                    "preserves_57": preserves_57,
+                    **opening_resources,
                 }
-            elif trump and trump.fingerprint == opener.fingerprint:
+            elif opening_resources["is_trump"]:
                 metadata[opener.fingerprint] = _metadata("trump_or_special")
             else:
                 metadata[opener.fingerprint] = {
                     **_metadata("ordinary"),
-                    "stronger_followups": len(stronger_followups),
-                    "preserves_57": preserves_57,
+                    **opening_resources,
                 }
 
         selected_records.append(
@@ -311,6 +308,76 @@ def _strongest_available(
     return max(available, key=_record_strength_key) if available else None
 
 
+def _build_resource_context(
+    records: list[AssistRecord],
+    ordinary_by_count: dict[int, list[AssistRecord]],
+) -> dict:
+    strong_reserve_masks = []
+    for count, group in ordinary_by_count.items():
+        seen_masks = set()
+        for record in reversed(group):
+            if record.mask in seen_masks:
+                continue
+            seen_masks.add(record.mask)
+            strong_reserve_masks.append((count, record.mask))
+            if len(seen_masks) >= MAX_STRATEGIC_RESERVES_PER_COUNT:
+                break
+
+    special_masks: dict[str, list[int]] = {}
+    for record in records:
+        effect = record.candidate.get("special_effect")
+        if effect:
+            special_masks.setdefault(effect, []).append(record.mask)
+    return {
+        "strong_reserve_masks": strong_reserve_masks,
+        "special_masks": special_masks,
+    }
+
+
+def _opening_resource_metadata(
+    opener: AssistRecord,
+    all_group: list[AssistRecord],
+    resource_context: dict,
+    full_mask: int,
+) -> dict:
+    trump = _strongest_available(all_group, full_mask)
+    stronger_masks = {
+        follower.mask
+        for follower in all_group
+        if follower.strength > opener.strength
+        and not follower.mask & opener.mask
+    }
+    strong_reserve_masks = resource_context["strong_reserve_masks"]
+    strong_reserve_loss = sum(
+        1
+        for _, reserve_mask in strong_reserve_masks
+        if reserve_mask & opener.mask
+    )
+
+    special_resource_loss = 0
+    preserved_specials = set()
+    for effect, masks in resource_context["special_masks"].items():
+        if any(not mask & opener.mask for mask in masks):
+            preserved_specials.add(effect)
+        else:
+            special_resource_loss += 1
+
+    return {
+        "stronger_followups": len(stronger_masks),
+        "preserves_trump": bool(
+            trump
+            and trump.fingerprint != opener.fingerprint
+            and not trump.mask & opener.mask
+        ),
+        "is_trump": bool(trump and trump.fingerprint == opener.fingerprint),
+        "strong_reserve_loss": strong_reserve_loss,
+        "special_resource_loss": special_resource_loss,
+        "preserves_57": "cut" in preserved_specials,
+        "preserves_x": "infinity" in preserved_specials,
+        "preserves_1729": "revolution" in preserved_specials,
+    }
+
+
 def _best_gold_route(
     opener: AssistRecord,
     all_group: list[AssistRecord],
@@ -363,7 +430,7 @@ def _finish_tail(
     cut_records: list[AssistRecord],
 ) -> list[AssistRecord] | None:
     if remaining_mask == 0:
-        return None
+        return []
     direct = records_by_mask.get(remaining_mask)
     if direct:
         return [direct[0]]
@@ -428,22 +495,55 @@ def _metadata(tier: str) -> dict:
     return {
         "tier": tier,
         "gold_score": 0.0,
+        "strategic_score": 0.0,
         "route_length": 99,
         "stronger_followups": 0,
+        "preserves_trump": False,
+        "is_trump": False,
+        "strong_reserve_loss": 0,
+        "special_resource_loss": 0,
         "preserves_57": False,
+        "preserves_x": False,
+        "preserves_1729": False,
     }
+
+
+def _strategic_gold_score(gold_score: float, metadata: dict) -> float:
+    config = gold_plan_evaluation_config().get("assist_opening_resource", {})
+    special_loss_penalty = float(config.get("special_loss_penalty", 8.0))
+    strong_reserve_loss_penalty = float(
+        config.get("strong_reserve_loss_penalty", 1.5)
+    )
+    preserve_trump_bonus = float(config.get("preserve_trump_bonus", 3.0))
+    stronger_followup_bonus = float(config.get("stronger_followup_bonus", 0.75))
+    max_followup_bonus = float(config.get("max_followup_bonus", 3.0))
+    followup_bonus = min(
+        max_followup_bonus,
+        int(metadata.get("stronger_followups", 0)) * stronger_followup_bonus,
+    )
+    score = (
+        float(gold_score)
+        - int(metadata.get("special_resource_loss", 0)) * special_loss_penalty
+        - int(metadata.get("strong_reserve_loss", 0)) * strong_reserve_loss_penalty
+        + (preserve_trump_bonus if metadata.get("preserves_trump") else 0.0)
+        + followup_bonus
+    )
+    return round(score, 4)
 
 
 def _candidate_selection_key(record: AssistRecord, metadata: dict) -> tuple:
     tier = metadata["tier"]
     return (
         TIER_ORDER[tier],
-        -float(metadata.get("gold_score", 0.0)),
+        -float(metadata.get("strategic_score", 0.0)),
         int(metadata.get("route_length", 99)),
-        1 if candidate_uses_joker(record.candidate) else 0,
-        0 if metadata.get("preserves_57") else 1,
+        int(metadata.get("special_resource_loss", 0)),
+        int(metadata.get("strong_reserve_loss", 0)),
+        0 if metadata.get("preserves_trump") else 1,
         -int(metadata.get("stronger_followups", 0)),
         record.strength,
+        1 if candidate_uses_joker(record.candidate) else 0,
+        0 if metadata.get("preserves_57") else 1,
         record.fingerprint,
     )
 

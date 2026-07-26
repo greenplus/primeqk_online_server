@@ -17,7 +17,10 @@ from cpu_player import (
     get_cpu_profile,
     is_cpu_player,
 )
-from assist_recommendation import rank_recommended_assist_candidates
+from assist_recommendation import (
+    RECOMMENDATION_CACHE_VERSION,
+    rank_recommended_assist_candidates,
+)
 import copy
 import json
 import random
@@ -1422,6 +1425,7 @@ def assist_recommendation_cache_key(
         )
     )
     return (
+        RECOMMENDATION_CACHE_VERSION,
         tuple(card_signature(card) for card in player.hand),
         tuple(card_signature(card) for card in source_cards),
         tuple(card_signature(card) for card in room.field),
@@ -2470,10 +2474,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:
                     continue
                 room = player.room
-                await player.send_json({
+                assist_payload = {
                     "type": "prime_assist_result",
                     **build_prime_assist_candidates(player, room, data),
-                })
+                }
+                if "assist_request_id" in data:
+                    assist_payload["assist_request_id"] = data["assist_request_id"]
+                await player.send_json(assist_payload)
                 continue
 
             elif msg_type == "play_card":

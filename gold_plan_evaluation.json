@@ -1,6 +1,13 @@
 {
   "formula": "100 - (100 - trump_strength) * resource_index",
   "immediate_win_trump_strength": 100.0,
+  "assist_opening_resource": {
+    "special_loss_penalty": 8.0,
+    "strong_reserve_loss_penalty": 1.5,
+    "preserve_trump_bonus": 3.0,
+    "stronger_followup_bonus": 0.75,
+    "max_followup_bonus": 3.0
+  },
   "trump_strength": {
     "2": {
       "default": 50.0,
