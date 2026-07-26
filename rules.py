@@ -119,6 +119,7 @@ PRESETS: Dict[str, RulePreset] = {
         prime_rule=PrimeRule.REGISTERED,
         assist_enabled=True,
         registration_enabled=True,
+        hnp_challenge_enabled=True,
         registered_number_limit=500,
     ),
     "event-chef-11-1-c": RulePreset(

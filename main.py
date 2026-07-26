@@ -17,6 +17,8 @@ from cpu_player import (
     get_cpu_profile,
     is_cpu_player,
 )
+from assist_recommendation import rank_recommended_assist_candidates
+import copy
 import json
 import random
 from random import randrange
@@ -1022,6 +1024,13 @@ def assist_card_text(cards: List[dict], assigned_numbers: List[str]) -> str:
 def assist_joker_count(cards: List[dict]) -> int:
     return sum(1 for card in cards if card.get("is_joker") or card.get("suit") == "X")
 
+def is_single_joker_realization(realization: dict) -> bool:
+    cards = realization.get("cards") or []
+    return (
+        len(cards) == 1
+        and assist_joker_count(cards) == 1
+    )
+
 def build_assist_number_text_filter(
     source_cards: List[dict],
     required_card_count: Optional[int],
@@ -1370,6 +1379,65 @@ def assist_card_count_from_filters(data: dict) -> Optional[int]:
         return 1
     return count if 1 <= count <= 11 else 1
 
+def assist_candidate_is_legal_for_filters(
+    room: Room,
+    candidate: dict,
+    count_scope: str,
+    specified_card_count: Optional[int],
+) -> bool:
+    card_count = len(candidate.get("cards") or [])
+    if count_scope == "specified":
+        return card_count == specified_card_count
+    if count_scope != "field" or not room.field:
+        return True
+    if candidate.get("special_effect") == "infinity":
+        return len(room.field) == 1
+    return field_allows_number(room, int(candidate.get("number", 0)), card_count)
+
+def assist_recommendation_cache_key(
+    player: "Player",
+    room: Room,
+    source_cards: list[dict],
+    selected_ids: list,
+    composite_ids: list,
+    count_scope: str,
+    kind_scope: str,
+    specified_card_count: Optional[int],
+) -> tuple:
+    def card_signature(card: dict) -> tuple:
+        return (
+            str(card.get("card_id")),
+            card.get("rank"),
+            card.get("suit"),
+            bool(card.get("is_joker")),
+        )
+
+    composite_entries = tuple(
+        sorted(
+            (
+                int(entry.value),
+                str(entry.expression),
+            )
+            for entry in getattr(player, "registered_composite_entries", ())
+        )
+    )
+    return (
+        tuple(card_signature(card) for card in player.hand),
+        tuple(card_signature(card) for card in source_cards),
+        tuple(card_signature(card) for card in room.field),
+        room.last_number,
+        bool(room.reverse_order),
+        getattr(room.rule, "key", ""),
+        tuple(sorted(int(number) for number in player.registered_primes)),
+        tuple(sorted(int(number) for number in player.registered_composites)),
+        composite_entries,
+        tuple(str(card_id) for card_id in selected_ids),
+        tuple(str(card_id) for card_id in composite_ids),
+        count_scope,
+        kind_scope,
+        specified_card_count,
+    )
+
 def assist_number_sort_key(room: Room, order: str):
     strong_first = order == "strong"
     if room.reverse_order:
@@ -1377,6 +1445,8 @@ def assist_number_sort_key(room: Room, order: str):
     return (lambda item: -item[1]) if strong_first else (lambda item: item[1])
 
 def assist_efficiency_score(candidate: dict) -> float:
+    if candidate.get("special_effect") == "infinity":
+        return float("inf")
     card_count = max(1, len(candidate.get("cards") or []))
     return candidate["number"] / (10 ** (card_count - 1))
 
@@ -1437,6 +1507,8 @@ def finalize_assist_candidates(
     scan_limit: Optional[int] = None,
     order: str = "weak",
     prefer_low_number: bool = False,
+    source_cards: Optional[list[dict]] = None,
+    room: Optional[Room] = None,
 ) -> dict:
     candidates = deduplicate_duplicate_card_set_assist_candidates(
         candidates,
@@ -1446,7 +1518,13 @@ def finalize_assist_candidates(
         candidate.get("finishes_remaining")
         for candidate in candidates
     )
-    if order == "efficient":
+    if order == "recommended":
+        candidates = rank_recommended_assist_candidates(
+            candidates,
+            source_cards or [],
+            reverse_order=bool(room and room.reverse_order),
+        )
+    elif order == "efficient":
         candidates = sorted(
             candidates,
             key=lambda candidate: (
@@ -1458,31 +1536,32 @@ def finalize_assist_candidates(
             ),
         )
 
-    # 57 and 1729 are always useful special plays, even when they are not
-    # registered. Keep at least one realization of each available special
-    # number when the ordinary candidate limit is applied.
-    required_special_ids = []
-    seen_special_effects = set()
-    for candidate in candidates:
-        special_effect = candidate.get("special_effect")
-        if special_effect and special_effect not in seen_special_effects:
-            seen_special_effects.add(special_effect)
-            required_special_ids.append(id(candidate))
-    required_special_id_set = set(required_special_ids)
-    optional_limit = max(0, limit - len(required_special_ids))
-    optional_ids = [
-        id(candidate)
-        for candidate in candidates
-        if id(candidate) not in required_special_id_set
-    ][:optional_limit]
-    kept_ids = required_special_id_set | set(optional_ids)
-    limited_candidates = [
-        candidate
-        for candidate in candidates
-        if id(candidate) in kept_ids
-    ]
-    truncated = truncated or len(limited_candidates) < len(candidates)
-    candidates = limited_candidates
+    if order != "recommended":
+        # 57 and 1729 are always useful special plays, even when they are not
+        # registered. Keep at least one realization of each available special
+        # number when the ordinary candidate limit is applied.
+        required_special_ids = []
+        seen_special_effects = set()
+        for candidate in candidates:
+            special_effect = candidate.get("special_effect")
+            if special_effect and special_effect not in seen_special_effects:
+                seen_special_effects.add(special_effect)
+                required_special_ids.append(id(candidate))
+        required_special_id_set = set(required_special_ids)
+        optional_limit = max(0, limit - len(required_special_ids))
+        optional_ids = [
+            id(candidate)
+            for candidate in candidates
+            if id(candidate) not in required_special_id_set
+        ][:optional_limit]
+        kept_ids = required_special_id_set | set(optional_ids)
+        limited_candidates = [
+            candidate
+            for candidate in candidates
+            if id(candidate) in kept_ids
+        ]
+        truncated = truncated or len(limited_candidates) < len(candidates)
+        candidates = limited_candidates
     payload = {
         "candidates": candidates,
         "truncated": truncated,
@@ -1541,8 +1620,41 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
         required_card_count = specified_card_count
     apply_field_value_filter = count_scope == "field"
     limit = assist_limit_from_filters(data)
-    scan_limit = assist_scan_limit_from_filters(data)
-    can_realize_number_text = build_assist_number_text_filter(source_cards, required_card_count)
+    scan_limit = (
+        ASSIST_SCAN_LIMITS["fifty"]
+        if order == "recommended"
+        else assist_scan_limit_from_filters(data)
+    )
+    recommendation_cache_key = None
+    if order == "recommended":
+        recommendation_cache_key = assist_recommendation_cache_key(
+            player,
+            room,
+            source_cards,
+            selected_ids,
+            composite_ids,
+            count_scope,
+            kind_scope,
+            specified_card_count,
+        )
+        cached = getattr(player, "_assist_recommendation_cache", None)
+        if cached and cached.get("key") == recommendation_cache_key:
+            return copy.deepcopy(cached["payload"])
+
+    generation_required_card_count = (
+        None
+        if order == "recommended"
+        else required_card_count
+    )
+    generation_apply_field_value_filter = (
+        False
+        if order == "recommended"
+        else apply_field_value_filter
+    )
+    can_realize_number_text = build_assist_number_text_filter(
+        source_cards,
+        generation_required_card_count,
+    )
 
     candidates = []
     scanned = 0
@@ -1562,20 +1674,72 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
         )
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
+    infinity_allowed_by_count = (
+        generation_required_card_count is None
+        or generation_required_card_count == 1
+    )
+    if infinity_allowed_by_count:
+        infinity_card = next(
+            (
+                card
+                for card in source_cards
+                if card.get("is_joker") or card.get("suit") == "X"
+            ),
+            None,
+        )
+        if infinity_card is not None:
+            infinity_candidate = {
+                "number": 0,
+                "cards": [infinity_card],
+                "assigned_numbers": ["inf"],
+                "visible_text": "X",
+                "joker_count": 1,
+                "kind": "special",
+                "special_effect": "infinity",
+                "field_count_match": (
+                    count_scope == "specified"
+                    or not room.field
+                    or len(room.field) == 1
+                ),
+            }
+            infinity_candidate["finishes_hand"] = len(
+                remove_cards_by_id(player.hand, infinity_candidate["cards"])
+            ) == 0
+            infinity_candidate["finishes_remaining"] = (
+                bool(selected_id_set)
+                and {
+                    infinity_card["card_id"]
+                } == {
+                    card["card_id"]
+                    for card in player.hand
+                    if card["card_id"] not in selected_id_set
+                }
+            )
+            if order == "recommended":
+                infinity_candidate["_assist_legal"] = assist_candidate_is_legal_for_filters(
+                    room,
+                    infinity_candidate,
+                    count_scope,
+                    specified_card_count,
+                )
+            candidates.append(infinity_candidate)
+
     for number, special_effect in SPECIAL_ASSIST_EFFECTS.items():
-        if apply_field_value_filter and not field_allows_number_value(room, number):
+        if generation_apply_field_value_filter and not field_allows_number_value(room, number):
             continue
         if not can_realize_number_text(number):
             continue
         realizations = find_prime_realizations(
             number,
             source_cards,
-            required_card_count,
+            generation_required_card_count,
             limit=ASSIST_REALIZATIONS_PER_NUMBER,
         )
         for realization in realizations:
+            if is_single_joker_realization(realization):
+                continue
             if (
-                apply_field_value_filter
+                generation_apply_field_value_filter
                 and not field_allows_number(room, number, len(realization["cards"]))
             ):
                 continue
@@ -1600,34 +1764,39 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
                     if card["card_id"] not in selected_id_set
                 }
             )
+            if order == "recommended":
+                realization["_assist_legal"] = assist_candidate_is_legal_for_filters(
+                    room,
+                    realization,
+                    count_scope,
+                    specified_card_count,
+                )
             candidates.append(realization)
 
+    scan_truncated = False
     for kind, number, entry in registered_numbers:
-        if apply_field_value_filter and not field_allows_number_value(room, number):
+        if generation_apply_field_value_filter and not field_allows_number_value(room, number):
             continue
         if not can_realize_number_text(number):
             continue
 
         scanned += 1
         if scanned > scan_limit:
-            return finalize_assist_candidates(
-                candidates,
-                limit,
-                source,
-                truncated=True,
-                scan_limit=scan_limit,
-                order=order,
-                prefer_low_number=room.reverse_order,
-            )
+            scan_truncated = True
+            break
         realizations = find_prime_realizations(
             number,
             source_cards,
-            required_card_count,
+            generation_required_card_count,
             limit=ASSIST_REALIZATIONS_PER_NUMBER,
         )
         for realization in realizations:
+            # A joker played by itself is always infinity. It cannot represent
+            # a registered prime or the visible value of a composite play.
+            if is_single_joker_realization(realization):
+                continue
             if (
-                apply_field_value_filter
+                generation_apply_field_value_filter
                 and not field_allows_number(room, number, len(realization["cards"]))
             ):
                 continue
@@ -1637,6 +1806,13 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
                 or not room.field
                 or len(realization["cards"]) == len(room.field)
             )
+            if order == "recommended":
+                realization["_assist_legal"] = assist_candidate_is_legal_for_filters(
+                    room,
+                    realization,
+                    count_scope,
+                    specified_card_count,
+                )
             if kind != "composite":
                 realization["finishes_hand"] = len(remove_cards_by_id(player.hand, realization["cards"])) == 0
                 realization["finishes_remaining"] = (
@@ -1679,14 +1855,23 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
             )
             candidates.append(realization)
 
-    return finalize_assist_candidates(
+    result = finalize_assist_candidates(
         candidates,
         limit,
         source,
-        truncated=False,
+        truncated=scan_truncated,
+        scan_limit=scan_limit if scan_truncated else None,
         order=order,
         prefer_low_number=room.reverse_order,
+        source_cards=source_cards,
+        room=room,
     )
+    if recommendation_cache_key is not None:
+        player._assist_recommendation_cache = {
+            "key": recommendation_cache_key,
+            "payload": copy.deepcopy(result),
+        }
+    return result
 
 def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
     result = _build_prime_assist_candidates(player, room, data)
@@ -1707,6 +1892,8 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     filters = data.get("filters")
     if not isinstance(filters, dict):
         filters = {}
+    if filters.get("order") == "recommended":
+        return result
     probe_data = {
         **data,
         "filters": {
