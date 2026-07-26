@@ -364,6 +364,7 @@ class Room:
             "current_turn_id": self.current_turn_id,
             "first_player_id": self.first_player_id,
             "revolution": self.reverse_order,
+            "field_number": str(self.last_number) if self.last_number is not None else None,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
