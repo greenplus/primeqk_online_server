@@ -56,6 +56,10 @@ ASSIST_SCAN_LIMITS = {
     "many": 2000,
 }
 ASSIST_REALIZATIONS_PER_NUMBER = 4
+SPECIAL_ASSIST_EFFECTS = {
+    57: "cut",
+    1729: "revolution",
+}
 CHEF_CARD_RANK = 593
 CHEF_CARD_SUIT = "🧑‍🍳"
 JOKER_ASSIGNABLE_VALUES = {str(value) for value in range(14)}
@@ -1438,6 +1442,10 @@ def finalize_assist_candidates(
         candidates,
         prefer_low_number=prefer_low_number,
     )
+    remaining_finish_exists = any(
+        candidate.get("finishes_remaining")
+        for candidate in candidates
+    )
     if order == "efficient":
         candidates = sorted(
             candidates,
@@ -1449,14 +1457,43 @@ def finalize_assist_candidates(
                 candidate.get("visible_text", ""),
             ),
         )
-    truncated = truncated or len(candidates) > limit
-    candidates = candidates[:limit]
-    payload = {"candidates": candidates, "truncated": truncated, "source": source}
+
+    # 57 and 1729 are always useful special plays, even when they are not
+    # registered. Keep at least one realization of each available special
+    # number when the ordinary candidate limit is applied.
+    required_special_ids = []
+    seen_special_effects = set()
+    for candidate in candidates:
+        special_effect = candidate.get("special_effect")
+        if special_effect and special_effect not in seen_special_effects:
+            seen_special_effects.add(special_effect)
+            required_special_ids.append(id(candidate))
+    required_special_id_set = set(required_special_ids)
+    optional_limit = max(0, limit - len(required_special_ids))
+    optional_ids = [
+        id(candidate)
+        for candidate in candidates
+        if id(candidate) not in required_special_id_set
+    ][:optional_limit]
+    kept_ids = required_special_id_set | set(optional_ids)
+    limited_candidates = [
+        candidate
+        for candidate in candidates
+        if id(candidate) in kept_ids
+    ]
+    truncated = truncated or len(limited_candidates) < len(candidates)
+    candidates = limited_candidates
+    payload = {
+        "candidates": candidates,
+        "truncated": truncated,
+        "source": source,
+        "remaining_finish_exists": remaining_finish_exists,
+    }
     if scan_limit is not None:
         payload["scan_limit"] = scan_limit
     return payload
 
-def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
+def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
     if (
         not room.rule.registration_enabled
         or not room.rule.assist_enabled
@@ -1511,14 +1548,59 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     scanned = 0
     registered_numbers = []
     if kind_scope in ("all", "prime"):
-        registered_numbers.extend(("prime", number, None) for number in player.registered_primes)
+        registered_numbers.extend(
+            ("prime", number, None)
+            for number in player.registered_primes
+            if number not in SPECIAL_ASSIST_EFFECTS
+        )
     if room.rule.allow_composite and kind_scope in ("all", "composite"):
         registered_numbers.extend(
             ("composite", entry.value, entry)
             for entry in player.registered_composite_entries
             if entry.value in player.registered_composites
+            and entry.value not in SPECIAL_ASSIST_EFFECTS
         )
     registered_numbers.sort(key=assist_number_sort_key(room, order))
+
+    for number, special_effect in SPECIAL_ASSIST_EFFECTS.items():
+        if apply_field_value_filter and not field_allows_number_value(room, number):
+            continue
+        if not can_realize_number_text(number):
+            continue
+        realizations = find_prime_realizations(
+            number,
+            source_cards,
+            required_card_count,
+            limit=ASSIST_REALIZATIONS_PER_NUMBER,
+        )
+        for realization in realizations:
+            if (
+                apply_field_value_filter
+                and not field_allows_number(room, number, len(realization["cards"]))
+            ):
+                continue
+            realization["kind"] = "special"
+            realization["special_effect"] = special_effect
+            realization["field_count_match"] = (
+                count_scope == "specified"
+                or not room.field
+                or len(realization["cards"]) == len(room.field)
+            )
+            realization["finishes_hand"] = len(
+                remove_cards_by_id(player.hand, realization["cards"])
+            ) == 0
+            realization["finishes_remaining"] = (
+                bool(selected_id_set)
+                and {
+                    card["card_id"]
+                    for card in realization["cards"]
+                } == {
+                    card["card_id"]
+                    for card in player.hand
+                    if card["card_id"] not in selected_id_set
+                }
+            )
+            candidates.append(realization)
 
     for kind, number, entry in registered_numbers:
         if apply_field_value_filter and not field_allows_number_value(room, number):
@@ -1558,9 +1640,15 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
             if kind != "composite":
                 realization["finishes_hand"] = len(remove_cards_by_id(player.hand, realization["cards"])) == 0
                 realization["finishes_remaining"] = (
-                    source == "unselected"
-                    and bool(selected_id_set)
-                    and len(remove_cards_by_id(source_cards, realization["cards"])) == 0
+                    bool(selected_id_set)
+                    and {
+                        card["card_id"]
+                        for card in realization["cards"]
+                    } == {
+                        card["card_id"]
+                        for card in player.hand
+                        if card["card_id"] not in selected_id_set
+                    }
                 )
                 candidates.append(realization)
                 continue
@@ -1579,9 +1667,15 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
             used_cards = realization["cards"] + expression["cards"]
             realization["finishes_hand"] = len(remove_cards_by_id(player.hand, used_cards)) == 0
             realization["finishes_remaining"] = (
-                source == "unselected"
-                and bool(selected_id_set)
-                and len(remove_cards_by_id(source_cards, used_cards)) == 0
+                bool(selected_id_set)
+                and {
+                    card["card_id"]
+                    for card in used_cards
+                } == {
+                    card["card_id"]
+                    for card in player.hand
+                    if card["card_id"] not in selected_id_set
+                }
             )
             candidates.append(realization)
 
@@ -1593,6 +1687,40 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         order=order,
         prefer_low_number=room.reverse_order,
     )
+
+def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
+    result = _build_prime_assist_candidates(player, room, data)
+    selected_ids = data.get("selected_card_ids") or []
+    composite_ids = data.get("composite_card_ids") or []
+    if not isinstance(selected_ids, list):
+        selected_ids = []
+    if not isinstance(composite_ids, list):
+        composite_ids = []
+    selected_id_set = {
+        card_id
+        for card_id in selected_ids + composite_ids
+        if isinstance(card_id, str)
+    }
+    if not selected_id_set or result.get("source") == "unselected":
+        return result
+
+    filters = data.get("filters")
+    if not isinstance(filters, dict):
+        filters = {}
+    probe_data = {
+        **data,
+        "filters": {
+            **filters,
+            "target_scope": "unselected",
+        },
+        "limit": 1,
+    }
+    remaining_result = _build_prime_assist_candidates(player, room, probe_data)
+    result["remaining_finish_exists"] = bool(
+        result.get("remaining_finish_exists")
+        or remaining_result.get("remaining_finish_exists")
+    )
+    return result
 ################################################
 # Webhook
 ################################################
