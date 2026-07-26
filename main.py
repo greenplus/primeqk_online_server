@@ -451,6 +451,10 @@ def room_counts_payload() -> dict:
         "assist_enabled": {rid: room.rule.assist_enabled for rid, room in rooms.items()},
         "registration_enabled": {rid: room.rule.registration_enabled for rid, room in rooms.items()},
         "hnp_challenge_enabled": {rid: room.rule.hnp_challenge_enabled for rid, room in rooms.items()},
+        "registered_number_limits": {
+            rid: room.rule.registered_number_limit
+            for rid, room in rooms.items()
+        },
         "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms},
         "registered_sample_options": registered_sample_options(),
         "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()},
@@ -881,10 +885,19 @@ def load_registered_samples() -> dict:
 REGISTERED_SAMPLES = load_registered_samples()
 
 def registered_sample_options() -> list[dict]:
-    return [
-        {"key": key, "label": sample["label"]}
-        for key, sample in REGISTERED_SAMPLES.items()
-    ]
+    options = []
+    for key, sample in REGISTERED_SAMPLES.items():
+        prime_values, composite_values, _, _, _ = sample["data"]
+        prime_count = len(set(prime_values))
+        composite_count = len(set(composite_values))
+        options.append({
+            "key": key,
+            "label": sample["label"],
+            "prime_count": prime_count,
+            "composite_count": composite_count,
+            "total_count": prime_count + composite_count,
+        })
+    return options
 
 def registered_sample_for_key(sample_key: str):
     return REGISTERED_SAMPLES.get(sample_key) or REGISTERED_SAMPLES.get(DEFAULT_REGISTERED_SAMPLE_KEY)
