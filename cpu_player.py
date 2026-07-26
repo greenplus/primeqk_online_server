@@ -2620,6 +2620,7 @@ CPU_PROFILES = {
             "std-11-n-no-c",
             "registered-11-n-assist",
             "neo-assist-11-n-unlimited",
+            "half-7-1-c-assist",
         ),
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
@@ -2637,6 +2638,7 @@ CPU_PROFILES = {
             "std-11-n-no-c",
             "registered-11-n-assist",
             "neo-assist-11-n-unlimited",
+            "half-7-1-c-assist",
         ),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",

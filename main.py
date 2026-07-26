@@ -291,6 +291,7 @@ class Room:
         self.reserve = [] # 山札予備軍
         self.last_number = None     # “場に出ている”最後の数値を保持
         self.current_turn_id = None
+        self.first_player_id = None
         self.has_drawn = False
         self.reverse_order = False
         self.score_log = []
@@ -361,6 +362,7 @@ class Room:
             "category": self.category,
             "current_turn": current_name,
             "current_turn_id": self.current_turn_id,
+            "first_player_id": self.first_player_id,
             "revolution": self.reverse_order,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
@@ -3271,6 +3273,7 @@ async def start_game(room):
 
     # ランダムに先攻プレイヤー決定
     room.current_turn_id = random.choice([p.id for p in waiting_players])
+    room.first_player_id = room.current_turn_id
 
     # プレイヤーそれぞれに手札情報を送信
     for player in waiting_players:
