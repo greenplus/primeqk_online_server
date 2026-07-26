@@ -778,13 +778,27 @@ def registered_numbers_update_payload(prime_result, composite_result) -> dict:
         "truncated": prime_result.truncated or composite_result.truncated,
     }
 
+def registered_number_total(prime_values, composite_values) -> int:
+    return len(set(prime_values)) + len(set(composite_values))
+
+def registered_number_limit_error_payload(limit: int, total: int) -> dict:
+    return {
+        "type": "error",
+        "code": "registered_number_limit",
+        "message": f"この部屋では登録できる素数・合成数は合計{limit}個までです。現在の入力は{total}個です。",
+    }
+
 def replace_player_registered_numbers_from_text(
     player: "Player",
     prime_text: str,
     composite_text: str,
+    limit: Optional[int] = None,
 ) -> dict:
     prime_result = parse_registered_prime_text(prime_text)
     composite_result = parse_registered_composite_text(composite_text)
+    total = registered_number_total(prime_result.prime_values, composite_result.composite_values)
+    if limit is not None and total > limit:
+        return registered_number_limit_error_payload(limit, total)
     player.replace_registered_primes(set(prime_result.prime_values))
     player.replace_registered_composites(
         set(composite_result.composite_values),
@@ -874,7 +888,50 @@ def registered_sample_for_key(sample_key: str):
     SAMPLE_REGISTERED_COMPOSITE_TEXT,
 ) = registered_sample_for_key(DEFAULT_REGISTERED_SAMPLE_KEY)["data"]
 
-def load_sample_registered_prime_payload(player: "Player", sample_key: str = DEFAULT_REGISTERED_SAMPLE_KEY) -> dict:
+def limit_registered_sample_data(
+    primes,
+    composites,
+    composite_entries,
+    prime_text: str,
+    composite_text: str,
+    limit: Optional[int] = None,
+):
+    if limit is None or registered_number_total(primes, composites) <= limit:
+        return primes, composites, composite_entries, prime_text, composite_text, False
+
+    limited_primes = tuple(dict.fromkeys(primes))[:limit]
+    remaining = max(0, limit - len(limited_primes))
+    limited_entries = []
+    seen_composites = set()
+    for entry in composite_entries:
+        if remaining <= 0:
+            break
+        if entry.value in seen_composites:
+            continue
+        seen_composites.add(entry.value)
+        limited_entries.append(entry)
+        remaining -= 1
+
+    limited_composites = tuple(entry.value for entry in limited_entries)
+    limited_prime_text = "\n".join(str(value) for value in limited_primes)
+    limited_composite_text = "\n".join(
+        f"{entry.pattern}={entry.expression}"
+        for entry in limited_entries
+    )
+    return (
+        limited_primes,
+        limited_composites,
+        tuple(limited_entries),
+        limited_prime_text,
+        limited_composite_text,
+        True,
+    )
+
+def load_sample_registered_prime_payload(
+    player: "Player",
+    sample_key: str = DEFAULT_REGISTERED_SAMPLE_KEY,
+    limit: Optional[int] = None,
+) -> dict:
     sample = registered_sample_for_key(sample_key)
     if sample is None:
         primes, composites, composite_entries, prime_text, composite_text = (), (), (), "", ""
@@ -884,6 +941,14 @@ def load_sample_registered_prime_payload(player: "Player", sample_key: str = DEF
         primes, composites, composite_entries, prime_text, composite_text = sample["data"]
         sample_key = sample["key"]
         sample_label = sample["label"]
+    primes, composites, composite_entries, prime_text, composite_text, limited = limit_registered_sample_data(
+        primes,
+        composites,
+        composite_entries,
+        prime_text,
+        composite_text,
+        limit,
+    )
     player.replace_registered_primes(set(primes))
     player.replace_registered_composites(
         set(composites),
@@ -899,7 +964,8 @@ def load_sample_registered_prime_payload(player: "Player", sample_key: str = DEF
         "composite_duplicate_count": 0,
         "prime_errors": [],
         "composite_errors": [],
-        "truncated": False,
+        "truncated": limited,
+        "registered_number_limit": limit,
         "sample": True,
         "sample_key": sample_key,
         "sample_label": sample_label,
@@ -1491,6 +1557,11 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
             )
             if kind != "composite":
                 realization["finishes_hand"] = len(remove_cards_by_id(player.hand, realization["cards"])) == 0
+                realization["finishes_remaining"] = (
+                    source == "unselected"
+                    and bool(selected_id_set)
+                    and len(remove_cards_by_id(source_cards, realization["cards"])) == 0
+                )
                 candidates.append(realization)
                 continue
 
@@ -1507,6 +1578,11 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
             )
             used_cards = realization["cards"] + expression["cards"]
             realization["finishes_hand"] = len(remove_cards_by_id(player.hand, used_cards)) == 0
+            realization["finishes_remaining"] = (
+                source == "unselected"
+                and bool(selected_id_set)
+                and len(remove_cards_by_id(source_cards, used_cards)) == 0
+            )
             candidates.append(realization)
 
     return finalize_assist_candidates(
@@ -1908,6 +1984,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     player,
                     prime_text,
                     composite_text,
+                    limit=player.room.rule.registered_number_limit if player.room else None,
                 ))
 
                 if player.room:
@@ -1932,7 +2009,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
 
-                await player.send_json(load_sample_registered_prime_payload(player, sample_key))
+                await player.send_json(load_sample_registered_prime_payload(
+                    player,
+                    sample_key,
+                    limit=player.room.rule.registered_number_limit if player.room else None,
+                ))
 
                 if player.room:
                     await player.room.update_room_status()

@@ -33,6 +33,7 @@ class RulePreset:
     assist_enabled: bool = False
     registration_enabled: bool = False
     hnp_challenge_enabled: bool = False
+    registered_number_limit: int | None = None
 
 PRESETS: Dict[str, RulePreset] = {
     "std-5-1": RulePreset(
@@ -110,13 +111,15 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "half-7-1-c-assist": RulePreset(
         key="half-7-1-c-assist",
-        label="初級: 7枚 / 偶数半減 / ペナ1 / アシストあり",
+        label="初級: 7枚 / 偶数半減 / ペナルティ1枚 / 登録制限",
         deck_rule=DeckRule.EVEN_HALVED,
         hand_size=7,
         penalty_rule=PenaltyRule.ALWAYS_1,
         allow_composite=True,
+        prime_rule=PrimeRule.REGISTERED,
         assist_enabled=True,
         registration_enabled=True,
+        registered_number_limit=500,
     ),
     "event-chef-11-1-c": RulePreset(
         key="event-chef-11-1-c",
