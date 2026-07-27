@@ -1,6 +1,9 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +24,7 @@ from assist_recommendation import (
     RECOMMENDATION_CACHE_VERSION,
     rank_recommended_assist_candidates,
 )
+from campaign_store import CampaignSettings, CampaignStore, utc_now
 import copy
 import json
 import random
@@ -48,7 +52,26 @@ SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
 GOLD_PRIME_TABLE_JSON = SERVER_DIR / "gold_prime_table_memory.json"
 SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
-app = FastAPI()
+CAMPAIGN_SETTINGS = CampaignSettings.from_env()
+CAMPAIGN_STORE = CampaignStore()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    if CAMPAIGN_SETTINGS.enabled:
+        await CAMPAIGN_STORE.connect()
+    yield
+    await CAMPAIGN_STORE.close()
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(CAMPAIGN_SETTINGS.allowed_origins),
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 ASSIST_LIMITS = {
     "ten": 10,
@@ -68,6 +91,7 @@ SPECIAL_ASSIST_EFFECTS = {
 CHEF_CARD_RANK = 593
 CHEF_CARD_SUIT = "🧑‍🍳"
 JOKER_ASSIGNABLE_VALUES = {str(value) for value in range(14)}
+MAX_PLAYER_NAME_LENGTH = 24
 
 
 def invalid_joker_assignments(values: List[str]) -> List[str]:
@@ -295,6 +319,10 @@ class Room:
         self.has_drawn = False
         self.reverse_order = False
         self.score_log = []
+        self.game_id: Optional[str] = None
+        self.game_started_at: Optional[datetime] = None
+        self.campaign_player_id: Optional[str] = None
+        self.campaign_cpu_key: Optional[str] = None
 
     async def broadcast(self, message: dict):
         disconnected = []
@@ -395,11 +423,18 @@ class Room:
         """勝者がいれば game_over を投げて True、なければ False を返す"""
         winner = check_win_condition(self)
         if winner is not None:
+            winner_player = next(
+                (p for p in get_active_players(self) if p.id == self.current_turn_id),
+                None,
+            )
+            campaign_result = await maybe_record_campaign_win(self, winner_player)
             self.state = "waiting"
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
             await self.log_chat(f"{winner}が勝利しました")
             await maybe_log_talkative_fish_game_over(self)
             await publish_score_log(self, winner)
+            if campaign_result is not None and winner_player is not None:
+                await winner_player.send_json(campaign_result)
             return True
         return False
 
@@ -462,6 +497,96 @@ def room_counts_payload() -> dict:
         "registered_sample_options": registered_sample_options(),
         "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()},
     }
+
+
+def campaign_base_payload(now: datetime) -> dict:
+    return {
+        "campaign_key": CAMPAIGN_SETTINGS.key,
+        "goal": CAMPAIGN_SETTINGS.goal,
+        "starts_at": (
+            CAMPAIGN_SETTINGS.start_at.isoformat()
+            if CAMPAIGN_SETTINGS.start_at is not None
+            else None
+        ),
+        "server_now": now.isoformat(),
+        "campaign_url": CAMPAIGN_SETTINGS.page_url,
+    }
+
+
+@app.get("/api/campaigns/gold-cpu-100")
+async def get_cpu_campaign_status() -> dict:
+    now = utc_now()
+    payload = campaign_base_payload(now)
+
+    if not CAMPAIGN_SETTINGS.enabled:
+        return {
+            **payload,
+            "status": "unavailable",
+            "message": "キャンペーンは現在無効です",
+            "total_wins": None,
+            "progress_percent": None,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    if CAMPAIGN_SETTINGS.start_at is None:
+        return {
+            **payload,
+            "status": "scheduled",
+            "message": CAMPAIGN_SETTINGS.start_error or "開始日時が未設定です",
+            "total_wins": None,
+            "progress_percent": None,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    if now < CAMPAIGN_SETTINGS.start_at:
+        return {
+            **payload,
+            "status": "scheduled",
+            "message": "キャンペーン開始前です",
+            "total_wins": 0,
+            "progress_percent": 0,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    if not CAMPAIGN_STORE.ready:
+        return {
+            **payload,
+            "status": "unavailable",
+            "message": "集計情報を取得できません",
+            "total_wins": None,
+            "progress_percent": None,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    try:
+        leaderboard = await CAMPAIGN_STORE.leaderboard(CAMPAIGN_SETTINGS.key, limit=20)
+    except Exception as exc:
+        print(f"campaign leaderboard failed: {exc}")
+        return {
+            **payload,
+            "status": "unavailable",
+            "message": "集計情報を取得できません",
+            "total_wins": None,
+            "progress_percent": None,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    total_wins = leaderboard["total_wins"]
+    return {
+        **payload,
+        "status": "active",
+        "message": "",
+        "total_wins": total_wins,
+        "progress_percent": min(100, round(total_wins / CAMPAIGN_SETTINGS.goal * 100, 1)),
+        "rankings": leaderboard["rankings"],
+        "last_updated_at": leaderboard["last_updated_at"],
+    }
+
 
 class Player:
     def __init__(self, ws: WebSocket):
@@ -563,6 +688,105 @@ def check_win_condition(room):
 
 def get_active_players(room) -> List["Player"]:
     return [p for p in room.players if p.status == "waiting"]
+
+
+def prepare_campaign_game(
+    room: Room,
+    active_players: List["Player"],
+    started_at: Optional[datetime] = None,
+) -> bool:
+    now = started_at or utc_now()
+    room.game_id = str(uuid.uuid4())
+    room.game_started_at = now
+    room.campaign_player_id = None
+    room.campaign_cpu_key = None
+
+    if not CAMPAIGN_SETTINGS.is_active(now):
+        return False
+    if room.room_id != "room_16" or room.rule.key != "half-7-1-c-assist":
+        return False
+    if len(active_players) != 2:
+        return False
+
+    human_players = [player for player in active_players if not is_cpu_player(player)]
+    cpu_players = [player for player in active_players if is_cpu_player(player)]
+    if len(human_players) != 1 or len(cpu_players) != 1:
+        return False
+
+    cpu_key = getattr(cpu_players[0], "cpu_key", None)
+    if cpu_key != "gold_planner":
+        return False
+
+    room.campaign_player_id = human_players[0].id
+    room.campaign_cpu_key = cpu_key
+    return True
+
+
+async def maybe_record_campaign_win(
+    room: Room,
+    winner_player: Optional["Player"],
+    won_at: Optional[datetime] = None,
+) -> Optional[dict]:
+    if winner_player is None or is_cpu_player(winner_player):
+        return None
+    if room.campaign_player_id != winner_player.id:
+        return None
+    if not room.game_id or room.game_started_at is None or not room.campaign_cpu_key:
+        return None
+
+    now = won_at or utc_now()
+    if not CAMPAIGN_SETTINGS.is_active(now):
+        return None
+    if (
+        CAMPAIGN_SETTINGS.start_at is None
+        or room.game_started_at < CAMPAIGN_SETTINGS.start_at
+    ):
+        return None
+
+    base_result = {
+        "type": "campaign_result",
+        "campaign_key": CAMPAIGN_SETTINGS.key,
+        "player_name": winner_player.name,
+        "goal": CAMPAIGN_SETTINGS.goal,
+        "campaign_url": CAMPAIGN_SETTINGS.page_url,
+    }
+    if not CAMPAIGN_STORE.ready:
+        return {
+            **base_result,
+            "status": "failed",
+            "message": "勝利しましたが、キャンペーン記録を保存できませんでした。",
+        }
+
+    try:
+        counts = await asyncio.wait_for(
+            CAMPAIGN_STORE.record_win(
+                campaign_key=CAMPAIGN_SETTINGS.key,
+                game_id=room.game_id,
+                player_name=winner_player.name,
+                room_id=room.room_id,
+                rule_key=room.rule.key,
+                cpu_key=room.campaign_cpu_key,
+                game_started_at=room.game_started_at,
+                won_at=now,
+            ),
+            timeout=3,
+        )
+    except Exception as exc:
+        print(f"campaign win recording failed: {exc}")
+        return {
+            **base_result,
+            "status": "failed",
+            "message": "勝利しましたが、キャンペーン記録を保存できませんでした。",
+        }
+
+    return {
+        **base_result,
+        "status": "recorded",
+        "player_wins": counts["player_wins"],
+        "total_wins": counts["total_wins"],
+        "message": "CPU勝利数キャンペーンに1勝を記録しました。",
+    }
+
 
 def score_card_symbol(card: dict) -> str:
     if card.get("is_joker") or card.get("suit") == "X":
@@ -2291,8 +2515,23 @@ async def websocket_endpoint(websocket: WebSocket):
             room_id = player.room.room_id if player.room else None
 
             if msg_type == "set_name":
-                # クライアントから名前を受け取る
-                player.name = data.get("name", "").strip() or player.name
+                requested_name = data.get("name", "")
+                if not isinstance(requested_name, str):
+                    await player.send_json({
+                        "type": "error",
+                        "code": "invalid_player_name",
+                        "message": "表示名を文字列で入力してください。",
+                    })
+                    continue
+                requested_name = requested_name.strip()
+                if len(requested_name) > MAX_PLAYER_NAME_LENGTH:
+                    await player.send_json({
+                        "type": "error",
+                        "code": "invalid_player_name",
+                        "message": f"表示名は{MAX_PLAYER_NAME_LENGTH}文字以内にしてください。",
+                    })
+                    continue
+                player.name = requested_name or player.name
                 # 必要なら acknowledgment を返す
                 await player.send_json({"type": "name_set", "id": player.id, "name": player.name})
                 if player.room:
@@ -3251,6 +3490,7 @@ async def start_game(room):
     waiting_players = get_active_players(room)
     if len(waiting_players) not in (1, 2):
         return
+    prepare_campaign_game(room, waiting_players)
     for p in room.players:
         if p not in waiting_players:
             p.clear_hand()
