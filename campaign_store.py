@@ -9,7 +9,7 @@ from typing import Any, Optional
 DEFAULT_CAMPAIGN_KEY = "gold-cpu-100"
 DEFAULT_CAMPAIGN_GOAL = 100
 DEFAULT_CAMPAIGN_PAGE_URL = (
-    "https://greenplus.github.io/primeqk_online/neo-client-prototype/campaign.html"
+    "https://greenplus.github.io/qkneo/campaign.html"
 )
 
 
