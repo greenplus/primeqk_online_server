@@ -508,6 +508,11 @@ def campaign_base_payload(now: datetime) -> dict:
             if CAMPAIGN_SETTINGS.start_at is not None
             else None
         ),
+        "ends_at": (
+            CAMPAIGN_SETTINGS.end_at.isoformat()
+            if CAMPAIGN_SETTINGS.end_at is not None
+            else None
+        ),
         "server_now": now.isoformat(),
         "campaign_url": CAMPAIGN_SETTINGS.page_url,
     }
@@ -534,6 +539,17 @@ async def get_cpu_campaign_status() -> dict:
             **payload,
             "status": "scheduled",
             "message": CAMPAIGN_SETTINGS.start_error or "開始日時が未設定です",
+            "total_wins": None,
+            "progress_percent": None,
+            "rankings": [],
+            "last_updated_at": None,
+        }
+
+    if CAMPAIGN_SETTINGS.end_at is None or CAMPAIGN_SETTINGS.end_error is not None:
+        return {
+            **payload,
+            "status": "unavailable",
+            "message": CAMPAIGN_SETTINGS.end_error or "終了日時が未設定です",
             "total_wins": None,
             "progress_percent": None,
             "rankings": [],
@@ -579,8 +595,12 @@ async def get_cpu_campaign_status() -> dict:
     total_wins = leaderboard["total_wins"]
     return {
         **payload,
-        "status": "active",
-        "message": "",
+        "status": "finished" if now >= CAMPAIGN_SETTINGS.end_at else "active",
+        "message": (
+            "キャンペーンは終了しました。最終結果です。"
+            if now >= CAMPAIGN_SETTINGS.end_at
+            else ""
+        ),
         "total_wins": total_wins,
         "progress_percent": min(100, round(total_wins / CAMPAIGN_SETTINGS.goal * 100, 1)),
         "rankings": leaderboard["rankings"],

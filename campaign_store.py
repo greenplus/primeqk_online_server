@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 
 DEFAULT_CAMPAIGN_KEY = "gold-cpu-100"
-DEFAULT_CAMPAIGN_GOAL = 100
+DEFAULT_CAMPAIGN_GOAL = 300
 DEFAULT_CAMPAIGN_PAGE_URL = (
     "https://greenplus.github.io/qkneo/campaign.html"
 )
@@ -32,16 +32,27 @@ def positive_int_env(name: str, default: int) -> int:
     return max(1, value)
 
 
-def parse_start_at(value: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
+def parse_campaign_datetime(
+    value: Optional[str],
+    variable_name: str,
+) -> tuple[Optional[datetime], Optional[str]]:
     if not value or not value.strip():
-        return None, "CPU_CAMPAIGN_START_AT が未設定です"
+        return None, f"{variable_name} が未設定です"
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
-        return None, "CPU_CAMPAIGN_START_AT はタイムゾーン付きISO日時で設定してください"
+        return None, f"{variable_name} はタイムゾーン付きISO日時で設定してください"
     if parsed.tzinfo is None:
-        return None, "CPU_CAMPAIGN_START_AT にはタイムゾーンが必要です"
+        return None, f"{variable_name} にはタイムゾーンが必要です"
     return parsed.astimezone(timezone.utc), None
+
+
+def parse_start_at(value: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
+    return parse_campaign_datetime(value, "CPU_CAMPAIGN_START_AT")
+
+
+def parse_end_at(value: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
+    return parse_campaign_datetime(value, "CPU_CAMPAIGN_END_AT")
 
 
 @dataclass(frozen=True)
@@ -51,12 +62,21 @@ class CampaignSettings:
     goal: int
     start_at: Optional[datetime]
     start_error: Optional[str]
+    end_at: Optional[datetime]
+    end_error: Optional[str]
     page_url: str
     allowed_origins: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "CampaignSettings":
         start_at, start_error = parse_start_at(os.getenv("CPU_CAMPAIGN_START_AT"))
+        end_at, end_error = parse_end_at(os.getenv("CPU_CAMPAIGN_END_AT"))
+        if (
+            start_at is not None
+            and end_at is not None
+            and end_at <= start_at
+        ):
+            end_error = "CPU_CAMPAIGN_END_AT は開始日時より後に設定してください"
         origins = tuple(
             origin.strip()
             for origin in os.getenv(
@@ -72,6 +92,8 @@ class CampaignSettings:
             goal=positive_int_env("CPU_CAMPAIGN_GOAL", DEFAULT_CAMPAIGN_GOAL),
             start_at=start_at,
             start_error=start_error,
+            end_at=end_at,
+            end_error=end_error,
             page_url=os.getenv(
                 "CPU_CAMPAIGN_PAGE_URL",
                 DEFAULT_CAMPAIGN_PAGE_URL,
@@ -81,10 +103,15 @@ class CampaignSettings:
         )
 
     def is_active(self, now: Optional[datetime] = None) -> bool:
-        if not self.enabled or self.start_at is None:
+        if (
+            not self.enabled
+            or self.start_at is None
+            or self.end_at is None
+            or self.end_error is not None
+        ):
             return False
         current = now or utc_now()
-        return current >= self.start_at
+        return self.start_at <= current < self.end_at
 
 
 class CampaignStore:
