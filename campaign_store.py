@@ -248,17 +248,22 @@ class CampaignStore:
             rows = await connection.fetch(
                 """
                 WITH player_totals AS (
-                    SELECT player_name, COUNT(*)::int AS wins
+                    SELECT
+                        player_name,
+                        COUNT(*)::int AS wins,
+                        MAX(won_at) AS reached_at
                     FROM campaign_wins
                     WHERE campaign_key = $1
                     GROUP BY player_name
                 )
                 SELECT
-                    RANK() OVER (ORDER BY wins DESC)::int AS rank,
+                    ROW_NUMBER() OVER (
+                        ORDER BY wins DESC, reached_at ASC, player_name ASC
+                    )::int AS rank,
                     player_name,
                     wins
                 FROM player_totals
-                ORDER BY wins DESC, player_name ASC
+                ORDER BY wins DESC, reached_at ASC, player_name ASC
                 LIMIT $2
                 """,
                 campaign_key,
