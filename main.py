@@ -440,6 +440,9 @@ class Room:
 
 
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
+NEO_BEGINNER_ROOM_IDS = ("room_16", "room_17", "room_18")
+NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
+
 ROOM_CONFIG = [
     ("room_1", PRESETS["std-5-1"], "Classic"),
     ("room_2", PRESETS["half-7-1-c"], "Classic"),
@@ -454,6 +457,10 @@ ROOM_CONFIG = [
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
     ("room_16", PRESETS["half-7-1-c-assist"], "Neo"),
+    ("room_17", PRESETS["half-7-1-c-assist"], "Neo"),
+    ("room_18", PRESETS["half-7-1-c-assist"], "Neo"),
+    ("room_19", PRESETS["registered-11-n-assist"], "Neo"),
+    ("room_20", PRESETS["registered-11-n-assist"], "Neo"),
     ("event_1", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_2", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_3", PRESETS["event-chef-11-1-c"], "Events"),
@@ -723,7 +730,7 @@ def prepare_campaign_game(
 
     if not CAMPAIGN_SETTINGS.is_active(now):
         return False
-    if room.room_id != "room_16" or room.rule.key != "half-7-1-c-assist":
+    if room.room_id not in NEO_BEGINNER_ROOM_IDS or room.rule.key != "half-7-1-c-assist":
         return False
     if len(active_players) != 2:
         return False
