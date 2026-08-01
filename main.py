@@ -92,6 +92,22 @@ CHEF_CARD_RANK = 593
 CHEF_CARD_SUIT = "🧑‍🍳"
 JOKER_ASSIGNABLE_VALUES = {str(value) for value in range(14)}
 MAX_PLAYER_NAME_LENGTH = 24
+MAX_CHAT_MESSAGE_LENGTH = 120
+GLOBAL_CHAT_COOLDOWN_SECONDS = 1.0
+GLOBAL_CHAT_TEMPLATES = {
+    "recruit": {
+        "message": "対戦相手を募集しています！",
+        "badge": "対戦募集",
+    },
+    "beginner_welcome": {
+        "message": "初心者の方も歓迎です。一緒に遊びませんか？",
+        "badge": "初心者歓迎",
+    },
+    "spectators_welcome": {
+        "message": "観戦・見学も歓迎です！",
+        "badge": "観戦歓迎",
+    },
+}
 
 
 def invalid_joker_assignments(values: List[str]) -> List[str]:
@@ -627,6 +643,8 @@ class Player:
         self.registered_primes: set[int] = set()
         self.registered_composites: set[int] = set()
         self.registered_composite_entries = ()
+        self.global_chat_subscribed = False
+        self.last_global_chat_at = 0.0
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -691,6 +709,133 @@ class Player:
 
     def can_use_registered_composite(self, n: int) -> bool:
         return n in self.registered_composites
+
+
+GLOBAL_CHAT_SUBSCRIBERS: set[Player] = set()
+
+
+def normalize_chat_message(value) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    message = value.strip()
+    if not message or len(message) > MAX_CHAT_MESSAGE_LENGTH:
+        return None
+    return message
+
+
+def global_chat_room_meta(room: Optional[Room]) -> dict:
+    if room is None:
+        return {"room_id": None, "room_badge": "ロビー", "room_tone": "neutral"}
+    if room.room_id in NEO_BEGINNER_ROOM_IDS:
+        number = NEO_BEGINNER_ROOM_IDS.index(room.room_id) + 1
+        return {
+            "room_id": room.room_id,
+            "room_badge": f"初級・ルーム{number}",
+            "room_tone": "beginner",
+        }
+    if room.room_id in NEO_ADVANCED_ROOM_IDS:
+        number = NEO_ADVANCED_ROOM_IDS.index(room.room_id) + 1
+        return {
+            "room_id": room.room_id,
+            "room_badge": f"上級・ルーム{number}",
+            "room_tone": "advanced",
+        }
+    return {
+        "room_id": room.room_id,
+        "room_badge": room.room_id,
+        "room_tone": "neutral",
+    }
+
+
+async def subscribe_global_chat(player: Player) -> bool:
+    if player.room is None:
+        await player.send_json({
+            "type": "error",
+            "code": "global_chat_requires_room",
+            "message": "部屋へ入室してからグローバルチャットを表示してください。",
+        })
+        return False
+    GLOBAL_CHAT_SUBSCRIBERS.add(player)
+    player.global_chat_subscribed = True
+    await player.send_json({
+        "type": "global_chat_joined",
+        "subscriber_count": len(GLOBAL_CHAT_SUBSCRIBERS),
+        "notice": "ここからのメッセージだけが表示されます。個人情報や連絡先は書き込まないでください。",
+    })
+    return True
+
+
+async def unsubscribe_global_chat(player: Player) -> None:
+    GLOBAL_CHAT_SUBSCRIBERS.discard(player)
+    player.global_chat_subscribed = False
+    await player.send_json({"type": "global_chat_left"})
+
+
+async def broadcast_global_chat(payload: dict) -> None:
+    disconnected = []
+    for subscriber in list(GLOBAL_CHAT_SUBSCRIBERS):
+        try:
+            await subscriber.send_json(payload)
+        except Exception:
+            disconnected.append(subscriber)
+    for subscriber in disconnected:
+        GLOBAL_CHAT_SUBSCRIBERS.discard(subscriber)
+        subscriber.global_chat_subscribed = False
+
+
+async def handle_global_chat_message(player: Player, data: dict) -> bool:
+    if player not in GLOBAL_CHAT_SUBSCRIBERS or not player.global_chat_subscribed:
+        await player.send_json({
+            "type": "error",
+            "code": "global_chat_not_joined",
+            "message": "注意事項を確認してからグローバルチャットを表示してください。",
+        })
+        return False
+    if player.room is None:
+        await player.send_json({
+            "type": "error",
+            "code": "global_chat_requires_room",
+            "message": "グローバルチャットへの送信には部屋への入室が必要です。",
+        })
+        return False
+
+    template_key = data.get("template_key")
+    template = GLOBAL_CHAT_TEMPLATES.get(template_key) if isinstance(template_key, str) else None
+    if template_key is not None and template is None:
+        await player.send_json({
+            "type": "error",
+            "code": "invalid_global_chat_template",
+            "message": "選択した定型文は使用できません。",
+        })
+        return False
+    message = template["message"] if template else normalize_chat_message(data.get("message"))
+    if message is None:
+        await player.send_json({
+            "type": "error",
+            "code": "invalid_chat_message",
+            "message": f"メッセージは1〜{MAX_CHAT_MESSAGE_LENGTH}文字で入力してください。",
+        })
+        return False
+
+    now = time.monotonic()
+    if now - getattr(player, "last_global_chat_at", 0.0) < GLOBAL_CHAT_COOLDOWN_SECONDS:
+        await player.send_json({
+            "type": "error",
+            "code": "global_chat_rate_limited",
+            "message": "少し待ってから送信してください。",
+        })
+        return False
+    player.last_global_chat_at = now
+
+    await broadcast_global_chat({
+        "type": "global_chat",
+        "sender": player.name,
+        "message": message,
+        "template_key": template_key if template else None,
+        "template_badge": template["badge"] if template else None,
+        **global_chat_room_meta(player.room),
+    })
+    return True
 
 ################################################
 # 勝敗判定ロジック
@@ -2808,15 +2953,32 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await pass_turn_for_player(player, room)
 
+            elif msg_type == "join_global_chat":
+                await subscribe_global_chat(player)
+
+            elif msg_type == "leave_global_chat":
+                await unsubscribe_global_chat(player)
+
+            elif msg_type == "global_chat":
+                await handle_global_chat_message(player, data)
+
             elif msg_type == "chat":
                 if not player.room:
+                    continue
+                message = normalize_chat_message(data.get("message"))
+                if message is None:
+                    await player.send_json({
+                        "type": "error",
+                        "code": "invalid_chat_message",
+                        "message": f"メッセージは1〜{MAX_CHAT_MESSAGE_LENGTH}文字で入力してください。",
+                    })
                     continue
                 # 表示用に「プレイヤー」を追加
                 display_sender = f"{player.name}"
                 await room.broadcast({
                     "type": "chat",
                     "sender": display_sender,
-                    "message": data["message"]
+                    "message": message,
                 })
 
     except WebSocketDisconnect:
@@ -2824,6 +2986,9 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         traceback.print_exc()
         await leave_room(player, notify_client=False)
+    finally:
+        GLOBAL_CHAT_SUBSCRIBERS.discard(player)
+        player.global_chat_subscribed = False
 
 ################################################
 # カードプレイ時の判定
