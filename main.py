@@ -500,25 +500,54 @@ ROOM_DESCRIPTIONS = {
 }
 rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
-def room_counts_payload() -> dict:
+ROOM_CATEGORIES_BY_CLIENT_SURFACE = {
+    "legacy": frozenset({"Classic", "Plus", "Events"}),
+    "plus": frozenset({"Classic", "Plus"}),
+    "neo": frozenset({"Neo"}),
+}
+
+WEBSOCKET_CLIENT_SURFACE_BY_PATH = {
+    "/ws": "legacy",
+    "/ws/plus": "plus",
+    "/ws/neo": "neo",
+}
+
+
+def room_is_available_to_client(room: Room, client_surface: Optional[str]) -> bool:
+    if client_surface is None:
+        return True
+    return room.category in ROOM_CATEGORIES_BY_CLIENT_SURFACE.get(client_surface, frozenset())
+
+
+def rooms_for_client(client_surface: Optional[str] = None) -> dict[str, Room]:
+    return {
+        room_id: room
+        for room_id, room in rooms.items()
+        if room_is_available_to_client(room, client_surface)
+    }
+
+
+def room_counts_payload(client_surface: Optional[str] = None) -> dict:
+    visible_rooms = rooms_for_client(client_surface)
     return {
         "type": "room_counts",
-        "counts": {room_id: len(room.players) for room_id, room in rooms.items()},
-        "rules": {rid: room.rule.label for rid, room in rooms.items()},
-        "room_categories": {rid: room.category for rid, room in rooms.items()},
+        "client_surface": client_surface,
+        "counts": {room_id: len(room.players) for room_id, room in visible_rooms.items()},
+        "rules": {rid: room.rule.label for rid, room in visible_rooms.items()},
+        "room_categories": {rid: room.category for rid, room in visible_rooms.items()},
         "room_category_descriptions": ROOM_CATEGORY_DESCRIPTIONS,
-        "allow_composite": {rid: room.rule.allow_composite for rid, room in rooms.items()},
-        "prime_rules": {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()},
-        "assist_enabled": {rid: room.rule.assist_enabled for rid, room in rooms.items()},
-        "registration_enabled": {rid: room.rule.registration_enabled for rid, room in rooms.items()},
-        "hnp_challenge_enabled": {rid: room.rule.hnp_challenge_enabled for rid, room in rooms.items()},
+        "allow_composite": {rid: room.rule.allow_composite for rid, room in visible_rooms.items()},
+        "prime_rules": {rid: room.rule.prime_rule.name.lower() for rid, room in visible_rooms.items()},
+        "assist_enabled": {rid: room.rule.assist_enabled for rid, room in visible_rooms.items()},
+        "registration_enabled": {rid: room.rule.registration_enabled for rid, room in visible_rooms.items()},
+        "hnp_challenge_enabled": {rid: room.rule.hnp_challenge_enabled for rid, room in visible_rooms.items()},
         "registered_number_limits": {
             rid: room.rule.registered_number_limit
-            for rid, room in rooms.items()
+            for rid, room in visible_rooms.items()
         },
-        "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms},
+        "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in visible_rooms},
         "registered_sample_options": registered_sample_options(),
-        "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()},
+        "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in visible_rooms.items()},
     }
 
 
@@ -2672,10 +2701,14 @@ async def pass_turn_for_player(player, room: Room) -> None:
 # WebSocket処理
 ################################################
 
+@app.websocket("/ws/neo")
+@app.websocket("/ws/plus")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    client_surface = WEBSOCKET_CLIENT_SURFACE_BY_PATH.get(websocket.scope.get("path"), "legacy")
     await websocket.accept()
     player = Player(websocket)  # 辞書ではなくPlayerクラスのインスタンスを生成
+    player.client_surface = client_surface
 
     try:
         # 自分のIDを通知
@@ -2765,13 +2798,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     await player.room.update_room_status()
                 continue
             elif msg_type == "get_room_counts":
-                await websocket.send_json(room_counts_payload())
+                await websocket.send_json(room_counts_payload(client_surface))
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
                 room = rooms.get(rid)
                 if room is None:
                     await websocket.send_json({"type": "error", "message": "room not found"})
+                    continue
+                if not room_is_available_to_client(room, client_surface):
+                    await websocket.send_json({
+                        "type": "error",
+                        "code": "room_not_available_for_client",
+                        "message": "このクライアントからは選択した部屋に入室できません。",
+                    })
                     continue
 
                 if player.room is room:
