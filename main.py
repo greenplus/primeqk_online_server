@@ -29,7 +29,9 @@ from tournament import TournamentRun, hash_resume_token, issue_resume_token, par
 from tournament_store import TournamentStore
 from recruitment_store import (
     MAX_ACTIVE_RECRUITMENTS,
+    RECRUITMENT_RULE_LABELS,
     RecruitmentError,
+    RecruitmentNotification,
     RecruitmentStore,
 )
 import copy
@@ -54,6 +56,12 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_JOIN_NOTIFY_LIMIT = int_env("DISCORD_JOIN_NOTIFY_LIMIT", 5)
 DISCORD_JOIN_NOTIFY_WINDOW_SECONDS = int_env("DISCORD_JOIN_NOTIFY_WINDOW_SECONDS", 3600, minimum=1)
+RECRUITMENT_DISCORD_PAIR_LIMIT = int_env("RECRUITMENT_DISCORD_PAIR_LIMIT", 3)
+RECRUITMENT_DISCORD_WINDOW_SECONDS = int_env(
+    "RECRUITMENT_DISCORD_WINDOW_SECONDS",
+    3600,
+    minimum=1,
+)
 PLUS_CLIENT_URL = os.getenv("PLUS_CLIENT_URL", "https://greenplus.github.io/qkplus/")
 NEO_CLIENT_URL = os.getenv("NEO_CLIENT_URL", "https://greenplus.github.io/qkneo/")
 LEGACY_CLIENT_URL = os.getenv("LEGACY_CLIENT_URL", "https://greenplus.github.io/primeqk_online/")
@@ -65,7 +73,11 @@ SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
 CAMPAIGN_SETTINGS = CampaignSettings.from_env()
 CAMPAIGN_STORE = CampaignStore()
 TOURNAMENT_STORE = TournamentStore()
-RECRUITMENT_STORE = RecruitmentStore()
+RECRUITMENT_STORE = RecruitmentStore(
+    notifications_enabled=bool(WEBHOOK_URL),
+    notification_pair_limit=RECRUITMENT_DISCORD_PAIR_LIMIT,
+    notification_window_seconds=RECRUITMENT_DISCORD_WINDOW_SECONDS,
+)
 TOURNAMENT_ADMIN_TOKEN = os.getenv("TOURNAMENT_ADMIN_TOKEN", "").strip()
 TOURNAMENT_ROOM_ID = "plus_tournament_1"
 PLUS_TOURNAMENT_RULE_KEYS = frozenset({
@@ -82,6 +94,7 @@ TOURNAMENT_MATCH_ROOMS: dict[str, "Room"] = {}
 ROOM_RESUME_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_LOCK = asyncio.Lock()
 TOURNAMENT_SCHEDULER_TASK = None
+RECRUITMENT_NOTIFICATION_TASK = None
 
 
 class TournamentSessionConflict(ValueError):
@@ -95,7 +108,7 @@ class TournamentSessionConflict(ValueError):
 
 @asynccontextmanager
 async def lifespan(_app):
-    global TOURNAMENT_SCHEDULER_TASK
+    global TOURNAMENT_SCHEDULER_TASK, RECRUITMENT_NOTIFICATION_TASK
     if CAMPAIGN_SETTINGS.enabled:
         await CAMPAIGN_STORE.connect()
     await TOURNAMENT_STORE.connect()
@@ -103,11 +116,21 @@ async def lifespan(_app):
     for run in await TOURNAMENT_STORE.load_active_runs():
         TOURNAMENT_RUNS_BY_ROOM[run.room_id] = run
     TOURNAMENT_SCHEDULER_TASK = asyncio.create_task(tournament_scheduler_loop())
+    if WEBHOOK_URL:
+        RECRUITMENT_NOTIFICATION_TASK = asyncio.create_task(
+            recruitment_notification_loop()
+        )
     yield
     if TOURNAMENT_SCHEDULER_TASK is not None:
         TOURNAMENT_SCHEDULER_TASK.cancel()
         try:
             await TOURNAMENT_SCHEDULER_TASK
+        except asyncio.CancelledError:
+            pass
+    if RECRUITMENT_NOTIFICATION_TASK is not None:
+        RECRUITMENT_NOTIFICATION_TASK.cancel()
+        try:
+            await RECRUITMENT_NOTIFICATION_TASK
         except asyncio.CancelledError:
             pass
     await CAMPAIGN_STORE.close()
@@ -658,10 +681,18 @@ def room_counts_payload(client_surface: Optional[str] = None) -> dict:
     }
 
 
-async def recruitment_payload(owner_token: object, notice: Optional[str] = None) -> dict:
+async def recruitment_payload(
+    board_key: str,
+    owner_token: object,
+    notice: Optional[str] = None,
+) -> dict:
     payload = {
         "type": "recruitments",
-        "items": await RECRUITMENT_STORE.list_active(owner_token=owner_token),
+        "board_key": board_key,
+        "items": await RECRUITMENT_STORE.list_active(
+            board_key=board_key,
+            owner_token=owner_token,
+        ),
         "max_count": MAX_ACTIVE_RECRUITMENTS,
         "server_now": utc_now().isoformat(),
     }
@@ -3338,17 +3369,20 @@ _discord_join_notify_lock = asyncio.Lock()
 async def notify_discord(content: str):
     if not WEBHOOK_URL:
         print("⚠️ Webhook URL が設定されていません")
-        return
+        return False
 
     try:
-        async with httpx.AsyncClient() as client:
-            await client.post(WEBHOOK_URL, json={
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(WEBHOOK_URL, json={
                 "content": content,
                 "allowed_mentions": {"parse": []},
             })
+            response.raise_for_status()
+        return True
     except Exception as e:
         # エラーをハンドリング
         print("notify_discord failed:", e)
+        return False
 
 
 def reserve_discord_join_notification(now: float | None = None) -> tuple[bool, int]:
@@ -3410,6 +3444,70 @@ async def notify_discord_join(player_name: str, room: Room):
     if suppressed:
         content = f"{content}\n（直近の入室通知 {suppressed} 件を省略しました）"
     await notify_discord(content)
+
+
+def discord_safe_text(value: object) -> str:
+    text_value = str(value or "")
+    for character in ("\\", "*", "_", "~", "`", ">", "|"):
+        text_value = text_value.replace(character, f"\\{character}")
+    return text_value
+
+
+def discord_recruitment_notification_content(
+    event: RecruitmentNotification,
+) -> str:
+    product_name = "素数大富豪NEO" if event.board_key == "neo" else "素数大富豪＋"
+    client_url = NEO_CLIENT_URL if event.board_key == "neo" else PLUS_CLIENT_URL
+    player_name = discord_safe_text(event.name)
+    rule_label = discord_safe_text(RECRUITMENT_RULE_LABELS.get(event.rule_key, event.rule_key))
+    scheduled_timestamp = int(event.scheduled_at.timestamp())
+    pair_id = event.recruitment_id.split("-", 1)[0]
+    common = (
+        f"👤 {player_name}\n"
+        f"🎴 希望: **{rule_label}**\n"
+        f"🕐 集合: <t:{scheduled_timestamp}:F>（<t:{scheduled_timestamp}:R>）\n"
+        f"🔖 募集ID: `{pair_id}`"
+    )
+    if event.event_type == "created":
+        return (
+            f"📣 **対戦募集 / {product_name}**\n"
+            f"{common}\n"
+            f"▶ {client_url}"
+        )
+    resolution = (
+        "投稿者が募集を削除しました。"
+        if event.resolution_reason == "deleted"
+        else "集合時間になりました。"
+    )
+    return (
+        f"✅ **募集終了 / {product_name}**\n"
+        f"{common}\n"
+        f"{resolution}"
+    )
+
+
+async def recruitment_notification_loop():
+    while True:
+        try:
+            await RECRUITMENT_STORE.expire_due()
+            events = await RECRUITMENT_STORE.pending_notifications(limit=10)
+            for event in events:
+                delivered = await notify_discord(
+                    discord_recruitment_notification_content(event)
+                )
+                if delivered:
+                    await RECRUITMENT_STORE.mark_notification_delivered(event.event_id)
+                    continue
+                retry_seconds = min(3600, 15 * (2 ** min(event.attempt_count, 8)))
+                await RECRUITMENT_STORE.mark_notification_failed(
+                    event.event_id,
+                    next_attempt_at=utc_now() + timedelta(seconds=retry_seconds),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"recruitment notification loop failed: {exc}")
+        await asyncio.sleep(5)
 
 ################################################
 # CPU処理
@@ -3893,7 +3991,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json(room_counts_payload(client_surface))
 
             elif msg_type == "get_recruitments":
-                if client_surface != "neo":
+                if client_surface not in {"neo", "plus"}:
                     await player.send_json({
                         "type": "recruitment_error",
                         "code": "unavailable",
@@ -3901,7 +3999,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
                 try:
-                    await player.send_json(await recruitment_payload(data.get("owner_token")))
+                    await player.send_json(await recruitment_payload(
+                        client_surface,
+                        data.get("owner_token"),
+                    ))
                 except RecruitmentError as exc:
                     await player.send_json({
                         "type": "recruitment_error",
@@ -3918,7 +4019,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             elif msg_type == "create_recruitment":
-                if client_surface != "neo":
+                if client_surface not in {"neo", "plus"}:
                     await player.send_json({
                         "type": "recruitment_error",
                         "code": "unavailable",
@@ -3926,15 +4027,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
                 try:
-                    await RECRUITMENT_STORE.create(
+                    created_recruitment = await RECRUITMENT_STORE.create(
                         name=data.get("name"),
                         rule_key=data.get("rule_key"),
                         scheduled_at=data.get("scheduled_at"),
                         owner_token=data.get("owner_token"),
+                        board_key=client_surface,
                     )
+                    notice = "募集を投稿しました。集合時間になると自動で消えます。"
+                    if WEBHOOK_URL and not created_recruitment.notification_reserved:
+                        notice += " Discord通知は現在の上限に達したため省略しました。"
                     await player.send_json(await recruitment_payload(
+                        client_surface,
                         data.get("owner_token"),
-                        notice="募集を投稿しました。集合時間になると自動で消えます。",
+                        notice=notice,
                     ))
                 except RecruitmentError as exc:
                     await player.send_json({
@@ -3952,7 +4058,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             elif msg_type == "delete_recruitment":
-                if client_surface != "neo":
+                if client_surface not in {"neo", "plus"}:
                     await player.send_json({
                         "type": "recruitment_error",
                         "code": "unavailable",
@@ -3963,6 +4069,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     deleted = await RECRUITMENT_STORE.delete(
                         recruitment_id=data.get("recruitment_id"),
                         owner_token=data.get("owner_token"),
+                        board_key=client_surface,
                     )
                     if not deleted:
                         raise RecruitmentError(
@@ -3970,6 +4077,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "募集が見つからないか、削除できる投稿者ではありません。",
                         )
                     await player.send_json(await recruitment_payload(
+                        client_surface,
                         data.get("owner_token"),
                         notice="募集を削除しました。",
                     ))
