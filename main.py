@@ -54,6 +54,9 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_JOIN_NOTIFY_LIMIT = int_env("DISCORD_JOIN_NOTIFY_LIMIT", 5)
 DISCORD_JOIN_NOTIFY_WINDOW_SECONDS = int_env("DISCORD_JOIN_NOTIFY_WINDOW_SECONDS", 3600, minimum=1)
+PLUS_CLIENT_URL = os.getenv("PLUS_CLIENT_URL", "https://greenplus.github.io/qkplus/")
+NEO_CLIENT_URL = os.getenv("NEO_CLIENT_URL", "https://greenplus.github.io/qkneo/")
+LEGACY_CLIENT_URL = os.getenv("LEGACY_CLIENT_URL", "https://greenplus.github.io/primeqk_online/")
 SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
@@ -554,6 +557,8 @@ class Room:
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
 NEO_BEGINNER_ROOM_IDS = ("room_16", "room_17", "room_18")
 NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
+CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6")
+PLUS_ROOM_IDS = ("room_7", "room_8", "room_9")
 
 ROOM_CONFIG = [
     ("room_1", PRESETS["std-5-1"], "Classic"),
@@ -1068,9 +1073,8 @@ async def announce_tournament_globally(message: str) -> None:
         "message": message,
         "template_key": None,
         "template_badge": "大会",
-        "room_id": TOURNAMENT_ROOM_ID,
-        "room_rule": rooms[TOURNAMENT_ROOM_ID].rule.label,
-    })
+        **global_chat_room_meta(rooms[TOURNAMENT_ROOM_ID]),
+    }, client_surface="plus")
 
 
 def tournament_match_both_ready(match) -> bool:
@@ -1712,6 +1716,26 @@ def global_chat_room_meta(room: Optional[Room]) -> dict:
             "room_badge": f"上級・ルーム{number}",
             "room_tone": "advanced",
         }
+    if room.room_id in CLASSIC_ROOM_IDS:
+        number = CLASSIC_ROOM_IDS.index(room.room_id) + 1
+        return {
+            "room_id": room.room_id,
+            "room_badge": f"Classic・ルーム{number}",
+            "room_tone": "classic",
+        }
+    if room.room_id in PLUS_ROOM_IDS:
+        number = PLUS_ROOM_IDS.index(room.room_id) + 1
+        return {
+            "room_id": room.room_id,
+            "room_badge": f"Plus・ルーム{number}",
+            "room_tone": "plus",
+        }
+    if room.room_id == TOURNAMENT_ROOM_ID:
+        return {
+            "room_id": room.room_id,
+            "room_badge": "Plus・大会",
+            "room_tone": "plus",
+        }
     return {
         "room_id": room.room_id,
         "room_badge": room.room_id,
@@ -1729,9 +1753,14 @@ async def subscribe_global_chat(player: Player) -> bool:
         return False
     GLOBAL_CHAT_SUBSCRIBERS.add(player)
     player.global_chat_subscribed = True
+    client_surface = getattr(player, "client_surface", "legacy")
     await player.send_json({
         "type": "global_chat_joined",
-        "subscriber_count": len(GLOBAL_CHAT_SUBSCRIBERS),
+        "subscriber_count": len([
+            subscriber
+            for subscriber in GLOBAL_CHAT_SUBSCRIBERS
+            if getattr(subscriber, "client_surface", "legacy") == client_surface
+        ]),
         "notice": "ここからのメッセージだけが表示されます。個人情報や連絡先は書き込まないでください。",
     })
     return True
@@ -1743,9 +1772,11 @@ async def unsubscribe_global_chat(player: Player) -> None:
     await player.send_json({"type": "global_chat_left"})
 
 
-async def broadcast_global_chat(payload: dict) -> None:
+async def broadcast_global_chat(payload: dict, client_surface: str) -> None:
     disconnected = []
     for subscriber in list(GLOBAL_CHAT_SUBSCRIBERS):
+        if getattr(subscriber, "client_surface", "legacy") != client_surface:
+            continue
         try:
             await subscriber.send_json(payload)
         except Exception:
@@ -1806,7 +1837,7 @@ async def handle_global_chat_message(player: Player, data: dict) -> bool:
         "template_key": template_key if template else None,
         "template_badge": template["badge"] if template else None,
         **global_chat_room_meta(player.room),
-    })
+    }, client_surface=getattr(player, "client_surface", "legacy"))
     return True
 
 ################################################
@@ -3311,7 +3342,10 @@ async def notify_discord(content: str):
 
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(WEBHOOK_URL, json={"content": content})
+            await client.post(WEBHOOK_URL, json={
+                "content": content,
+                "allowed_mentions": {"parse": []},
+            })
     except Exception as e:
         # エラーをハンドリング
         print("notify_discord failed:", e)
@@ -3339,13 +3373,40 @@ def reserve_discord_join_notification(now: float | None = None) -> tuple[bool, i
     return True, suppressed
 
 
-async def notify_discord_join(content: str):
+def discord_join_notification_content(player_name: str, room: Room) -> str:
+    room_meta = global_chat_room_meta(room)
+    room_label = room_meta["room_badge"]
+    if room.category == "Neo":
+        icon = "🟢"
+        product_name = "素数大富豪NEO"
+        client_url = NEO_CLIENT_URL
+    elif room.category in {"Classic", "Plus"}:
+        icon = "🔵"
+        product_name = "素数大富豪＋"
+        client_url = PLUS_CLIENT_URL
+    else:
+        icon = "🟠"
+        product_name = "素数大富豪＋ 旧UI"
+        client_url = LEGACY_CLIENT_URL
+        if room.category == "Events" and room.room_id.startswith("event_"):
+            room_label = f"Events・ルーム{room.room_id.removeprefix('event_')}"
+
+    return (
+        f"{icon} **{product_name}**\n"
+        f"🎮 {player_name} が **{room_label}** に参加しました\n"
+        f"ルール: {room.rule.label}\n"
+        f"▶ {client_url}"
+    )
+
+
+async def notify_discord_join(player_name: str, room: Room):
     async with _discord_join_notify_lock:
         should_send, suppressed = reserve_discord_join_notification()
 
     if not should_send:
         return
 
+    content = discord_join_notification_content(player_name, room)
     if suppressed:
         content = f"{content}\n（直近の入室通知 {suppressed} 件を省略しました）"
     await notify_discord(content)
@@ -3970,7 +4031,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await room.log_chat(f"{player.name}が入室しました")
                 # 同期処理の後で、バックグラウンドに通知タスクを投げる
                 asyncio.create_task(
-                    notify_discord_join(f"🎮 {player.name} が {room.room_id}（{room.rule.label}）に参加しました")
+                    notify_discord_join(player.name, room)
                 )
 
 
