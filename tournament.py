@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import hashlib
 import secrets
@@ -80,6 +80,9 @@ class TournamentMatch:
     status: str = "pending"
     winner_id: Optional[str] = None
     resolution: Optional[str] = None
+    called_at: Optional[datetime] = None
+    ready_deadline_at: Optional[datetime] = None
+    ready_player_ids: list[str] = field(default_factory=list)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -93,6 +96,9 @@ class TournamentMatch:
             "status": self.status,
             "winner_id": self.winner_id,
             "resolution": self.resolution,
+            "called_at": isoformat(self.called_at),
+            "ready_deadline_at": isoformat(self.ready_deadline_at),
+            "ready_player_ids": list(self.ready_player_ids),
             "started_at": isoformat(self.started_at),
             "completed_at": isoformat(self.completed_at),
         }
@@ -108,6 +114,9 @@ class TournamentMatch:
             status=str(value.get("status", "pending")),
             winner_id=value.get("winner_id"),
             resolution=value.get("resolution"),
+            called_at=parse_datetime(value["called_at"]) if value.get("called_at") else None,
+            ready_deadline_at=parse_datetime(value["ready_deadline_at"]) if value.get("ready_deadline_at") else None,
+            ready_player_ids=[str(item) for item in value.get("ready_player_ids", [])],
             started_at=parse_datetime(value["started_at"]) if value.get("started_at") else None,
             completed_at=parse_datetime(value["completed_at"]) if value.get("completed_at") else None,
         )
@@ -157,6 +166,7 @@ class TournamentRun:
     participants: dict[str, TournamentParticipant] = field(default_factory=dict)
     matches: list[TournamentMatch] = field(default_factory=list)
     current_match_id: Optional[str] = None
+    active_match_ids: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
 
@@ -199,7 +209,29 @@ class TournamentRun:
 
     @property
     def current_match(self) -> Optional[TournamentMatch]:
-        return next((match for match in self.matches if match.match_id == self.current_match_id), None)
+        active = self.current_matches
+        return active[0] if active else None
+
+    @property
+    def current_matches(self) -> list[TournamentMatch]:
+        active_ids = set(self.active_match_ids)
+        if self.current_match_id:
+            active_ids.add(self.current_match_id)
+        return [
+            match
+            for match in self.matches
+            if match.match_id in active_ids and match.status in {"called", "playing"}
+        ]
+
+    def current_match_for_participant(self, participant_id: str) -> Optional[TournamentMatch]:
+        return next(
+            (
+                match
+                for match in self.current_matches
+                if participant_id in {match.player1_id, match.player2_id}
+            ),
+            None,
+        )
 
     def participant_for_token(self, token: str) -> Optional[TournamentParticipant]:
         digest = hash_resume_token(token)
@@ -259,17 +291,84 @@ class TournamentRun:
     def next_pending_match(self) -> Optional[TournamentMatch]:
         return next((match for match in self.matches if match.status == "pending"), None)
 
-    def start_next_match(self, *, now: Optional[datetime] = None) -> Optional[TournamentMatch]:
+    def start_next_match(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        ready_wait_seconds: int = 60,
+    ) -> Optional[TournamentMatch]:
         if self.status != "running" or self.current_match_id is not None:
             return None
         match = self.next_pending_match()
         if match is None:
             self.finish_if_complete(now=now)
             return None
-        match.status = "playing"
-        match.started_at = now or utc_now()
+        current = now or utc_now()
+        match.status = "called"
+        match.called_at = current
+        match.ready_deadline_at = current + timedelta(seconds=max(1, ready_wait_seconds))
+        match.ready_player_ids = []
         self.current_match_id = match.match_id
+        self.active_match_ids = [match.match_id]
         return match
+
+    def start_next_round(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        ready_wait_seconds: int = 60,
+    ) -> list[TournamentMatch]:
+        if self.status != "running" or self.current_matches:
+            return []
+        pending = [match for match in self.matches if match.status == "pending"]
+        if not pending:
+            self.finish_if_complete(now=now)
+            return []
+        round_no = min(match.round_no for match in pending)
+        matches = [match for match in pending if match.round_no == round_no]
+        current = now or utc_now()
+        for match in matches:
+            match.status = "called"
+            match.called_at = current
+            match.ready_deadline_at = current + timedelta(seconds=max(1, ready_wait_seconds))
+            match.ready_player_ids = []
+        self.active_match_ids = [match.match_id for match in matches]
+        self.current_match_id = matches[0].match_id if matches else None
+        return matches
+
+    def mark_match_ready(self, participant_id: str, match_id: Optional[str] = None) -> TournamentMatch:
+        match = (
+            next((item for item in self.current_matches if item.match_id == match_id), None)
+            if match_id
+            else self.current_match_for_participant(participant_id)
+        )
+        if match is None or match.status != "called":
+            raise ValueError("現在、参加確認中の対戦はありません。")
+        if participant_id not in {match.player1_id, match.player2_id}:
+            raise ValueError("この対戦の参加者ではありません。")
+        if participant_id not in match.ready_player_ids:
+            match.ready_player_ids.append(participant_id)
+        return match
+
+    def begin_match(
+        self,
+        match_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> TournamentMatch:
+        match = next((item for item in self.current_matches if item.match_id == match_id), None)
+        if match is None or match.status not in {"called", "playing"}:
+            raise ValueError("開始できる対戦がありません。")
+        match.status = "playing"
+        if match.started_at is None:
+            match.started_at = now or utc_now()
+        return match
+
+    def begin_current_match(self, *, now: Optional[datetime] = None) -> TournamentMatch:
+        match = self.current_match
+        if match is None:
+            raise ValueError("開始できる対戦がありません。")
+        return self.begin_match(match.match_id, now=now)
 
     def resolve_match(
         self,
@@ -288,8 +387,9 @@ class TournamentRun:
         match.winner_id = winner_id
         match.resolution = resolution
         match.completed_at = now or utc_now()
+        self.active_match_ids = [item for item in self.active_match_ids if item != match.match_id]
         if self.current_match_id == match.match_id:
-            self.current_match_id = None
+            self.current_match_id = self.active_match_ids[0] if self.active_match_ids else None
         self.finish_if_complete(now=now)
         return match
 
@@ -297,6 +397,7 @@ class TournamentRun:
         if self.matches and all(match.status in TERMINAL_MATCH_STATUSES for match in self.matches):
             self.status = "finished"
             self.current_match_id = None
+            self.active_match_ids = []
             self.finished_at = now or utc_now()
             return True
         return False
@@ -339,12 +440,70 @@ class TournamentRun:
             row["rank"] = previous_rank
         return ordered
 
+    def league_table(self) -> dict[str, Any]:
+        players = [
+            {
+                "participant_id": participant.participant_id,
+                "display_name": participant.display_name,
+            }
+            for participant in self.active_participants
+        ]
+        cells: dict[str, dict[str, dict[str, Any]]] = {
+            player["participant_id"]: {}
+            for player in players
+        }
+        for player in players:
+            participant_id = player["participant_id"]
+            cells[participant_id][participant_id] = {"result": "self", "label": "—"}
+        for match in self.matches:
+            if match.status == "completed" and match.winner_id is not None:
+                player1_result = "win" if match.winner_id == match.player1_id else "loss"
+                player2_result = "win" if match.winner_id == match.player2_id else "loss"
+                player1_label = "○" if player1_result == "win" else "×"
+                player2_label = "○" if player2_result == "win" else "×"
+            elif match.status == "skipped":
+                player1_result = player2_result = "skipped"
+                player1_label = player2_label = "–"
+            elif match.status == "playing":
+                player1_result = player2_result = "playing"
+                player1_label = player2_label = "対戦中"
+            elif match.status == "called":
+                player1_result = player2_result = "called"
+                player1_label = player2_label = "呼出中"
+            else:
+                player1_result = player2_result = "pending"
+                player1_label = player2_label = "・"
+            common = {"match_id": match.match_id, "round_no": match.round_no}
+            cells[match.player1_id][match.player2_id] = {
+                **common,
+                "result": player1_result,
+                "label": player1_label,
+            }
+            cells[match.player2_id][match.player1_id] = {
+                **common,
+                "result": player2_result,
+                "label": player2_label,
+            }
+        return {
+            "players": players,
+            "rows": [
+                {
+                    **player,
+                    "cells": cells[player["participant_id"]],
+                }
+                for player in players
+            ],
+        }
+
     def public_payload(self, *, viewer_participant_id: Optional[str] = None) -> dict[str, Any]:
         participants = {
             participant.participant_id: participant.display_name
             for participant in self.active_participants
         }
-        current = self.current_match
+        active = self.current_matches
+        current = self.current_match_for_participant(viewer_participant_id) if viewer_participant_id else None
+        if current is None:
+            current = active[0] if active else None
         return {
             "run_id": self.run_id,
             "format_key": self.format_key,
@@ -360,8 +519,10 @@ class TournamentRun:
             "viewer_participant_id": viewer_participant_id,
             "registered": viewer_participant_id in participants,
             "current_match": self._public_match(current, participants) if current else None,
+            "active_matches": [self._public_match(match, participants) for match in active],
             "matches": [self._public_match(match, participants) for match in self.matches],
             "standings": self.standings(),
+            "league_table": self.league_table(),
             "finished_at": isoformat(self.finished_at),
         }
 
@@ -389,6 +550,7 @@ class TournamentRun:
             "participants": [participant.to_dict() for participant in self.participants.values()],
             "matches": [match.to_dict() for match in self.matches],
             "current_match_id": self.current_match_id,
+            "active_match_ids": list(self.active_match_ids),
             "created_at": isoformat(self.created_at),
             "finished_at": isoformat(self.finished_at),
         }
@@ -409,6 +571,7 @@ class TournamentRun:
             participants={participant.participant_id: participant for participant in participants},
             matches=[TournamentMatch.from_dict(item) for item in value.get("matches", [])],
             current_match_id=value.get("current_match_id"),
+            active_match_ids=[str(item) for item in value.get("active_match_ids", [])],
             created_at=parse_datetime(value["created_at"]),
             finished_at=parse_datetime(value["finished_at"]) if value.get("finished_at") else None,
         )

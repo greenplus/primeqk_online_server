@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
@@ -25,7 +25,7 @@ from assist_recommendation import (
     rank_recommended_assist_candidates,
 )
 from campaign_store import CampaignSettings, CampaignStore, utc_now
-from tournament import TournamentRun, hash_resume_token, parse_datetime
+from tournament import TournamentRun, hash_resume_token, issue_resume_token, parse_datetime
 from tournament_store import TournamentStore
 import copy
 import json
@@ -69,8 +69,19 @@ PLUS_TOURNAMENT_RULE_KEYS = frozenset({
 })
 TOURNAMENT_RUNS_BY_ROOM: dict[str, TournamentRun] = {}
 TOURNAMENT_SESSIONS: dict[str, "Player"] = {}
+TOURNAMENT_MATCH_ROOMS: dict[str, "Room"] = {}
+ROOM_RESUME_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_LOCK = asyncio.Lock()
 TOURNAMENT_SCHEDULER_TASK = None
+
+
+class TournamentSessionConflict(ValueError):
+    """A live tournament participant session requires an explicit takeover."""
+
+    def __init__(self, run: TournamentRun, participant_id: str):
+        super().__init__("同じ大会参加権が別のタブで使用中です。")
+        self.run = run
+        self.participant_id = participant_id
 
 
 @asynccontextmanager
@@ -369,9 +380,11 @@ class Room:
         self.campaign_player_id: Optional[str] = None
         self.campaign_cpu_key: Optional[str] = None
         self.tournament_run_id: Optional[str] = None
+        self.tournament_match_id: Optional[str] = None
 
     async def broadcast(self, message: dict):
         disconnected = []
+        removed_immediately = []
         for p in list(self.players):
             if hasattr(p, "ws") and p.ws is None and not is_cpu_player(p):
                 continue
@@ -380,29 +393,31 @@ class Room:
             except Exception as exc:
                 print(f"broadcast failed in {self.room_id}: {exc}")
                 disconnected.append(p)
-        disconnected_waiting = {p.id for p in disconnected if p.status == "waiting"}
         for p in disconnected:
-            if self.room_id == TOURNAMENT_ROOM_ID and getattr(p, "tournament_participant_id", None):
-                p.ws = None
-                p.disconnected_at = utc_now()
-                continue
-            if p in self.players:
-                self.players.remove(p)
-            if p.room is self:
-                p.room = None
-                p.status = "watching"
-                p.clear_hand()
+            if getattr(p, "room_resume_token_hash", None):
+                await mark_player_disconnected(p)
+            else:
+                removed_immediately.append(p)
+                if p in self.players:
+                    self.players.remove(p)
+                if getattr(p, "room", None) is self:
+                    p.room = None
+                    p.status = "watching"
+                    p.clear_hand()
         if disconnected:
             if self.state == "playing":
                 for p in disconnected:
-                    if p.id in disconnected_waiting:
+                    if p.status == "waiting":
                         record_score_play_line(self, p, "切断")
-            await handle_room_after_player_removed(self)
+            if removed_immediately:
+                await handle_room_after_player_removed(self)
+            else:
+                await self.update_room_status()
 
     async def update_room_status(self):
         message = {
             "type": "update_room_status",
-            "room_id": self.room_id,
+            "room_id": public_room_id(self),
             "rule": self.rule.label,
             "category": self.category,
             "allow_composite": self.rule.allow_composite,
@@ -428,10 +443,22 @@ class Room:
             ],
             "waiting_count": len([p for p in self.players if p.status == "waiting"])
         }
-        if self.room_id == TOURNAMENT_ROOM_ID:
-            message["tournament"] = tournament_public_payload(
-                TOURNAMENT_RUNS_BY_ROOM.get(self.room_id)
-            )
+        if is_tournament_managed_room(self):
+            run = tournament_run_for_room(self)
+            for room_player in list(self.players):
+                if room_player.ws is None:
+                    continue
+                try:
+                    await room_player.send_json({
+                        **message,
+                        "tournament": tournament_public_payload(
+                            run,
+                            room_player.tournament_participant_id,
+                        ),
+                    })
+                except Exception:
+                    await mark_player_disconnected(room_player)
+            return
         await self.broadcast(message)
 
     async def log_chat(self, message: str, sender="system"):
@@ -443,7 +470,7 @@ class Room:
         current_name = current_player.name if current_player else None
         state_msg = {
             "type": "game_update",
-            "room_id": self.room_id,
+            "room_id": public_room_id(self),
             "state": self.state,
             "category": self.category,
             "current_turn": current_name,
@@ -477,10 +504,22 @@ class Room:
                 for p in get_active_players(self)
             ]
         }
-        if self.room_id == TOURNAMENT_ROOM_ID:
-            state_msg["tournament"] = tournament_public_payload(
-                TOURNAMENT_RUNS_BY_ROOM.get(self.room_id)
-            )
+        if is_tournament_managed_room(self):
+            run = tournament_run_for_room(self)
+            for room_player in list(self.players):
+                if room_player.ws is None:
+                    continue
+                try:
+                    await room_player.send_json({
+                        **state_msg,
+                        "tournament": tournament_public_payload(
+                            run,
+                            room_player.tournament_participant_id,
+                        ),
+                    })
+                except Exception:
+                    await mark_player_disconnected(room_player)
+            return
         await self.broadcast(state_msg)
 
     async def try_end_game(self) -> bool:
@@ -615,17 +654,160 @@ def tournament_public_payload(
             "status": "unavailable",
             "room_id": TOURNAMENT_ROOM_ID,
             "persistent": TOURNAMENT_STORE.persistent,
+            "match_ready_seconds": tournament_match_ready_seconds(),
+            "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+            "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
+            "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
         }
     return {
         **run.public_payload(viewer_participant_id=viewer_participant_id),
         "persistent": TOURNAMENT_STORE.persistent,
+        "match_ready_seconds": tournament_match_ready_seconds(),
+        "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+        "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
+        "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
     }
 
 
-def tournament_for_player(player: "Player") -> Optional[TournamentRun]:
-    if player.room is None:
+def tournament_match_ready_seconds() -> int:
+    return int_env("TOURNAMENT_MATCH_READY_SECONDS", 60, minimum=10)
+
+
+def tournament_disconnect_grace_seconds() -> int:
+    return waiting_disconnect_grace_seconds()
+
+
+def playing_disconnect_grace_seconds() -> int:
+    return int_env("PLAYING_DISCONNECT_GRACE_SECONDS", 60, minimum=10)
+
+
+def waiting_disconnect_grace_seconds() -> int:
+    return int_env("WAITING_DISCONNECT_GRACE_SECONDS", 180, minimum=10)
+
+
+def is_tournament_managed_room(room: Optional["Room"]) -> bool:
+    return bool(room and (room.room_id == TOURNAMENT_ROOM_ID or room.tournament_run_id))
+
+
+def public_room_id(room: "Room") -> str:
+    return TOURNAMENT_ROOM_ID if is_tournament_managed_room(room) else room.room_id
+
+
+def tournament_run_for_room(room: Optional["Room"]) -> Optional[TournamentRun]:
+    if room is None:
         return None
-    return TOURNAMENT_RUNS_BY_ROOM.get(player.room.room_id)
+    if room.room_id == TOURNAMENT_ROOM_ID:
+        return TOURNAMENT_RUNS_BY_ROOM.get(TOURNAMENT_ROOM_ID)
+    if not room.tournament_run_id:
+        return None
+    return next(
+        (run for run in TOURNAMENT_RUNS_BY_ROOM.values() if run.run_id == room.tournament_run_id),
+        None,
+    )
+
+
+def tournament_for_player(player: "Player") -> Optional[TournamentRun]:
+    run = tournament_run_for_room(player.room)
+    if run is not None:
+        return run
+    participant_id = player.tournament_participant_id
+    if participant_id:
+        return next(
+            (item for item in TOURNAMENT_RUNS_BY_ROOM.values() if participant_id in item.participants),
+            None,
+        )
+    return None
+
+
+def room_disconnect_grace_seconds(room: "Room", player: "Player") -> int:
+    if room.state == "playing" and player.status == "waiting":
+        return playing_disconnect_grace_seconds()
+    return waiting_disconnect_grace_seconds()
+
+
+async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] = None) -> None:
+    if player.room is None:
+        return
+    player.ws = None
+    if getattr(player, "disconnected_at", None) is None:
+        player.disconnected_at = now or utc_now()
+
+
+def room_resume_session(token: object, requested_room_id: str) -> Optional["Player"]:
+    if not isinstance(token, str) or not token:
+        return None
+    session = ROOM_RESUME_SESSIONS.get(hash_resume_token(token))
+    if (
+        session is None
+        or session.room_session_room_id != requested_room_id
+        or session.ws is not None
+    ):
+        return None
+    return session
+
+
+async def bind_room_resume_session(
+    incoming: "Player",
+    session: "Player",
+) -> "Player":
+    incoming.ws, session.ws = None, incoming.ws
+    session.disconnected_at = None
+    session.client_surface = incoming.client_surface
+    await session.send_json({"type": "your_id", "id": session.id, "name": session.name})
+    await session.send_json({
+        "type": "room_session",
+        "room_id": session.room_session_room_id,
+        "status": "resumed",
+        "display_name": session.name,
+    })
+    return session
+
+
+async def issue_room_resume_session(player: "Player", room_id: str) -> None:
+    if player.room_resume_token_hash:
+        ROOM_RESUME_SESSIONS.pop(player.room_resume_token_hash, None)
+    token = issue_resume_token()
+    digest = hash_resume_token(token)
+    player.room_resume_token_hash = digest
+    player.room_session_room_id = room_id
+    ROOM_RESUME_SESSIONS[digest] = player
+    await player.send_json({
+        "type": "room_session",
+        "room_id": room_id,
+        "status": "issued",
+        "resume_token": token,
+        "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
+        "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+    })
+
+
+def forget_room_resume_session(player: "Player") -> None:
+    if player.room_resume_token_hash:
+        ROOM_RESUME_SESSIONS.pop(player.room_resume_token_hash, None)
+    player.room_resume_token_hash = None
+    player.room_session_room_id = None
+
+
+def room_initialization_payload(room: "Room", player: "Player") -> dict:
+    return {
+        "type": "room_state_initialization",
+        "room_id": public_room_id(room),
+        "room_state": room.state,
+        "category": room.category,
+        "allow_composite": room.rule.allow_composite,
+        "prime_rule": room.rule.prime_rule.name.lower(),
+        "assist_enabled": room.rule.assist_enabled,
+        "registration_enabled": room.rule.registration_enabled,
+        "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
+        "description": ROOM_DESCRIPTIONS.get(public_room_id(room), ""),
+        "cpu_profiles": available_cpu_profile_payloads(room.rule),
+        "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
+        "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+        "tournament": tournament_public_payload(
+            tournament_run_for_room(room),
+            player.tournament_participant_id,
+        ) if is_tournament_managed_room(room) else None,
+    }
 
 
 def tournament_admin_authorized(value) -> bool:
@@ -688,13 +870,47 @@ async def bind_tournament_participant(
 ) -> "Player":
     participant = run.participants[participant_id]
     existing = TOURNAMENT_SESSIONS.get(participant_id)
+    active_match = run.current_match_for_participant(participant_id)
+    target_room = (
+        TOURNAMENT_MATCH_ROOMS.get(active_match.match_id)
+        if active_match is not None and active_match.status == "playing"
+        else rooms[run.room_id]
+    )
+    target_room = target_room or rooms[run.room_id]
     if existing is not None and existing is not player:
-        room = player.room
-        if room is not None and player in room.players:
-            room.players.remove(player)
-        if room is not None and existing not in room.players:
-            room.players.append(existing)
-            existing.room = room
+        old_ws = existing.ws
+        if old_ws is not None and old_ws is not player.ws:
+            try:
+                await old_ws.send_json({
+                    "type": "session_replaced",
+                    "room_id": public_room_id(existing.room) if existing.room else run.room_id,
+                    "message": "大会参加権が別のタブへ引き継がれました。",
+                })
+            except Exception:
+                pass
+            try:
+                await old_ws.close(code=4001)
+            except Exception:
+                pass
+        incoming_token_hash = player.room_resume_token_hash
+        incoming_session_room_id = player.room_session_room_id
+        if existing.room_resume_token_hash:
+            ROOM_RESUME_SESSIONS.pop(existing.room_resume_token_hash, None)
+        if incoming_token_hash:
+            ROOM_RESUME_SESSIONS[incoming_token_hash] = existing
+        existing.room_resume_token_hash = incoming_token_hash
+        existing.room_session_room_id = incoming_session_room_id
+        player.room_resume_token_hash = None
+        player.room_session_room_id = None
+        incoming_room = player.room
+        if incoming_room is not None and player in incoming_room.players:
+            incoming_room.players.remove(player)
+        old_room = existing.room
+        if old_room is not None and old_room is not target_room and existing in old_room.players:
+            old_room.players.remove(existing)
+        if existing not in target_room.players:
+            target_room.players.append(existing)
+        existing.room = target_room
         existing.ws = player.ws
         existing.disconnected_at = None
         existing.name = participant.display_name
@@ -702,6 +918,12 @@ async def bind_tournament_participant(
         player.room = None
         bound = existing
     else:
+        old_room = player.room
+        if old_room is not None and old_room is not target_room and player in old_room.players:
+            old_room.players.remove(player)
+        if player not in target_room.players:
+            target_room.players.append(player)
+        player.room = target_room
         player.tournament_participant_id = participant_id
         player.name = participant.display_name
         player.disconnected_at = None
@@ -727,6 +949,15 @@ async def register_or_resume_tournament_player(
     )
     issued_token = None
     resumed = participant is not None
+    if participant is not None:
+        existing = TOURNAMENT_SESSIONS.get(participant.participant_id)
+        if (
+            existing is not None
+            and existing is not player
+            and existing.ws is not None
+            and data.get("takeover") is not True
+        ):
+            raise TournamentSessionConflict(run, participant.participant_id)
     if participant is None:
         participant, issued_token = run.register(player.name)
         await TOURNAMENT_STORE.audit(
@@ -747,6 +978,13 @@ async def register_or_resume_tournament_player(
     if issued_token is not None:
         payload["resume_token"] = issued_token
     await bound.send_json(payload)
+    current_match = run.current_match_for_participant(participant.participant_id)
+    if (
+        current_match is not None
+        and current_match.status == "called"
+        and participant.participant_id in {current_match.player1_id, current_match.player2_id}
+    ):
+        await notify_tournament_match_call(run, current_match)
     if bound.room is not None:
         await bound.room.log_chat(
             f"{participant.display_name}が大会へ復帰しました。"
@@ -785,9 +1023,14 @@ async def withdraw_tournament_player(player: "Player") -> None:
     })
 
 
-def tournament_session_online(participant_id: str, room: Room) -> bool:
+def tournament_session_online(participant_id: str, room: Optional[Room] = None) -> bool:
     session = TOURNAMENT_SESSIONS.get(participant_id)
-    return bool(session and session.ws is not None and session.room is room)
+    return bool(
+        session
+        and session.ws is not None
+        and is_tournament_managed_room(session.room)
+        and (room is None or session.room is room)
+    )
 
 
 async def announce_tournament_globally(message: str) -> None:
@@ -802,46 +1045,127 @@ async def announce_tournament_globally(message: str) -> None:
     })
 
 
-async def prepare_tournament_match(run: TournamentRun, room: Room) -> None:
-    match = run.current_match
-    if match is None or room.state == "playing":
+def tournament_match_both_ready(match) -> bool:
+    return {match.player1_id, match.player2_id}.issubset(set(match.ready_player_ids))
+
+
+async def notify_tournament_match_call(run: TournamentRun, match) -> None:
+    for participant_id in (match.player1_id, match.player2_id):
+        session = TOURNAMENT_SESSIONS.get(participant_id)
+        if not tournament_session_online(participant_id):
+            continue
+        await session.send_json({
+            "type": "tournament_match_call",
+            "message": "あなたの対戦です。「この対戦に参加」を押してください。",
+            "match_id": match.match_id,
+            "ready_deadline_at": match.ready_deadline_at.isoformat() if match.ready_deadline_at else None,
+            "tournament": tournament_public_payload(run, participant_id),
+        })
+
+
+async def mark_tournament_match_ready(player: "Player", match_id: str) -> None:
+    run = tournament_for_player(player)
+    participant_id = player.tournament_participant_id
+    if run is None or participant_id is None:
+        raise ValueError("大会参加情報が見つかりません。")
+    match = run.current_match_for_participant(participant_id)
+    if match is None or match.match_id != match_id:
+        raise ValueError("この対戦の参加確認は終了しています。")
+    run.mark_match_ready(participant_id, match_id)
+    await TOURNAMENT_STORE.save_run(run)
+    await TOURNAMENT_STORE.audit(
+        run.run_id,
+        actor=run.participants[participant_id].display_name,
+        action="match_ready",
+        details={"match_id": match.match_id, "participant_id": participant_id},
+    )
+    await player.send_json({
+        "type": "tournament_match_ready_ack",
+        "match_id": match.match_id,
+        "tournament": tournament_public_payload(run, participant_id),
+    })
+    await rooms[run.room_id].update_room_status()
+    if tournament_match_both_ready(match):
+        await prepare_tournament_match(run, match)
+
+
+async def prepare_tournament_match(
+    run: TournamentRun,
+    match,
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    if match is None or match.status not in {"called", "playing"}:
         return
     if not (
-        tournament_session_online(match.player1_id, room)
-        and tournament_session_online(match.player2_id, room)
+        tournament_session_online(match.player1_id)
+        and tournament_session_online(match.player2_id)
     ):
         return
+    current = now or utc_now()
+    if match.status == "called":
+        deadline_elapsed = bool(
+            match.ready_deadline_at is not None
+            and current >= match.ready_deadline_at
+        )
+        if not tournament_match_both_ready(match) and not deadline_elapsed:
+            return
+    run.begin_match(match.match_id, now=current)
+    await TOURNAMENT_STORE.save_run(run)
     player1 = TOURNAMENT_SESSIONS[match.player1_id]
     player2 = TOURNAMENT_SESSIONS[match.player2_id]
-    for room_player in room.players:
-        room_player.status = "waiting" if room_player in {player1, player2} else "watching"
-        if room_player not in {player1, player2}:
-            room_player.clear_hand()
-    room.rule = PRESETS[run.rule_key]
-    room.tournament_run_id = run.run_id
-    await room.log_chat(
+    room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
+    if room is None:
+        room = Room(
+            f"{TOURNAMENT_ROOM_ID}/{run.run_id}/{match.match_id}",
+            PRESETS[run.rule_key],
+            "Plus",
+        )
+        room.tournament_run_id = run.run_id
+        room.tournament_match_id = match.match_id
+        TOURNAMENT_MATCH_ROOMS[match.match_id] = room
+    for match_player in (player1, player2):
+        old_room = match_player.room
+        if old_room is not None and old_room is not room and match_player in old_room.players:
+            old_room.players.remove(match_player)
+        if match_player not in room.players:
+            room.players.append(match_player)
+        match_player.room = room
+        match_player.status = "waiting"
+        match_player.disconnected_at = None
+        match_player.clear_hand()
+        await match_player.send_json({
+            "type": "tournament_match_started",
+            "match_id": match.match_id,
+            "round_no": match.round_no,
+            "tournament": tournament_public_payload(run, match_player.tournament_participant_id),
+        })
+    await rooms[run.room_id].log_chat(
         f"第{match.round_no}ラウンド: {player1.name} vs {player2.name} を開始します。"
     )
+    await rooms[run.room_id].update_room_status()
     await room.update_room_status()
     await start_game(room)
 
 
 async def start_or_prepare_next_tournament_match(run: TournamentRun) -> None:
-    room = rooms[run.room_id]
-    if room.state == "playing":
-        return
-    match = run.current_match or run.start_next_match()
-    if match is None:
+    lobby = rooms[run.room_id]
+    existing_matches = run.current_matches
+    matches = existing_matches or run.start_next_round(
+        ready_wait_seconds=tournament_match_ready_seconds(),
+    )
+    if not matches:
         await TOURNAMENT_STORE.save_run(run)
         return
     await TOURNAMENT_STORE.save_run(run)
-    player1 = run.participants[match.player1_id].display_name
-    player2 = run.participants[match.player2_id].display_name
-    await room.log_chat(
-        f"次の対戦は第{match.round_no}ラウンド {player1} vs {player2} です。対戦者の接続を待っています。"
-    )
-    await room.update_room_status()
-    await prepare_tournament_match(run, room)
+    if not existing_matches:
+        await lobby.log_chat(
+            f"第{matches[0].round_no}ラウンドの{len(matches)}試合を呼び出しました。"
+            f"対戦者は{tournament_match_ready_seconds()}秒以内に参加確認を押してください。"
+        )
+        for match in matches:
+            await notify_tournament_match_call(run, match)
+    await lobby.update_room_status()
 
 
 async def resolve_tournament_match(
@@ -851,6 +1175,7 @@ async def resolve_tournament_match(
     *,
     resolution: str,
     actor: str,
+    advance: bool = True,
 ) -> None:
     match = run.resolve_match(match_id, winner_id, resolution=resolution)
     await TOURNAMENT_STORE.save_run(run)
@@ -859,26 +1184,53 @@ async def resolve_tournament_match(
         "winner_id": winner_id,
         "resolution": resolution,
     })
-    room = rooms[run.room_id]
-    if room.state == "playing" and room.tournament_run_id == run.run_id:
-        room.state = "waiting"
-        room.current_turn_id = None
-        for room_player in room.players:
-            room_player.status = "watching"
-            room_player.clear_hand()
-            if getattr(room_player, "ws", None) is not None:
-                await room_player.send_hand_update()
-        await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
+    lobby = rooms[run.room_id]
+    await close_tournament_match_room(run, match_id, winner_id=winner_id)
     if winner_id is None:
-        await room.log_chat("対戦はスキップされました。")
+        await lobby.log_chat("対戦はスキップされました。")
     else:
         winner_name = run.participants[winner_id].display_name
-        await room.log_chat(f"大会結果を反映しました: {winner_name}の勝利")
-    await room.update_room_status()
+        await lobby.log_chat(f"大会結果を反映しました: {winner_name}の勝利")
+    await lobby.update_room_status()
     if run.status == "finished":
         await announce_tournament_finished(run)
-    else:
+    elif advance:
         await start_or_prepare_next_tournament_match(run)
+
+
+async def close_tournament_match_room(
+    run: TournamentRun,
+    match_id: str,
+    *,
+    winner_id: Optional[str],
+    broadcast_result: bool = True,
+) -> None:
+    room = TOURNAMENT_MATCH_ROOMS.pop(match_id, None)
+    if room is None:
+        return
+    winner_name = run.participants[winner_id].display_name if winner_id else None
+    room.state = "waiting"
+    room.current_turn_id = None
+    if broadcast_result:
+        await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
+    lobby = rooms[run.room_id]
+    for room_player in list(room.players):
+        room.players.remove(room_player)
+        room_player.clear_hand()
+        room_player.status = "watching"
+        room_player.room = lobby
+        if room_player not in lobby.players:
+            lobby.players.append(room_player)
+        if room_player.ws is not None:
+            await room_player.send_hand_update()
+            await room_player.send_json({
+                "type": "tournament_return_to_lobby",
+                "tournament": tournament_public_payload(
+                    run,
+                    room_player.tournament_participant_id,
+                ),
+            })
+    await lobby.update_room_status()
 
 
 async def announce_tournament_finished(run: TournamentRun) -> None:
@@ -891,8 +1243,11 @@ async def announce_tournament_finished(run: TournamentRun) -> None:
 
 
 async def record_tournament_game_result(room: Room, winner_player: Optional["Player"]) -> None:
-    run = TOURNAMENT_RUNS_BY_ROOM.get(room.room_id)
-    match = run.current_match if run else None
+    run = tournament_run_for_room(room)
+    match = next(
+        (item for item in run.current_matches if item.match_id == room.tournament_match_id),
+        None,
+    ) if run else None
     participant_id = getattr(winner_player, "tournament_participant_id", None)
     if run is None or match is None or participant_id is None:
         return
@@ -905,15 +1260,74 @@ async def record_tournament_game_result(room: Room, winner_player: Optional["Pla
         "winner_id": participant_id,
         "game_id": room.game_id,
     })
-    if run.status == "finished":
-        asyncio.create_task(announce_tournament_finished(run))
-    else:
-        asyncio.create_task(delayed_tournament_advance(run, 1.5))
+    asyncio.create_task(delayed_tournament_match_completion(run, match.match_id, participant_id, 1.5))
 
 
-async def delayed_tournament_advance(run: TournamentRun, delay_seconds: float) -> None:
+async def delayed_tournament_match_completion(
+    run: TournamentRun,
+    match_id: str,
+    winner_id: Optional[str],
+    delay_seconds: float,
+) -> None:
     await asyncio.sleep(delay_seconds)
-    await start_or_prepare_next_tournament_match(run)
+    await close_tournament_match_room(
+        run,
+        match_id,
+        winner_id=winner_id,
+        broadcast_result=False,
+    )
+    if run.status == "finished":
+        await announce_tournament_finished(run)
+    else:
+        await start_or_prepare_next_tournament_match(run)
+
+
+def tournament_participant_disconnect_expired(
+    player: Optional["Player"],
+    online: bool,
+    now: datetime,
+    grace_seconds: int,
+    fallback_time: Optional[datetime],
+) -> bool:
+    if online:
+        return False
+    disconnected_at = player.disconnected_at if player is not None else None
+    disconnected_at = disconnected_at or fallback_time or now
+    if player is not None and player.disconnected_at is None:
+        player.disconnected_at = disconnected_at
+    return (now - disconnected_at).total_seconds() >= grace_seconds
+
+
+async def expire_disconnected_room_sessions(now: Optional[datetime] = None) -> None:
+    current = now or utc_now()
+    sessions = list({id(player): player for player in ROOM_RESUME_SESSIONS.values()}.values())
+    expired_by_room: dict[int, tuple[Room, list["Player"]]] = {}
+    for player in sessions:
+        room = player.room
+        if player.ws is not None or room is None:
+            continue
+        if room.tournament_match_id:
+            continue
+        disconnected_at = player.disconnected_at or current
+        if (current - disconnected_at).total_seconds() < room_disconnect_grace_seconds(room, player):
+            continue
+        entry = expired_by_room.setdefault(id(room), (room, []))
+        entry[1].append(player)
+
+    for room, expired_players in expired_by_room.values():
+        departed_ids = []
+        for player in expired_players:
+            departed_ids.append(player.id)
+            if player in room.players:
+                room.players.remove(player)
+            player.room = None
+            player.status = "watching"
+            player.clear_hand()
+            forget_room_resume_session(player)
+        await handle_room_after_player_removed(
+            room,
+            departed_ids[0] if len(departed_ids) == 1 else None,
+        )
 
 
 async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
@@ -945,30 +1359,58 @@ async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
                 await room.update_room_status()
             if run.status != "running":
                 continue
-            if run.current_match is None:
+            if not run.current_matches:
                 await start_or_prepare_next_tournament_match(run)
                 continue
-            match = run.current_match
-            player1 = TOURNAMENT_SESSIONS.get(match.player1_id)
-            player2 = TOURNAMENT_SESSIONS.get(match.player2_id)
-            online1 = tournament_session_online(match.player1_id, room)
-            online2 = tournament_session_online(match.player2_id, room)
-            if room.state != "playing" and online1 and online2:
-                await prepare_tournament_match(run, room)
-                continue
-            grace_seconds = int_env("TOURNAMENT_DISCONNECT_GRACE_SECONDS", 180, minimum=10)
-            disconnected_times = [
-                player.disconnected_at
-                for player, online in ((player1, online1), (player2, online2))
-                if not online and player is not None and player.disconnected_at is not None
-            ]
-            if (not online1 or not online2) and not disconnected_times:
-                for player, online in ((player1, online1), (player2, online2)):
-                    if player is not None and not online:
-                        player.disconnected_at = current
-                continue
-            if disconnected_times and (current - min(disconnected_times)).total_seconds() >= grace_seconds:
-                winner_id = match.player1_id if online1 and not online2 else match.player2_id if online2 and not online1 else None
+            for match in list(run.current_matches):
+                match_room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
+                if match.status == "playing" and match_room is None:
+                    # 再起動で手札状態が失われた試合だけを再呼び出しする。
+                    match.status = "called"
+                    match.started_at = None
+                    match.called_at = current
+                    match.ready_deadline_at = current + timedelta(
+                        seconds=tournament_match_ready_seconds()
+                    )
+                    match.ready_player_ids = []
+                    await TOURNAMENT_STORE.save_run(run)
+                    await notify_tournament_match_call(run, match)
+
+                expected_room = match_room if match.status == "playing" else None
+                player1 = TOURNAMENT_SESSIONS.get(match.player1_id)
+                player2 = TOURNAMENT_SESSIONS.get(match.player2_id)
+                online1 = tournament_session_online(match.player1_id, expected_room)
+                online2 = tournament_session_online(match.player2_id, expected_room)
+                if online1 and online2:
+                    if match.status == "called":
+                        deadline_elapsed = bool(
+                            match.ready_deadline_at is not None
+                            and current >= match.ready_deadline_at
+                        )
+                        if tournament_match_both_ready(match) or deadline_elapsed:
+                            await prepare_tournament_match(run, match, now=current)
+                    continue
+
+                grace_seconds = (
+                    playing_disconnect_grace_seconds()
+                    if match.status == "playing"
+                    else waiting_disconnect_grace_seconds()
+                )
+                fallback_time = match.started_at if match.status == "playing" else match.called_at
+                expired1 = tournament_participant_disconnect_expired(
+                    player1, online1, current, grace_seconds, fallback_time
+                )
+                expired2 = tournament_participant_disconnect_expired(
+                    player2, online2, current, grace_seconds, fallback_time
+                )
+                if expired1 and online2:
+                    winner_id = match.player2_id
+                elif expired2 and online1:
+                    winner_id = match.player1_id
+                elif expired1 and expired2:
+                    winner_id = None
+                else:
+                    continue
                 await resolve_tournament_match(
                     run,
                     match.match_id,
@@ -976,6 +1418,8 @@ async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
                     resolution="forfeit" if winner_id else "auto_skip",
                     actor="system",
                 )
+
+        await expire_disconnected_room_sessions(current)
 
 
 async def tournament_scheduler_loop() -> None:
@@ -1114,6 +1558,9 @@ class Player:
         self.last_global_chat_at = 0.0
         self.tournament_participant_id: Optional[str] = None
         self.disconnected_at: Optional[datetime] = None
+        self.room_resume_token_hash: Optional[str] = None
+        self.room_session_room_id: Optional[str] = None
+        self.client_surface = "legacy"
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -3192,11 +3639,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
             elif msg_type == "tournament_register":
-                if player.room is None or player.room.room_id != TOURNAMENT_ROOM_ID:
+                if not is_tournament_managed_room(player.room):
                     await player.send_json({"type": "error", "message": "plus大会ルームへ入室してから登録してください。"})
                     continue
                 try:
                     player = await register_or_resume_tournament_player(player, data)
+                except TournamentSessionConflict as exc:
+                    await player.send_json({
+                        "type": "tournament_session_conflict",
+                        "message": str(exc),
+                        "run_id": exc.run.run_id,
+                        "participant_id": exc.participant_id,
+                        "tournament": tournament_public_payload(exc.run),
+                    })
                 except ValueError as exc:
                     await player.send_json({"type": "error", "code": "tournament_registration", "message": str(exc)})
                 continue
@@ -3205,6 +3660,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     await withdraw_tournament_player(player)
                 except ValueError as exc:
                     await player.send_json({"type": "error", "code": "tournament_withdraw", "message": str(exc)})
+                continue
+            elif msg_type == "tournament_match_ready":
+                try:
+                    await mark_tournament_match_ready(player, str(data.get("match_id", "")))
+                except ValueError as exc:
+                    await player.send_json({"type": "error", "code": "tournament_match_ready", "message": str(exc)})
                 continue
             elif msg_type == "tournament_admin_schedule":
                 if not tournament_admin_authorized(data.get("admin_token")):
@@ -3330,24 +3791,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
 
+                resumed_session = room_resume_session(data.get("resume_token"), rid)
+                if resumed_session is not None and resumed_session is not player:
+                    player = await bind_room_resume_session(player, resumed_session)
+                    active_room = player.room or room
+                    if player.room is None:
+                        active_room.players.append(player)
+                        player.room = active_room
+                    await active_room.update_room_status()
+                    await player.send_json(room_initialization_payload(active_room, player))
+                    await player.send_hand_update()
+                    if active_room.state == "playing":
+                        await active_room.update_game_state()
+                    continue
+
                 if player.room is room:
                     await room.update_room_status()
-                    await player.send_json({
-                        "type": "room_state_initialization",
-                        "room_state": room.state,
-                        "category": room.category,
-                        "allow_composite": room.rule.allow_composite,
-                        "prime_rule": room.rule.prime_rule.name.lower(),
-                        "assist_enabled": room.rule.assist_enabled,
-                        "registration_enabled": room.rule.registration_enabled,
-                        "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
-                        "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
-                        "cpu_profiles": available_cpu_profile_payloads(room.rule),
-                        "tournament": tournament_public_payload(
-                            TOURNAMENT_RUNS_BY_ROOM.get(room.room_id),
-                            player.tournament_participant_id,
-                        ) if room.room_id == TOURNAMENT_ROOM_ID else None,
-                    })
+                    await player.send_json(room_initialization_payload(room, player))
                     continue
 
                 if player.room:
@@ -3368,23 +3828,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 player.room = room
                 player.status = "watching"  # 仮に入室したらwatchingに
 
+                if client_surface != "legacy":
+                    await issue_room_resume_session(player, rid)
                 await room.update_room_status()
-                await player.send_json({
-                    "type": "room_state_initialization",
-                    "room_state": room.state,
-                    "category": room.category,
-                    "allow_composite": room.rule.allow_composite,
-                    "prime_rule": room.rule.prime_rule.name.lower(),
-                    "assist_enabled": room.rule.assist_enabled,
-                    "registration_enabled": room.rule.registration_enabled,
-                    "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
-                    "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
-                    "cpu_profiles": available_cpu_profile_payloads(room.rule),
-                    "tournament": tournament_public_payload(
-                        TOURNAMENT_RUNS_BY_ROOM.get(room.room_id),
-                        player.tournament_participant_id,
-                    ) if room.room_id == TOURNAMENT_ROOM_ID else None,
-                })
+                await player.send_json(room_initialization_payload(room, player))
 
             elif msg_type == "leave_room":
                 await leave_room(player)
@@ -3393,7 +3840,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:  # 部屋にいなければ無視
                     continue
                 room = player.room
-                if room.room_id == TOURNAMENT_ROOM_ID:
+                if is_tournament_managed_room(room):
                     await player.send_json({
                         "type": "error",
                         "message": "大会ルームの対戦参加状態はシステムが管理します。大会パネルから参加登録してください。",
@@ -3418,7 +3865,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:
                     continue
                 room = player.room
-                if room.room_id == TOURNAMENT_ROOM_ID:
+                if is_tournament_managed_room(room):
                     await player.send_json({"type": "error", "message": "大会ルームにはCPUを追加できません。"})
                     continue
                 if room.state == "playing":
@@ -3452,7 +3899,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:
                     continue
                 room = player.room
-                if room.room_id == TOURNAMENT_ROOM_ID:
+                if is_tournament_managed_room(room):
                     await player.send_json({"type": "error", "message": "大会の対戦はシステムが自動で開始します。"})
                     continue
 
@@ -3460,6 +3907,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 waiting_players = get_active_players(room)
                 if len(waiting_players) not in (1, 2):
                     await websocket.send_json({"type": "error", "message": "対戦待ちは1人または2人必要です。"})
+                    continue
+                disconnected_waiting = [
+                    item
+                    for item in waiting_players
+                    if not is_cpu_player(item) and getattr(item, "ws", None) is None
+                ]
+                if disconnected_waiting:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "切断中の対戦待ちプレイヤーがいます。復帰するか待機猶予が終わるまでお待ちください。",
+                    })
                     continue
                 missing_registered = missing_registered_prime_players(room)
                 if missing_registered:
@@ -3558,23 +4016,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
-        if player.tournament_participant_id and player.room and player.room.room_id == TOURNAMENT_ROOM_ID:
-            player.ws = None
-            player.disconnected_at = utc_now()
-            await player.room.update_room_status()
-        else:
-            await leave_room(player, notify_client=False)
+        if player.ws is websocket and player.room is not None:
+            room = player.room
+            if player.room_resume_token_hash:
+                await mark_player_disconnected(player)
+                if room.state == "playing" and player.status == "waiting":
+                    record_score_play_line(room, player, "切断")
+                await room.update_room_status()
+            else:
+                await leave_room(player, notify_client=False)
     except Exception:
         traceback.print_exc()
-        if player.tournament_participant_id and player.room and player.room.room_id == TOURNAMENT_ROOM_ID:
-            player.ws = None
-            player.disconnected_at = utc_now()
-            await player.room.update_room_status()
-        else:
-            await leave_room(player, notify_client=False)
+        if player.ws is websocket and player.room is not None:
+            room = player.room
+            if player.room_resume_token_hash:
+                await mark_player_disconnected(player)
+                if room.state == "playing" and player.status == "waiting":
+                    record_score_play_line(room, player, "切断")
+                await room.update_room_status()
+            else:
+                await leave_room(player, notify_client=False)
     finally:
-        GLOBAL_CHAT_SUBSCRIBERS.discard(player)
-        player.global_chat_subscribed = False
+        if player.ws is websocket or player.ws is None:
+            GLOBAL_CHAT_SUBSCRIBERS.discard(player)
+            player.global_chat_subscribed = False
 
 ################################################
 # カードプレイ時の判定
@@ -4232,24 +4697,36 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 async def leave_room(player, notify_client: bool = True):
     if player.room is None:
         if notify_client:
-            await player.send_json(room_counts_payload())
+            await player.send_json(room_counts_payload(player.client_surface))
         return
 
-    room_id = player.room.room_id
-    if room_id == TOURNAMENT_ROOM_ID and player.tournament_participant_id:
-        run = TOURNAMENT_RUNS_BY_ROOM.get(room_id)
-        if run is not None and run.status == "running":
-            if notify_client:
-                await player.send_json({
-                    "type": "error",
-                    "message": "大会進行中は退室できません。切断後も復帰トークンで戻れます。",
-                })
-            return
-        player.disconnected_at = utc_now()
-    if room_id and player in rooms[room_id].players:
-        room = player.room
+    room = player.room
+    public_id = public_room_id(room)
+    run = tournament_for_player(player)
+    tournament_match = (
+        run.current_match_for_participant(player.tournament_participant_id)
+        if run is not None and player.tournament_participant_id
+        else None
+    )
+    if tournament_match is not None and tournament_match.status in {"called", "playing"}:
+        opponent_id = (
+            tournament_match.player2_id
+            if tournament_match.player1_id == player.tournament_participant_id
+            else tournament_match.player1_id
+        )
+        await resolve_tournament_match(
+            run,
+            tournament_match.match_id,
+            opponent_id,
+            resolution="explicit_leave_forfeit",
+            actor=run.participants[player.tournament_participant_id].display_name,
+            advance=False,
+        )
+        room = player.room or rooms[run.room_id]
+
+    if player in room.players:
         departed_player_id = player.id
-        rooms[room_id].players.remove(player)
+        room.players.remove(player)
         player.room = None
 
         # 退出通知
@@ -4263,8 +4740,13 @@ async def leave_room(player, notify_client: bool = True):
         player.room = None
         player.status = "watching"
         player.clear_hand()
+    forget_room_resume_session(player)
+    player.disconnected_at = None
     if notify_client:
-        await player.send_json(room_counts_payload())
+        await player.send_json({"type": "room_left", "room_id": public_id})
+        await player.send_json(room_counts_payload(player.client_surface))
+    if run is not None and tournament_match is not None and run.status == "running":
+        await start_or_prepare_next_tournament_match(run)
 
 
 ################################################
