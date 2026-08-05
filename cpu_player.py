@@ -6,9 +6,14 @@ from itertools import permutations
 import json
 from pathlib import Path
 import secrets
+import time
 from typing import Callable, Iterable, List, Optional
 
-from registered_primes import registered_prime_templates_for_hand, registered_value_encodings
+from registered_primes import (
+    registered_prime_template_index,
+    registered_prime_templates_for_hand,
+    registered_value_encodings,
+)
 from rules import PrimeRule
 
 
@@ -27,6 +32,22 @@ SILVER_PLAN_MAX_STEPS = SILVER_PLAN_MAX_RALLY_STEPS + 2
 SILVER_RALLY_COUNTS = (1, 2, 3, 4)
 SILVER_EVEN_RANKS = {2, 4, 6, 8, 10, 12}
 SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE = 0.0
+CPU_PLANNER_DEFAULT_BUDGET_MS = 250
+COMPOSITE_PRACTICE_MAX_PLAN_STEPS = 5
+COMPOSITE_PRACTICE_BRANCH_CAP = 48
+COMPOSITE_PRACTICE_RANK_WEIGHTS = {
+    0: 100,  # X
+    2: 60,
+    1: 25,
+    3: 25,
+    5: 25,
+    7: 10,
+    9: 10,
+    10: 10,
+    11: 10,
+    13: 10,
+}
+SILVER_PLAN_SEARCH_RESULT_CAP = GOLD_PLAN_MAX_RESULTS_PER_COUNT * 2
 FISH_EXTRA_343_PRIME_COUNT = 500
 FISH_343_TOKEN_VALUES = {
     "t": "10",
@@ -41,6 +62,10 @@ FISH_343_TOKEN_VALUES = {
 class CpuAction:
     kind: str
     payload: dict = field(default_factory=dict)
+
+
+class CpuSearchDeadline(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -94,6 +119,10 @@ class CpuPlayer:
         self.gold_plan_step_index = 0
         self.silver_active_plan: Optional[dict] = None
         self.silver_plan_step_index = 0
+        self.decision_time_budget_ms = CPU_PLANNER_DEFAULT_BUDGET_MS
+        self.decision_deadline: Optional[float] = None
+        self.last_decision_timed_out = False
+        self.small_finish_index = registered_prime_template_index((), max_cards=3)
 
     async def send_json(self, message: dict):
         return None
@@ -135,6 +164,10 @@ class CpuPlayer:
 
     def replace_registered_primes(self, values: set[int]) -> None:
         self.registered_primes = set(values)
+        self.small_finish_index = registered_prime_template_index(
+            tuple(sorted(self.registered_primes)),
+            max_cards=3,
+        )
 
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
@@ -156,7 +189,13 @@ def get_cpu_profile(cpu_key: str) -> Optional[CpuProfile]:
 
 
 def available_cpu_profiles_for_rule(rule) -> List[CpuProfile]:
-    return [profile for profile in CPU_PROFILES.values() if profile.supports_rule(rule)]
+    allowed_keys = tuple(getattr(rule, "cpu_profile_keys", ()) or ())
+    return [
+        profile
+        for profile in CPU_PROFILES.values()
+        if profile.supports_rule(rule)
+        and (not allowed_keys or profile.key in allowed_keys)
+    ]
 
 
 def available_cpu_profile_payloads(rule) -> List[dict]:
@@ -169,9 +208,33 @@ def choose_profile_cpu_action(
     validator: Optional[NumberValidator] = None,
 ) -> CpuAction:
     profile = get_cpu_profile(getattr(cpu, "cpu_key", "basic"))
-    if profile and profile.action_selector:
-        return profile.action_selector(cpu, room, validator)
-    return choose_cpu_action(cpu, room, validator=validator)
+    budget_ms = max(1, int(getattr(
+        cpu,
+        "decision_time_budget_ms",
+        CPU_PLANNER_DEFAULT_BUDGET_MS,
+    )))
+    cpu.decision_deadline = time.perf_counter() + budget_ms / 1000
+    cpu.last_decision_timed_out = False
+    try:
+        if profile and profile.action_selector:
+            return profile.action_selector(cpu, room, validator)
+        return choose_cpu_action(cpu, room, validator=validator)
+    except CpuSearchDeadline:
+        cpu.last_decision_timed_out = True
+        clear_gold_active_plan(cpu)
+        clear_silver_active_plan(cpu)
+        if profile and profile.key == "composite_practice":
+            cpu.decision_deadline = None
+            return choose_composite_practice_emergency_action(cpu, room)
+        return choose_cpu_action(cpu, room, validator=validator, max_cards=3)
+    finally:
+        cpu.decision_deadline = None
+
+
+def check_cpu_search_deadline(cpu: CpuPlayer) -> None:
+    deadline = getattr(cpu, "decision_deadline", None)
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise CpuSearchDeadline
 
 
 def choose_cpu_action(
@@ -188,6 +251,234 @@ def choose_cpu_action(
         return CpuAction("draw")
 
     return CpuAction("pass")
+
+
+def choose_composite_practice_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    """Choose from composite plays, reserving a known <=3-card prime for the finish."""
+    validator = gold_knowledge_number_validator
+    field = getattr(room, "field", []) or []
+
+    if not field:
+        plan = build_composite_practice_plan(
+            cpu,
+            room_without_field(room),
+            max_steps=COMPOSITE_PRACTICE_MAX_PLAN_STEPS,
+            validator=validator,
+        )
+        if plan is not None and plan.get("steps"):
+            return candidate_to_action(plan["steps"][0])
+
+    if field:
+        composite_finishes = direct_composite_finish_candidates(cpu, room)
+        if composite_finishes:
+            return candidate_to_action(max(
+                composite_finishes,
+                key=lambda candidate: candidate_strength(candidate, room),
+            ))
+        finish = choose_composite_practice_prime_finish(cpu, room, validator)
+        if finish is not None:
+            return candidate_to_action(finish)
+
+    counts = (len(field),) if field else range(1, min(9, len(cpu.hand)) + 1)
+    candidates = [
+        candidate
+        for candidate in knowledge_composite_candidates(cpu, room, counts)
+        if candidate_is_playable(candidate, cpu, room)
+    ]
+    if candidates:
+        best = max(
+            dedupe_candidates(candidates),
+            key=lambda candidate: composite_practice_fallback_score(cpu, room, candidate, validator),
+        )
+        return candidate_to_action(best)
+
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+    return CpuAction("pass")
+
+
+def choose_composite_practice_emergency_action(cpu: CpuPlayer, room) -> CpuAction:
+    composite_finishes = direct_composite_finish_candidates(cpu, room)
+    if composite_finishes:
+        return candidate_to_action(max(
+            composite_finishes,
+            key=lambda candidate: candidate_strength(candidate, room),
+        ))
+    finish = choose_composite_practice_prime_finish(cpu, room, gold_knowledge_number_validator)
+    if finish is not None:
+        return candidate_to_action(finish)
+    field = getattr(room, "field", []) or []
+    counts = (len(field),) if field else range(1, min(9, len(cpu.hand)) + 1)
+    candidates = [
+        candidate
+        for candidate in knowledge_composite_candidates(cpu, room, counts)
+        if candidate_is_playable(candidate, cpu, room)
+    ]
+    if candidates:
+        return candidate_to_action(min(
+            candidates,
+            key=lambda candidate: candidate_strength(candidate, room),
+        ))
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+    return CpuAction("pass")
+
+
+def choose_composite_practice_prime_finish(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[dict]:
+    max_cards = int(getattr(room.rule, "normal_finish_max_hand_size", 3))
+    if not 1 <= len(cpu.hand) <= max_cards:
+        return None
+    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]) and len(getattr(room, "field", []) or []) <= 1:
+        return {
+            "kind": "prime",
+            "number": "X",
+            "cards": cpu.hand[:],
+            "assigned_numbers": [],
+        }
+    candidates = direct_prime_finish_candidates(cpu, room, validator)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate_strength(candidate, room))
+
+
+def build_composite_practice_plan(
+    cpu: CpuPlayer,
+    room,
+    max_steps: int = COMPOSITE_PRACTICE_MAX_PLAN_STEPS,
+    validator: Optional[NumberValidator] = None,
+) -> Optional[dict]:
+    """Find an idealized partition plan, preferring a composite final play."""
+    validator = validator or gold_knowledge_number_validator
+    seen_depth: dict[tuple[str, ...], int] = {}
+
+    def visit(current: CpuPlayer, steps_left: int) -> Optional[dict]:
+        check_cpu_search_deadline(current)
+        signature = tuple(sorted(str(card.get("card_id")) for card in current.hand))
+        if seen_depth.get(signature, -1) >= steps_left:
+            return None
+        seen_depth[signature] = steps_left
+
+        prime_finish = choose_composite_practice_prime_finish(current, room, validator)
+        best = (
+            {"steps": [prime_finish], "finish_kind": "prime", "completed": True}
+            if prime_finish is not None
+            else None
+        )
+        if steps_left <= 0:
+            return best
+
+        direct_composites = direct_composite_finish_candidates(current, room)
+        if direct_composites:
+            finish = max(direct_composites, key=lambda item: candidate_strength(item, room))
+            return {"steps": [finish], "finish_kind": "composite", "completed": True}
+
+        candidates = knowledge_composite_candidates(
+            current,
+            room,
+            range(1, min(9, len(current.hand)) + 1),
+        )
+        complete_composites = [
+            candidate
+            for candidate in candidates
+            if len(candidate_consumed_cards(candidate)) == len(current.hand)
+        ]
+        if complete_composites:
+            finish = max(complete_composites, key=lambda item: candidate_strength(item, room))
+            composite_plan = {"steps": [finish], "finish_kind": "composite", "completed": True}
+            if best is None or composite_practice_plan_score(composite_plan, room) > composite_practice_plan_score(best, room):
+                best = composite_plan
+        candidates = [
+            candidate
+            for candidate in dedupe_candidates(candidates)
+            if candidate_is_playable(candidate, current, room)
+            and len(candidate_consumed_cards(candidate)) < len(current.hand)
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                len(candidate_consumed_cards(candidate)),
+                1 if int(candidate.get("number", 0)) == 57 else 0,
+                candidate_strength(candidate, room),
+            ),
+            reverse=True,
+        )
+        for candidate in candidates[:COMPOSITE_PRACTICE_BRANCH_CAP]:
+            remaining = remaining_cards(current.hand, candidate_consumed_cards(candidate))
+            child = temporary_cpu_with_hand(current, remaining)
+            tail = visit(child, steps_left - 1)
+            if tail is None:
+                continue
+            plan = {
+                "steps": [candidate] + tail["steps"],
+                "finish_kind": tail["finish_kind"],
+                "completed": True,
+            }
+            if best is None or composite_practice_plan_score(plan, room) > composite_practice_plan_score(best, room):
+                best = plan
+        return best
+
+    return visit(cpu, max_steps)
+
+
+def composite_practice_plan_score(plan: dict, room) -> tuple:
+    steps = plan.get("steps", [])
+    cut_count = sum(1 for step in steps if int(step.get("number", 0)) == 57)
+    return (
+        1 if plan.get("finish_kind") == "composite" else 0,
+        -len(steps),
+        cut_count,
+        candidate_strength(steps[-1], room) if steps else -1,
+    )
+
+
+def composite_practice_hand_resource_score(cpu: CpuPlayer, room, hand: List[Card]) -> tuple:
+    rank_score = sum(
+        COMPOSITE_PRACTICE_RANK_WEIGHTS.get(0 if is_joker(card) else int(card.get("rank", 0)), 0)
+        for card in hand
+    )
+    temp = temporary_cpu_with_hand(cpu, hand)
+    strongest = strongest_candidates_by_count(
+        knowledge_composite_candidates(temp, room_without_field(room), range(1, min(9, len(hand)) + 1)),
+        room,
+    )
+    trump_score = tuple(
+        candidate_strength(strongest[count], room) if count in strongest else -1
+        for count in range(9, 0, -1)
+    )
+    return rank_score, trump_score
+
+
+def composite_practice_fallback_score(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+    validator: NumberValidator,
+) -> tuple:
+    remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+    child = temporary_cpu_with_hand(cpu, remaining)
+    plan = build_composite_practice_plan(
+        child,
+        room_without_field(room),
+        max_steps=max(0, COMPOSITE_PRACTICE_MAX_PLAN_STEPS - 1),
+        validator=validator,
+    )
+    route_score = composite_practice_plan_score(plan, room) if plan else (-1, -999, 0, -1)
+    resource_score = composite_practice_hand_resource_score(cpu, room, remaining)
+    return (
+        1 if plan else 0,
+        route_score,
+        resource_score,
+        1 if int(candidate.get("number", 0)) == 57 else 0,
+        len(candidate_consumed_cards(candidate)),
+        -candidate_strength(candidate, room),
+    )
 
 
 def choose_gold_planning_cpu_action(
@@ -1082,6 +1373,7 @@ def search_same_count_gold_plans(
     max_steps: int,
     validator: NumberValidator,
 ) -> list[dict]:
+    check_cpu_search_deadline(cpu)
     direct_tail = choose_gold_finish_tail(cpu, room, validator)
     if direct_tail:
         return [
@@ -1091,6 +1383,7 @@ def search_same_count_gold_plans(
     results = []
     seen_plans = set()
     for joker_trump in (False, True):
+        check_cpu_search_deadline(cpu)
         last_candidates = gold_last_rally_candidates(
             cpu,
             room,
@@ -1099,6 +1392,7 @@ def search_same_count_gold_plans(
             joker_trump=joker_trump,
         )
         for last in last_candidates:
+            check_cpu_search_deadline(cpu)
             last = dict(last)
             last["joker_trump"] = joker_trump
             reserved_hand = remaining_cards(cpu.hand, candidate_consumed_cards(last))
@@ -1106,6 +1400,7 @@ def search_same_count_gold_plans(
             last_strength = candidate_strength(last, room)
 
             def visit(current_cpu: CpuPlayer, bound_strength: int, selected_desc: list[dict]) -> None:
+                check_cpu_search_deadline(current_cpu)
                 if len(results) >= GOLD_PLAN_MAX_RESULTS_PER_COUNT * 2:
                     return
                 tail = choose_gold_finish_tail(current_cpu, room, validator)
@@ -1132,6 +1427,7 @@ def search_same_count_gold_plans(
                     validator,
                 )
                 for rally, finish_tail in split_plans:
+                    check_cpu_search_deadline(current_cpu)
                     sequence = list(reversed(selected_desc + [rally])) + [last] + finish_tail
                     if len(sequence) > max_steps:
                         continue
@@ -1159,6 +1455,7 @@ def search_same_count_gold_plans(
                 )[:GOLD_PLAN_MAX_BRANCH_CANDIDATES]
 
                 for candidate in branch_candidates:
+                    check_cpu_search_deadline(current_cpu)
                     next_hand = remaining_cards(current_cpu.hand, candidate_consumed_cards(candidate))
                     next_cpu = temporary_cpu_with_hand(current_cpu, next_hand)
                     visit(next_cpu, candidate_strength(candidate, room), selected_desc + [candidate])
@@ -1212,16 +1509,23 @@ def search_same_count_silver_plans(
     rally_count: int,
     validator: NumberValidator,
 ) -> list[dict]:
+    check_cpu_search_deadline(cpu)
     results = []
     seen_plans = set()
     last_candidates = silver_last_rally_candidates(cpu, room, rally_count, validator)
 
     for last in last_candidates:
+        check_cpu_search_deadline(cpu)
+        if len(results) >= SILVER_PLAN_SEARCH_RESULT_CAP:
+            break
         reserved_hand = remaining_cards(cpu.hand, candidate_consumed_cards(last))
         reserved_cpu = temporary_cpu_with_hand(cpu, reserved_hand)
         last_strength = candidate_strength(last, room)
 
         def visit(current_cpu: CpuPlayer, bound_strength: int, selected_desc: list[dict]) -> None:
+            check_cpu_search_deadline(current_cpu)
+            if len(results) >= SILVER_PLAN_SEARCH_RESULT_CAP:
+                return
             tail = choose_gold_finish_tail(current_cpu, room_without_field(room), validator)
             if tail:
                 sequence = list(reversed(selected_desc)) + [last] + tail
@@ -1251,6 +1555,9 @@ def search_same_count_silver_plans(
             )[:GOLD_PLAN_MAX_BRANCH_CANDIDATES]
 
             for candidate in branch_candidates:
+                check_cpu_search_deadline(current_cpu)
+                if len(results) >= SILVER_PLAN_SEARCH_RESULT_CAP:
+                    return
                 next_hand = remaining_cards(current_cpu.hand, candidate_consumed_cards(candidate))
                 next_cpu = temporary_cpu_with_hand(current_cpu, next_hand)
                 visit(next_cpu, candidate_strength(candidate, room), selected_desc + [candidate])
@@ -1470,11 +1777,12 @@ def direct_prime_finish_candidates(
 ) -> list[dict]:
     non_joker_ranks = [int(card.get("rank", 0)) for card in cpu.hand if not is_joker(card)]
     joker_count = len(cpu.hand) - len(non_joker_ranks)
+    max_cards = int(getattr(getattr(room, "rule", None), "normal_finish_max_hand_size", 0) or 9)
     templates = registered_prime_templates_for_hand(
         cpu.registered_primes,
         non_joker_ranks,
         joker_count=joker_count,
-        max_cards=9,
+        max_cards=max_cards,
     )
     hand_ids = {card.get("card_id") for card in cpu.hand}
     candidates = []
@@ -2082,7 +2390,12 @@ def knowledge_composite_candidates(
 ) -> List[dict]:
     if not getattr(getattr(room, "rule", None), "allow_composite", False):
         return []
-    count_set = {count for count in counts if 2 <= count <= 4}
+    max_visible_cards = (
+        9
+        if getattr(getattr(room, "rule", None), "key", None) == "composite-practice-11-n"
+        else 4
+    )
+    count_set = {count for count in counts if 1 <= count <= max_visible_cards}
     if not count_set:
         return []
 
@@ -2092,7 +2405,7 @@ def knowledge_composite_candidates(
 
     candidates = []
     for value in sorted(set(cpu.registered_composites) | set(entries_by_value)):
-        for visible_ranks in registered_value_encodings(value, max_cards=4):
+        for visible_ranks in registered_value_encodings(value, max_cards=max_visible_cards):
             if len(visible_ranks) not in count_set:
                 continue
             visible_cards = cards_for_ranks(cpu.hand, visible_ranks)
@@ -2360,6 +2673,8 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
     temp.registered_primes = cpu.registered_primes
     temp.registered_composites = cpu.registered_composites
     temp.registered_composite_entries = cpu.registered_composite_entries
+    temp.decision_time_budget_ms = cpu.decision_time_budget_ms
+    temp.decision_deadline = cpu.decision_deadline
     return temp
 
 
@@ -2667,5 +2982,17 @@ CPU_PROFILES = {
             sample_key="silver_prime_table",
         ),
         action_selector=choose_talkative_fish_cpu_action,
+    ),
+    "composite_practice": CpuProfile(
+        key="composite_practice",
+        label="合成数練習CPU",
+        description="5手以内の合成数分け切りを優先し、合成数上がり、3枚以下の素数上がり、強札温存の順に評価します。",
+        rule_keys=("composite-practice-11-n",),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="composite_practice_cpu_ge3",
+        ),
+        action_selector=choose_composite_practice_cpu_action,
     ),
 }

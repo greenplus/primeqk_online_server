@@ -20,6 +20,10 @@ class PrimeRule(Enum):
     SEMIPRIME = auto()    # 半素数
     REGISTERED = auto()   # プレイヤーごとの登録済み素数
 
+class MovePolicy(Enum):
+    STANDARD = auto()
+    COMPOSITE_ONLY_WITH_SMALL_HAND_FINISH = auto()
+
 @dataclass(frozen=True)
 class RulePreset:
     key: str
@@ -34,6 +38,10 @@ class RulePreset:
     registration_enabled: bool = False
     hnp_challenge_enabled: bool = False
     registered_number_limit: int | None = None
+    move_policy: MovePolicy = MovePolicy.STANDARD
+    normal_finish_max_hand_size: int = 0
+    special_numbers_composite_only: bool = False
+    cpu_profile_keys: tuple[str, ...] = ()
 
 PRESETS: Dict[str, RulePreset] = {
     "std-5-1": RulePreset(
@@ -207,5 +215,19 @@ PRESETS: Dict[str, RulePreset] = {
         allow_composite=True,
         assist_enabled=True,
         registration_enabled=True,
+    ),
+    "composite-practice-11-n": RulePreset(
+        key="composite-practice-11-n",
+        label="合成数練習: 11枚 / 通常",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=True,
+        assist_enabled=True,
+        registration_enabled=True,
+        move_policy=MovePolicy.COMPOSITE_ONLY_WITH_SMALL_HAND_FINISH,
+        normal_finish_max_hand_size=3,
+        special_numbers_composite_only=True,
+        cpu_profile_keys=("composite_practice",),
     ),
 }

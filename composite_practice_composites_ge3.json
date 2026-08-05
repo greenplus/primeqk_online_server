@@ -1,0 +1,8 @@
+{
+  "name": "composite-practice-since2020-ge3",
+  "source": "outputs/prime_daifugo_since2020/candidates_ge3.csv",
+  "threshold": 3,
+  "composite_count": 299,
+  "minimum_total_count": 3,
+  "maximum_total_count": 508
+}

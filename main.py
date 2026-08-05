@@ -7,8 +7,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
-from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
-from registered_primes import parse_registered_composite_text, parse_registered_prime_text
+from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule, MovePolicy
+from registered_primes import (
+    parse_registered_composite_text,
+    parse_registered_prime_text,
+    registered_prime_template_index,
+)
 from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from cpu_player import (
     CpuPlayer,
@@ -70,6 +74,7 @@ SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
 GOLD_PRIME_TABLE_JSON = SERVER_DIR / "gold_prime_table_memory.json"
 SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
+COMPOSITE_PRACTICE_GE3_TEXT = SERVER_DIR / "composite_practice_composites_ge3.txt"
 CAMPAIGN_SETTINGS = CampaignSettings.from_env()
 CAMPAIGN_STORE = CampaignStore()
 TOURNAMENT_STORE = TournamentStore()
@@ -79,6 +84,9 @@ RECRUITMENT_STORE = RecruitmentStore(
     notification_window_seconds=RECRUITMENT_DISCORD_WINDOW_SECONDS,
 )
 TOURNAMENT_ADMIN_TOKEN = os.getenv("TOURNAMENT_ADMIN_TOKEN", "").strip()
+COMPOSITE_PRACTICE_ACCESS_TOKEN = os.getenv("COMPOSITE_PRACTICE_ACCESS_TOKEN", "").strip()
+COMPOSITE_PRACTICE_ROOM_ID = "composite_practice_1"
+COMPOSITE_PRACTICE_ACCESS_SCOPE = "composite_practice_owner"
 TOURNAMENT_ROOM_ID = "plus_tournament_1"
 PLUS_TOURNAMENT_RULE_KEYS = frozenset({
     "std-5-1",
@@ -380,6 +388,20 @@ def is_valid_prime_for_player(n: int, player: "Player", rule: RulePreset) -> boo
         return player.can_use_registered_prime(n)
     return is_valid_prime_by_rule(n, rule)
 
+
+def normal_play_allowed_for_player(player: "Player", rule: RulePreset, played_cards: List[dict]) -> bool:
+    if rule.move_policy is MovePolicy.STANDARD:
+        return True
+    if rule.move_policy is not MovePolicy.COMPOSITE_ONLY_WITH_SMALL_HAND_FINISH:
+        return False
+    if not 1 <= len(player.hand) <= rule.normal_finish_max_hand_size:
+        return False
+    return {
+        card.get("card_id") for card in played_cards
+    } == {
+        card.get("card_id") for card in player.hand
+    }
+
 def rule_display_name(prime_rule: PrimeRule) -> str:
     if prime_rule is PrimeRule.TETRAD:
         return "四つ子素数"
@@ -602,6 +624,7 @@ ROOM_CONFIG = [
     ("room_18", PRESETS["half-7-1-c-assist"], "Neo"),
     ("room_19", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_20", PRESETS["registered-11-n-assist"], "Neo"),
+    (COMPOSITE_PRACTICE_ROOM_ID, PRESETS["composite-practice-11-n"], "CompositePractice"),
     ("event_1", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_2", PRESETS["event-chef-11-1-c"], "Events"),
     ("event_3", PRESETS["event-chef-11-1-c"], "Events"),
@@ -622,6 +645,10 @@ ROOM_DESCRIPTIONS = {
         "合成数候補では、式に使う材料札もあわせてセットされます。"
         "ジョーカーを含む候補は X69|X=2 のような数譜方式で表示されます。"
     ),
+    COMPOSITE_PRACTICE_ROOM_ID: (
+        "合成数出しだけで進める非公開練習部屋です。手札が3枚以下のときに限り、"
+        "全手札を使う通常の合法手で上がれます。57と1729は合成数出しでのみ発動します。"
+    ),
 }
 rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
@@ -629,12 +656,14 @@ ROOM_CATEGORIES_BY_CLIENT_SURFACE = {
     "legacy": frozenset({"Classic", "Plus", "Events"}),
     "plus": frozenset({"Classic", "Plus"}),
     "neo": frozenset({"Neo"}),
+    "plus_practice": frozenset({"CompositePractice"}),
 }
 
 WEBSOCKET_CLIENT_SURFACE_BY_PATH = {
     "/ws": "legacy",
     "/ws/plus": "plus",
     "/ws/neo": "neo",
+    "/ws/plus-practice": "plus_practice",
 }
 
 
@@ -644,16 +673,23 @@ def room_is_available_to_client(room: Room, client_surface: Optional[str]) -> bo
     return room.category in ROOM_CATEGORIES_BY_CLIENT_SURFACE.get(client_surface, frozenset())
 
 
-def rooms_for_client(client_surface: Optional[str] = None) -> dict[str, Room]:
+def rooms_for_client(
+    client_surface: Optional[str] = None,
+    practice_authorized: bool = False,
+) -> dict[str, Room]:
     return {
         room_id: room
         for room_id, room in rooms.items()
         if room_is_available_to_client(room, client_surface)
+        and (room_id != COMPOSITE_PRACTICE_ROOM_ID or practice_authorized)
     }
 
 
-def room_counts_payload(client_surface: Optional[str] = None) -> dict:
-    visible_rooms = rooms_for_client(client_surface)
+def room_counts_payload(
+    client_surface: Optional[str] = None,
+    practice_authorized: bool = False,
+) -> dict:
+    visible_rooms = rooms_for_client(client_surface, practice_authorized=practice_authorized)
     return {
         "type": "room_counts",
         "client_surface": client_surface,
@@ -671,7 +707,9 @@ def room_counts_payload(client_surface: Optional[str] = None) -> dict:
             for rid, room in visible_rooms.items()
         },
         "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in visible_rooms},
-        "registered_sample_options": registered_sample_options(),
+        "registered_sample_options": registered_sample_options(
+            include_composite_practice=practice_authorized,
+        ),
         "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in visible_rooms.items()},
         "tournaments": {
             rid: tournament_public_payload(run)
@@ -815,6 +853,7 @@ async def bind_room_resume_session(
     incoming.ws, session.ws = None, incoming.ws
     session.disconnected_at = None
     session.client_surface = incoming.client_surface
+    session.composite_practice_authorized = incoming.composite_practice_authorized
     await session.send_json({"type": "your_id", "id": session.id, "name": session.name})
     await session.send_json({
         "type": "room_session",
@@ -880,6 +919,24 @@ def tournament_admin_authorized(value) -> bool:
         and isinstance(value, str)
         and secrets.compare_digest(value, TOURNAMENT_ADMIN_TOKEN)
     )
+
+
+def composite_practice_authorized(value) -> bool:
+    return bool(
+        COMPOSITE_PRACTICE_ACCESS_TOKEN
+        and isinstance(value, str)
+        and secrets.compare_digest(value, COMPOSITE_PRACTICE_ACCESS_TOKEN)
+    )
+
+
+def player_can_access_room(player: "Player", room: Room) -> bool:
+    if room.room_id != COMPOSITE_PRACTICE_ROOM_ID:
+        return True
+    return bool(getattr(player, "composite_practice_authorized", False))
+
+
+def room_discord_join_notifications_enabled(room: Room) -> bool:
+    return room.room_id != COMPOSITE_PRACTICE_ROOM_ID
 
 
 async def send_tournament_status(player: "Player") -> None:
@@ -1650,6 +1707,8 @@ class Player:
         self.room_resume_token_hash: Optional[str] = None
         self.room_session_room_id: Optional[str] = None
         self.client_surface = "legacy"
+        self.composite_practice_authorized = False
+        self.small_finish_index = registered_prime_template_index((), max_cards=3)
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -1706,6 +1765,10 @@ class Player:
 
     def replace_registered_primes(self, values: set[int]) -> None:
         self.registered_primes = set(values)
+        self.small_finish_index = registered_prime_template_index(
+            tuple(sorted(self.registered_primes)),
+            max_cards=3,
+        )
 
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
@@ -2273,6 +2336,20 @@ REGISTERED_SAMPLE_DEFS = {
         "prime_json": SILVER_PRIME_TABLE_JSON,
         "composite_text": None,
     },
+    "composite_practice_ge3": {
+        "label": "合成数練習：大会3回以上",
+        "prime_json": SAMPLE_MEMORY_JSON,
+        "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
+        "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
+        "visible": True,
+    },
+    "composite_practice_cpu_ge3": {
+        "label": "合成数練習CPU：大会3回以上",
+        "prime_json": GOLD_PRIME_TABLE_JSON,
+        "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
+        "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
+        "visible": False,
+    },
 }
 DEFAULT_REGISTERED_SAMPLE_KEY = "sashimi2024"
 
@@ -2308,6 +2385,8 @@ def load_registered_samples() -> dict:
         samples[key] = {
             "key": key,
             "label": definition["label"],
+            "access_scope": definition.get("access_scope"),
+            "visible": definition.get("visible", True),
             "data": load_sample_memory_from_files(
                 definition["prime_json"],
                 definition.get("composite_text"),
@@ -2317,9 +2396,13 @@ def load_registered_samples() -> dict:
 
 REGISTERED_SAMPLES = load_registered_samples()
 
-def registered_sample_options() -> list[dict]:
+def registered_sample_options(include_composite_practice: bool = False) -> list[dict]:
     options = []
     for key, sample in REGISTERED_SAMPLES.items():
+        if not sample.get("visible", True):
+            continue
+        if sample.get("access_scope") == COMPOSITE_PRACTICE_ACCESS_SCOPE and not include_composite_practice:
+            continue
         prime_values, composite_values, _, _, _ = sample["data"]
         prime_count = len(set(prime_values))
         composite_count = len(set(composite_values))
@@ -2331,6 +2414,18 @@ def registered_sample_options() -> list[dict]:
             "total_count": prime_count + composite_count,
         })
     return options
+
+
+def player_can_load_registered_sample(player: "Player", sample: Optional[dict]) -> bool:
+    if sample is None:
+        return False
+    if sample.get("access_scope") != COMPOSITE_PRACTICE_ACCESS_SCOPE:
+        return True
+    return bool(
+        getattr(player, "composite_practice_authorized", False)
+        and player.room is not None
+        and player.room.room_id == COMPOSITE_PRACTICE_ROOM_ID
+    )
 
 def registered_sample_for_key(sample_key: str):
     return REGISTERED_SAMPLES.get(sample_key) or REGISTERED_SAMPLES.get(DEFAULT_REGISTERED_SAMPLE_KEY)
@@ -3029,6 +3124,9 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
     ):
         return {"candidates": [], "truncated": False, "source": "hand"}
 
+    composite_practice = (
+        room.rule.move_policy is MovePolicy.COMPOSITE_ONLY_WITH_SMALL_HAND_FINISH
+    )
     selected_ids = data.get("selected_card_ids") or []
     if not isinstance(selected_ids, list):
         selected_ids = []
@@ -3109,7 +3207,13 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
     candidates = []
     scanned = 0
     registered_numbers = []
-    if kind_scope in ("all", "prime"):
+    if (
+        kind_scope in ("all", "prime")
+        and (
+            not composite_practice
+            or len(player.hand) <= room.rule.normal_finish_max_hand_size
+        )
+    ):
         registered_numbers.extend(
             ("prime", number, None)
             for number in player.registered_primes
@@ -3120,14 +3224,14 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
             ("composite", entry.value, entry)
             for entry in player.registered_composite_entries
             if entry.value in player.registered_composites
-            and entry.value not in SPECIAL_ASSIST_EFFECTS
+            and (composite_practice or entry.value not in SPECIAL_ASSIST_EFFECTS)
         )
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
     infinity_allowed_by_count = (
         generation_required_card_count is None
         or generation_required_card_count == 1
-    )
+    ) and (not composite_practice or len(player.hand) == 1)
     if infinity_allowed_by_count:
         infinity_card = next(
             (
@@ -3174,7 +3278,7 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
                 )
             candidates.append(infinity_candidate)
 
-    for number, special_effect in SPECIAL_ASSIST_EFFECTS.items():
+    for number, special_effect in (() if composite_practice else SPECIAL_ASSIST_EFFECTS.items()):
         if generation_apply_field_value_filter and not field_allows_number_value(room, number):
             continue
         if not can_realize_number_text(number):
@@ -3251,6 +3355,8 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
             ):
                 continue
             realization["kind"] = kind
+            if composite_practice and kind == "composite" and number in SPECIAL_ASSIST_EFFECTS:
+                realization["special_effect"] = SPECIAL_ASSIST_EFFECTS[number]
             realization["field_count_match"] = (
                 count_scope == "specified"
                 or not room.field
@@ -3304,6 +3410,18 @@ def _build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> 
                 }
             )
             candidates.append(realization)
+
+    if composite_practice:
+        hand_ids = {card["card_id"] for card in player.hand}
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("kind") == "composite"
+            or {
+                card["card_id"]
+                for card in candidate.get("cards", [])
+            } == hand_ids
+        ]
 
     result = finalize_assist_candidates(
         candidates,
@@ -3434,6 +3552,8 @@ def discord_join_notification_content(player_name: str, room: Room) -> str:
 
 
 async def notify_discord_join(player_name: str, room: Room):
+    if not room_discord_join_notifications_enabled(room):
+        return
     async with _discord_join_notify_lock:
         should_send, suppressed = reserve_discord_join_notification()
 
@@ -3805,6 +3925,7 @@ async def pass_turn_for_player(player, room: Room) -> None:
 
 @app.websocket("/ws/neo")
 @app.websocket("/ws/plus")
+@app.websocket("/ws/plus-practice")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     client_surface = WEBSOCKET_CLIENT_SURFACE_BY_PATH.get(websocket.scope.get("path"), "legacy")
@@ -3821,7 +3942,36 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_type = data.get("type")
             room_id = player.room.room_id if player.room else None
 
-            if msg_type == "set_name":
+            if (
+                client_surface == "plus_practice"
+                and msg_type != "authorize_composite_practice"
+                and not player.composite_practice_authorized
+            ):
+                await player.send_json({
+                    "type": "error",
+                    "code": "practice_authorization_required",
+                    "message": "先に練習部屋の認証を行ってください。",
+                })
+                continue
+
+            if msg_type == "authorize_composite_practice":
+                authorized = (
+                    client_surface == "plus_practice"
+                    and composite_practice_authorized(data.get("access_token"))
+                )
+                player.composite_practice_authorized = authorized
+                await player.send_json({
+                    "type": "composite_practice_authorization",
+                    "authorized": authorized,
+                    "message": "認証しました。" if authorized else "アクセストークンが正しくありません。",
+                })
+                if authorized:
+                    await player.send_json(room_counts_payload(
+                        client_surface,
+                        practice_authorized=True,
+                    ))
+                continue
+            elif msg_type == "set_name":
                 requested_name = data.get("name", "")
                 if not isinstance(requested_name, str):
                     await player.send_json({
@@ -3970,6 +4120,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not isinstance(sample_key, str):
                     sample_key = DEFAULT_REGISTERED_SAMPLE_KEY
                 sample = registered_sample_for_key(sample_key)
+                if not player_can_load_registered_sample(player, sample):
+                    await player.send_json({
+                        "type": "error",
+                        "code": "registered_sample_forbidden",
+                        "message": "このサンプルを読み込む権限がありません。",
+                    })
+                    continue
                 sample_data = sample["data"] if sample else ((), (), (), "", "")
                 if not sample_data[0] and not sample_data[1]:
                     await player.send_json({
@@ -3988,7 +4145,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     await player.room.update_room_status()
                 continue
             elif msg_type == "get_room_counts":
-                await websocket.send_json(room_counts_payload(client_surface))
+                await websocket.send_json(room_counts_payload(
+                    client_surface,
+                    practice_authorized=player.composite_practice_authorized,
+                ))
 
             elif msg_type == "get_recruitments":
                 if client_surface not in {"neo", "plus"}:
@@ -4109,6 +4269,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": "このクライアントからは選択した部屋に入室できません。",
                     })
                     continue
+                if not player_can_access_room(player, room):
+                    await websocket.send_json({
+                        "type": "error",
+                        "code": "practice_authorization_required",
+                        "message": "この練習部屋へ入るには認証が必要です。",
+                    })
+                    continue
 
                 resumed_session = room_resume_session(data.get("resume_token"), rid)
                 if resumed_session is not None and resumed_session is not player:
@@ -4138,9 +4305,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await room.log_chat(f"{player.name}が入室しました")
                 # 同期処理の後で、バックグラウンドに通知タスクを投げる
-                asyncio.create_task(
-                    notify_discord_join(player.name, room)
-                )
+                if room_discord_join_notifications_enabled(room):
+                    asyncio.create_task(
+                        notify_discord_join(player.name, room)
+                    )
 
 
                 room.players.append(player)
@@ -4307,12 +4475,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 await pass_turn_for_player(player, room)
 
             elif msg_type == "join_global_chat":
+                if client_surface == "plus_practice":
+                    await player.send_json({"type": "error", "message": "練習ページではグローバルチャットを利用できません。"})
+                    continue
                 await subscribe_global_chat(player)
 
             elif msg_type == "leave_global_chat":
                 await unsubscribe_global_chat(player)
 
             elif msg_type == "global_chat":
+                if client_surface == "plus_practice":
+                    await player.send_json({"type": "error", "message": "練習ページではグローバルチャットを利用できません。"})
+                    continue
                 await handle_global_chat_message(player, data)
 
             elif msg_type == "chat":
@@ -4373,6 +4547,13 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # 手札にあるか検証
     if not player.has_cards(played_cards):
         await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
+        return
+    if not normal_play_allowed_for_player(player, room.rule, played_cards):
+        await player.ws.send_json({
+            "type": "error",
+            "code": "composite_play_required",
+            "message": "この部屋では合成数出しだけが使えます。手札3枚以下では、全手札を使う通常の合法手でのみ上がれます。",
+        })
         return
 
     # ジョーカー絡みの処理
@@ -4479,7 +4660,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
                 return
 
     # グロタンカット
-    if number == 57:
+    if number == 57 and not room.rule.special_numbers_composite_only:
         # 出した順そのまま予備軍に
         push_to_reserve(room, played_cards)
         for c in played_cards:
@@ -4507,7 +4688,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
             return
         await broadcast_turn_update(room, player.name)
         return  # 次の処理（素数判定～next_turn）をすべてスキップ
-    if number == 1729:
+    if number == 1729 and not room.rule.special_numbers_composite_only:
         # フラグをトグル
         room.reverse_order = not room.reverse_order
         # カードを場に出す
@@ -4976,6 +5157,54 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         await next_turn(room)
         return
 
+    if room.rule.special_numbers_composite_only and sel_number in {57, 1729}:
+        push_to_reserve(room, sel_cards)
+        sel_ids = {c["card_id"] for c in sel_cards}
+        con_only = [c for c in con_cards if c["card_id"] not in sel_ids]
+        return_cards_to_deck_bottom(room, con_only)
+        for card in all_consume:
+            player.remove_card(card)
+
+        await player.send_hand_update()
+        if sel_number == 57:
+            flow_field(room)
+            room.has_drawn = False
+            await room.update_game_state()
+            await room.broadcast({
+                "type": "action_result",
+                "action": "field_flow",
+                "player_id": player.id,
+                "played_cards": sel_cards,
+                "number": 57,
+                "mode": "composite",
+                "flow_reason": "grotan_cut",
+            })
+            await room.log_chat(f"{player.name}が合成数 {composite_chat_text} を出しました、グロタンカット！")
+            record_score_play_line(room, player, f"{score_prefix}{score_composite_text}[GC]{score_win_suffix(player)}")
+            if await room.try_end_game():
+                await room.update_room_status()
+                return
+            await broadcast_turn_update(room, player.name)
+            return
+
+        room.reverse_order = not room.reverse_order
+        room.field = sel_cards
+        room.last_number = sel_number
+        await room.update_game_state()
+        await room.broadcast({
+            "type": "action_result",
+            "action": "play_card",
+            "player_id": player.id,
+            "played_cards": sel_cards,
+            "number": 1729,
+            "mode": "composite",
+            "special_effect": "revolution",
+        })
+        await room.log_chat(f"{player.name}が合成数 {composite_chat_text} を出しました、ラマヌジャン革命！")
+        record_score_play_line(room, player, f"{score_prefix}{score_composite_text}[RR]{score_win_suffix(player)}")
+        await next_turn(room)
+        return
+
     # 7) すべてOK → 札を「出した順」でreserveに積む → 手札から除去
     #    出した順は UI から渡す順序（selected→consume）で良ければそのまま。必要なら tokens から順序を決める。
     push_to_reserve(room, sel_cards)
@@ -5016,7 +5245,10 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 async def leave_room(player, notify_client: bool = True):
     if player.room is None:
         if notify_client:
-            await player.send_json(room_counts_payload(player.client_surface))
+            await player.send_json(room_counts_payload(
+                player.client_surface,
+                practice_authorized=player.composite_practice_authorized,
+            ))
         return
 
     room = player.room
@@ -5063,7 +5295,10 @@ async def leave_room(player, notify_client: bool = True):
     player.disconnected_at = None
     if notify_client:
         await player.send_json({"type": "room_left", "room_id": public_id})
-        await player.send_json(room_counts_payload(player.client_surface))
+        await player.send_json(room_counts_payload(
+            player.client_surface,
+            practice_authorized=player.composite_practice_authorized,
+        ))
     if run is not None and tournament_match is not None and run.status == "running":
         await start_or_prepare_next_tournament_match(run)
 
