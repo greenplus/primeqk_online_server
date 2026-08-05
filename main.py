@@ -27,6 +27,11 @@ from assist_recommendation import (
 from campaign_store import CampaignSettings, CampaignStore, utc_now
 from tournament import TournamentRun, hash_resume_token, issue_resume_token, parse_datetime
 from tournament_store import TournamentStore
+from recruitment_store import (
+    MAX_ACTIVE_RECRUITMENTS,
+    RecruitmentError,
+    RecruitmentStore,
+)
 import copy
 import json
 import random
@@ -57,6 +62,7 @@ SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
 CAMPAIGN_SETTINGS = CampaignSettings.from_env()
 CAMPAIGN_STORE = CampaignStore()
 TOURNAMENT_STORE = TournamentStore()
+RECRUITMENT_STORE = RecruitmentStore()
 TOURNAMENT_ADMIN_TOKEN = os.getenv("TOURNAMENT_ADMIN_TOKEN", "").strip()
 TOURNAMENT_ROOM_ID = "plus_tournament_1"
 PLUS_TOURNAMENT_RULE_KEYS = frozenset({
@@ -90,6 +96,7 @@ async def lifespan(_app):
     if CAMPAIGN_SETTINGS.enabled:
         await CAMPAIGN_STORE.connect()
     await TOURNAMENT_STORE.connect()
+    await RECRUITMENT_STORE.connect()
     for run in await TOURNAMENT_STORE.load_active_runs():
         TOURNAMENT_RUNS_BY_ROOM[run.room_id] = run
     TOURNAMENT_SCHEDULER_TASK = asyncio.create_task(tournament_scheduler_loop())
@@ -102,6 +109,7 @@ async def lifespan(_app):
             pass
     await CAMPAIGN_STORE.close()
     await TOURNAMENT_STORE.close()
+    await RECRUITMENT_STORE.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -645,6 +653,18 @@ def room_counts_payload(client_surface: Optional[str] = None) -> dict:
     }
 
 
+async def recruitment_payload(owner_token: object, notice: Optional[str] = None) -> dict:
+    payload = {
+        "type": "recruitments",
+        "items": await RECRUITMENT_STORE.list_active(owner_token=owner_token),
+        "max_count": MAX_ACTIVE_RECRUITMENTS,
+        "server_now": utc_now().isoformat(),
+    }
+    if notice:
+        payload["notice"] = notice
+    return payload
+
+
 def tournament_public_payload(
     run: Optional[TournamentRun],
     viewer_participant_id: Optional[str] = None,
@@ -728,9 +748,15 @@ def room_disconnect_grace_seconds(room: "Room", player: "Player") -> int:
 async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] = None) -> None:
     if player.room is None:
         return
+    first_notice = getattr(player, "disconnected_at", None) is None
+    room = player.room
     player.ws = None
-    if getattr(player, "disconnected_at", None) is None:
+    if first_notice:
         player.disconnected_at = now or utc_now()
+        grace_seconds = room_disconnect_grace_seconds(room, player)
+        await room.log_chat(
+            f"{player.name}の通信が一時的に切れました。{grace_seconds}秒間、復帰を待ちます。"
+        )
 
 
 def room_resume_session(token: object, requested_room_id: str) -> Optional["Player"]:
@@ -760,6 +786,8 @@ async def bind_room_resume_session(
         "status": "resumed",
         "display_name": session.name,
     })
+    if session.room is not None:
+        await session.room.log_chat(f"{session.name}が通信切断から復帰しました。")
     return session
 
 
@@ -1168,6 +1196,21 @@ async def start_or_prepare_next_tournament_match(run: TournamentRun) -> None:
     await lobby.update_room_status()
 
 
+def tournament_disconnect_resolution_message(
+    run: TournamentRun,
+    match,
+    winner_id: Optional[str],
+    resolution: str,
+) -> Optional[str]:
+    if resolution == "forfeit" and winner_id is not None:
+        loser_id = match.player2_id if winner_id == match.player1_id else match.player1_id
+        loser_name = run.participants[loser_id].display_name
+        return f"{loser_name}は復帰猶予を超えたため、切断による不戦敗になりました。"
+    if resolution == "auto_skip":
+        return "両対戦者が復帰猶予を超えたため、切断扱いで対戦をスキップしました。"
+    return None
+
+
 async def resolve_tournament_match(
     run: TournamentRun,
     match_id: str,
@@ -1186,6 +1229,14 @@ async def resolve_tournament_match(
     })
     lobby = rooms[run.room_id]
     await close_tournament_match_room(run, match_id, winner_id=winner_id)
+    disconnect_message = tournament_disconnect_resolution_message(
+        run,
+        match,
+        winner_id,
+        resolution,
+    )
+    if disconnect_message:
+        await lobby.log_chat(disconnect_message)
     if winner_id is None:
         await lobby.log_chat("対戦はスキップされました。")
     else:
@@ -1324,6 +1375,9 @@ async def expire_disconnected_room_sessions(now: Optional[datetime] = None) -> N
             player.status = "watching"
             player.clear_hand()
             forget_room_resume_session(player)
+            await room.log_chat(
+                f"{player.name}は復帰猶予を超えたため、切断扱いで退室しました。"
+            )
         await handle_room_after_player_removed(
             room,
             departed_ids[0] if len(departed_ids) == 1 else None,
@@ -3776,6 +3830,102 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             elif msg_type == "get_room_counts":
                 await websocket.send_json(room_counts_payload(client_surface))
+
+            elif msg_type == "get_recruitments":
+                if client_surface != "neo":
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "unavailable",
+                        "message": "このクライアントでは募集掲示板を利用できません。",
+                    })
+                    continue
+                try:
+                    await player.send_json(await recruitment_payload(data.get("owner_token")))
+                except RecruitmentError as exc:
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": exc.code,
+                        "message": exc.message,
+                    })
+                except Exception as exc:
+                    print(f"recruitment list failed: {exc}")
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "temporarily_unavailable",
+                        "message": "募集を読み込めませんでした。時間をおいて再度お試しください。",
+                    })
+                continue
+
+            elif msg_type == "create_recruitment":
+                if client_surface != "neo":
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "unavailable",
+                        "message": "このクライアントでは募集掲示板を利用できません。",
+                    })
+                    continue
+                try:
+                    await RECRUITMENT_STORE.create(
+                        name=data.get("name"),
+                        rule_key=data.get("rule_key"),
+                        scheduled_at=data.get("scheduled_at"),
+                        owner_token=data.get("owner_token"),
+                    )
+                    await player.send_json(await recruitment_payload(
+                        data.get("owner_token"),
+                        notice="募集を投稿しました。集合時間になると自動で消えます。",
+                    ))
+                except RecruitmentError as exc:
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": exc.code,
+                        "message": exc.message,
+                    })
+                except Exception as exc:
+                    print(f"recruitment creation failed: {exc}")
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "temporarily_unavailable",
+                        "message": "募集を投稿できませんでした。時間をおいて再度お試しください。",
+                    })
+                continue
+
+            elif msg_type == "delete_recruitment":
+                if client_surface != "neo":
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "unavailable",
+                        "message": "このクライアントでは募集掲示板を利用できません。",
+                    })
+                    continue
+                try:
+                    deleted = await RECRUITMENT_STORE.delete(
+                        recruitment_id=data.get("recruitment_id"),
+                        owner_token=data.get("owner_token"),
+                    )
+                    if not deleted:
+                        raise RecruitmentError(
+                            "not_owner",
+                            "募集が見つからないか、削除できる投稿者ではありません。",
+                        )
+                    await player.send_json(await recruitment_payload(
+                        data.get("owner_token"),
+                        notice="募集を削除しました。",
+                    ))
+                except RecruitmentError as exc:
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": exc.code,
+                        "message": exc.message,
+                    })
+                except Exception as exc:
+                    print(f"recruitment deletion failed: {exc}")
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "temporarily_unavailable",
+                        "message": "募集を削除できませんでした。時間をおいて再度お試しください。",
+                    })
+                continue
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
