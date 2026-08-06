@@ -91,14 +91,15 @@ COMPOSITE_PRACTICE_ACCESS_TOKEN = os.getenv("COMPOSITE_PRACTICE_ACCESS_TOKEN", "
 COMPOSITE_PRACTICE_ROOM_ID = "composite_practice_1"
 COMPOSITE_PRACTICE_ACCESS_SCOPE = "composite_practice_owner"
 TOURNAMENT_ROOM_ID = "plus_tournament_1"
-PLUS_TOURNAMENT_RULE_KEYS = frozenset({
-    "std-5-1",
-    "std-7-1",
-    "std-11-n-c",
-    "std-11-n-c-rev",
-    "tetrad-11-n-c",
-    "semiprime-11-n-c",
-})
+PLUS_TOURNAMENT_RULE_KEYS = frozenset(
+    key
+    for key, preset in PRESETS.items()
+    if preset.prime_rule != PrimeRule.REGISTERED
+    and not preset.assist_enabled
+    and not preset.registration_enabled
+    and not preset.hnp_challenge_enabled
+    and preset.move_policy == MovePolicy.STANDARD
+)
 TOURNAMENT_RUNS_BY_ROOM: dict[str, TournamentRun] = {}
 TOURNAMENT_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_MATCH_ROOMS: dict[str, "Room"] = {}
@@ -755,15 +756,79 @@ def tournament_public_payload(
             "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
             "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
             "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+            "available_rules": tournament_rule_catalog(),
         }
     return {
         **run.public_payload(viewer_participant_id=viewer_participant_id),
+        "rule": tournament_rule_payload(PRESETS[run.rule_key]),
+        "available_rules": tournament_rule_catalog(),
         "persistent": TOURNAMENT_STORE.persistent,
         "match_ready_seconds": tournament_match_ready_seconds(),
         "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
     }
+
+
+def tournament_rule_payload(preset: RulePreset) -> dict:
+    deck_rules = {
+        DeckRule.DEFAULT: ("default", "山札通常", True),
+        DeckRule.EVEN_HALVED: ("even_halved", "山札の偶数カード半減", False),
+        DeckRule.EVEN_HALVED_WITH_CHEFS: (
+            "even_halved_with_chefs",
+            "山札の偶数カード半減＋コックさん12枚",
+            False,
+        ),
+    }
+    penalty_rules = {
+        PenaltyRule.NORMAL: ("normal", "ペナルティ通常", True),
+        PenaltyRule.ALWAYS_1: ("always_1", "ペナルティ1枚", False),
+        PenaltyRule.FIELD_COUNT: ("field_count", "ペナルティは場の枚数", False),
+    }
+    prime_rules = {
+        PrimeRule.NORMAL: ("normal", "素数", True),
+        PrimeRule.TETRAD: ("tetrad", "四つ子素数", False),
+        PrimeRule.SEMIPRIME: ("semiprime", "半素数", False),
+        PrimeRule.REGISTERED: ("registered", "登録制限", False),
+    }
+    deck_key, deck_label, deck_default = deck_rules[preset.deck_rule]
+    penalty_key, penalty_label, penalty_default = penalty_rules[preset.penalty_rule]
+    prime_key, prime_label, prime_default = prime_rules[preset.prime_rule]
+    summary_parts = []
+    if preset.start_revolution:
+        summary_parts.append("初期革命")
+    if not prime_default:
+        summary_parts.append(prime_label)
+    summary_parts.append(f"{preset.hand_size}枚")
+    if not deck_default:
+        summary_parts.append(deck_label.removeprefix("山札の"))
+    if not penalty_default:
+        summary_parts.append(penalty_label)
+    if not preset.allow_composite:
+        summary_parts.append("合成数なし")
+    return {
+        "key": preset.key,
+        "label": preset.label,
+        "summary": " / ".join(summary_parts),
+        "hand_size": preset.hand_size,
+        "deck_rule": {"key": deck_key, "label": deck_label, "default": deck_default},
+        "penalty_rule": {
+            "key": penalty_key,
+            "label": penalty_label,
+            "default": penalty_default,
+        },
+        "prime_rule": {"key": prime_key, "label": prime_label, "default": prime_default},
+        "allow_composite": preset.allow_composite,
+        "start_revolution": preset.start_revolution,
+    }
+
+
+def tournament_rule_catalog() -> list[dict]:
+    return [
+        tournament_rule_payload(preset)
+        for key, preset in PRESETS.items()
+        if key in PLUS_TOURNAMENT_RULE_KEYS
+    ]
 
 
 def tournament_match_ready_seconds() -> int:
@@ -983,6 +1048,9 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         "starts_at": run.starts_at.isoformat(),
     })
     await room.log_chat(f"大会「{run.title}」の日程が設定されました。")
+    await notify_tournament_discord(run, "scheduled")
+    if run.status == "registration":
+        await notify_tournament_discord(run, "registration")
     await room.update_room_status()
     return run
 
@@ -1168,6 +1236,74 @@ async def announce_tournament_globally(message: str) -> None:
     }, client_surface="plus")
 
 
+def tournament_discord_notification_content(
+    run: TournamentRun,
+    event: str,
+    *,
+    winner_text: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
+    event_headings = {
+        "scheduled": "📅 **大会開催決定 / 素数大富豪＋**",
+        "registration": "📣 **大会参加登録開始 / 素数大富豪＋**",
+        "running": "🏁 **大会開始 / 素数大富豪＋**",
+        "cancelled": "🚫 **大会中止 / 素数大富豪＋**",
+        "finished": "🏆 **大会終了・結果発表 / 素数大富豪＋**",
+    }
+    heading = event_headings.get(event, "🎴 **大会情報 / 素数大富豪＋**")
+    title = discord_safe_text(run.title)
+    rule_summary = discord_safe_text(tournament_rule_payload(PRESETS[run.rule_key])["summary"])
+    registration_timestamp = int(run.registration_opens_at.timestamp())
+    start_timestamp = int(run.starts_at.timestamp())
+    lines = [
+        heading,
+        f"**{title}**",
+        f"🎴 ルール: **{rule_summary}**",
+    ]
+    if event == "scheduled":
+        lines.extend([
+            f"📝 参加登録: <t:{registration_timestamp}:F>（<t:{registration_timestamp}:R>）",
+            f"🕐 大会開始: <t:{start_timestamp}:F>（<t:{start_timestamp}:R>）",
+            f"👥 定員: {run.max_participants}人",
+        ])
+    elif event == "registration":
+        lines.extend([
+            f"🕐 大会開始: <t:{start_timestamp}:F>（<t:{start_timestamp}:R>）",
+            f"👥 定員: {run.max_participants}人",
+        ])
+    elif event == "running":
+        lines.append(f"👥 参加者: {len(run.active_participants)}人")
+    elif event == "cancelled":
+        lines.append(discord_safe_text(reason or "大会は中止になりました。"))
+    elif event == "finished":
+        lines.append(f"🥇 優勝: **{discord_safe_text(winner_text or '該当者なし')}**")
+        standings = run.standings()[:10]
+        if standings:
+            result_lines = [
+                f"{row['rank']}位 {discord_safe_text(row['display_name'])}: "
+                f"{row['wins']}勝{row['losses']}敗 / {row['points']}点"
+                for row in standings
+            ]
+            lines.append("📊 最終順位\n" + "\n".join(result_lines))
+    lines.append(f"▶ {PLUS_CLIENT_URL}")
+    return "\n".join(lines)
+
+
+async def notify_tournament_discord(
+    run: TournamentRun,
+    event: str,
+    *,
+    winner_text: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    return await notify_discord(tournament_discord_notification_content(
+        run,
+        event,
+        winner_text=winner_text,
+        reason=reason,
+    ))
+
+
 def tournament_match_both_ready(match) -> bool:
     return {match.player1_id, match.player2_id}.issubset(set(match.ready_player_ids))
 
@@ -1315,7 +1451,9 @@ async def resolve_tournament_match(
     actor: str,
     advance: bool = True,
 ) -> None:
+    was_finished = run.status == "finished"
     match = run.resolve_match(match_id, winner_id, resolution=resolution)
+    finished_now = not was_finished and run.status == "finished"
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(run.run_id, actor=actor, action="resolve_match", details={
         "match_id": match_id,
@@ -1338,9 +1476,9 @@ async def resolve_tournament_match(
         winner_name = run.participants[winner_id].display_name
         await lobby.log_chat(f"大会結果を反映しました: {winner_name}の勝利")
     await lobby.update_room_status()
-    if run.status == "finished":
+    if finished_now:
         await announce_tournament_finished(run)
-    elif advance:
+    elif advance and run.status != "finished":
         await start_or_prepare_next_tournament_match(run)
 
 
@@ -1385,6 +1523,7 @@ async def announce_tournament_finished(run: TournamentRun) -> None:
     room = rooms[run.room_id]
     await room.log_chat(f"全試合終了。優勝: {winner_text}")
     await announce_tournament_globally(f"大会「{run.title}」が終了しました。優勝: {winner_text}")
+    await notify_tournament_discord(run, "finished", winner_text=winner_text)
     await room.update_room_status()
 
 
@@ -1399,14 +1538,22 @@ async def record_tournament_game_result(room: Room, winner_player: Optional["Pla
         return
     if participant_id not in {match.player1_id, match.player2_id}:
         return
+    was_finished = run.status == "finished"
     match = run.resolve_match(match.match_id, participant_id, resolution="game")
+    finished_now = not was_finished and run.status == "finished"
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(run.run_id, actor="system", action="game_result", details={
         "match_id": match.match_id,
         "winner_id": participant_id,
         "game_id": room.game_id,
     })
-    asyncio.create_task(delayed_tournament_match_completion(run, match.match_id, participant_id, 1.5))
+    asyncio.create_task(delayed_tournament_match_completion(
+        run,
+        match.match_id,
+        participant_id,
+        1.5,
+        announce_finished=finished_now,
+    ))
 
 
 async def delayed_tournament_match_completion(
@@ -1414,6 +1561,8 @@ async def delayed_tournament_match_completion(
     match_id: str,
     winner_id: Optional[str],
     delay_seconds: float,
+    *,
+    announce_finished: bool = False,
 ) -> None:
     await asyncio.sleep(delay_seconds)
     await close_tournament_match_room(
@@ -1422,9 +1571,9 @@ async def delayed_tournament_match_completion(
         winner_id=winner_id,
         broadcast_result=False,
     )
-    if run.status == "finished":
+    if announce_finished:
         await announce_tournament_finished(run)
-    else:
+    elif run.status != "finished":
         await start_or_prepare_next_tournament_match(run)
 
 
@@ -1501,10 +1650,14 @@ async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
                     await announce_tournament_globally(
                         f"大会「{run.title}」の参加登録を開始しました。plus大会ルームへお越しください。"
                     )
+                    await notify_tournament_discord(run, "registration")
                 elif run.status == "cancelled":
-                    await room.log_chat("参加者が2人未満のため大会を中止しました。")
+                    reason = "参加者が2人未満のため大会を中止しました。"
+                    await room.log_chat(reason)
+                    await notify_tournament_discord(run, "cancelled", reason=reason)
                 elif run.status == "running":
                     await room.log_chat("参加登録を締め切り、対戦の割り振りを確定しました。")
+                    await notify_tournament_discord(run, "running")
                 await room.update_room_status()
             if run.status != "running":
                 continue
