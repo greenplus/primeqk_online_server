@@ -70,11 +70,14 @@ PLUS_CLIENT_URL = os.getenv("PLUS_CLIENT_URL", "https://greenplus.github.io/qkpl
 NEO_CLIENT_URL = os.getenv("NEO_CLIENT_URL", "https://greenplus.github.io/qkneo/")
 LEGACY_CLIENT_URL = os.getenv("LEGACY_CLIENT_URL", "https://greenplus.github.io/primeqk_online/")
 SERVER_DIR = Path(__file__).resolve().parent
-SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
-REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
-GOLD_PRIME_TABLE_JSON = SERVER_DIR / "gold_prime_table_memory.json"
-SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
-COMPOSITE_PRACTICE_GE3_TEXT = SERVER_DIR / "composite_practice_composites_ge3.txt"
+DATA_DIR = SERVER_DIR / "data"
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+SAMPLE_MEMORY_JSON = KNOWLEDGE_DIR / "sample_memory.json"
+REGISTERED_TOURNAMENT_JSON = KNOWLEDGE_DIR / "registered_prime_daifugo_plus_ge4.json"
+GOLD_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "gold_prime_table_memory.json"
+SILVER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "silver_prime_table_memory.json"
+COMPOSITE_PRACTICE_GE3_TEXT = KNOWLEDGE_DIR / "composite_practice_composites_ge3.txt"
+COMPOSITE_PRACTICE_PRIME_JSON = KNOWLEDGE_DIR / "composite_practice_primes_le3_upper.json"
 CAMPAIGN_SETTINGS = CampaignSettings.from_env()
 CAMPAIGN_STORE = CampaignStore()
 TOURNAMENT_STORE = TournamentStore()
@@ -2337,15 +2340,15 @@ REGISTERED_SAMPLE_DEFS = {
         "composite_text": None,
     },
     "composite_practice_ge3": {
-        "label": "合成数練習：大会3回以上",
-        "prime_json": SAMPLE_MEMORY_JSON,
+        "label": "合成数練習：3枚以下上位互換＋大会3回以上",
+        "prime_json": COMPOSITE_PRACTICE_PRIME_JSON,
         "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
         "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
         "visible": True,
     },
     "composite_practice_cpu_ge3": {
-        "label": "合成数練習CPU：大会3回以上",
-        "prime_json": GOLD_PRIME_TABLE_JSON,
+        "label": "合成数練習CPU：3枚以下上位互換＋大会3回以上",
+        "prime_json": COMPOSITE_PRACTICE_PRIME_JSON,
         "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
         "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
         "visible": False,

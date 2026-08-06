@@ -26,7 +26,8 @@ GOLD_PLAN_MAX_RESULTS_PER_COUNT = 3
 GOLD_PLAN_MAX_ALTERNATIVES = 8
 GOLD_PLAN_MAX_RALLY_PREFIX_STEPS = 6
 GOLD_PLAN_MAX_RALLY_STEPS = GOLD_PLAN_MAX_RALLY_PREFIX_STEPS + 1
-GOLD_PLAN_EVALUATION_JSON = Path(__file__).resolve().parent / "gold_plan_evaluation.json"
+SERVER_DIR = Path(__file__).resolve().parent
+GOLD_PLAN_EVALUATION_JSON = SERVER_DIR / "data" / "cpu" / "gold_plan_evaluation.json"
 SILVER_PLAN_MAX_RALLY_STEPS = 3
 SILVER_PLAN_MAX_STEPS = SILVER_PLAN_MAX_RALLY_STEPS + 2
 SILVER_RALLY_COUNTS = (1, 2, 3, 4)
@@ -35,6 +36,7 @@ SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE = 0.0
 CPU_PLANNER_DEFAULT_BUDGET_MS = 250
 COMPOSITE_PRACTICE_MAX_PLAN_STEPS = 5
 COMPOSITE_PRACTICE_BRANCH_CAP = 48
+COMPOSITE_PRACTICE_ALL_OUT_ATTEMPTS = 96
 COMPOSITE_PRACTICE_RANK_WEIGHTS = {
     0: 100,  # X
     2: 60,
@@ -296,8 +298,13 @@ def choose_composite_practice_cpu_action(
         )
         return candidate_to_action(best)
 
+    if field and composite_practice_future_plan(cpu, room, validator) is not None:
+        return CpuAction("pass")
     if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
         return CpuAction("draw")
+    all_out = build_composite_practice_all_out_payload(cpu, room)
+    if all_out is not None:
+        return CpuAction("play_composite", all_out)
     return CpuAction("pass")
 
 
@@ -323,9 +330,167 @@ def choose_composite_practice_emergency_action(cpu: CpuPlayer, room) -> CpuActio
             candidates,
             key=lambda candidate: candidate_strength(candidate, room),
         ))
+    if field and composite_practice_future_plan(
+        cpu,
+        room,
+        gold_knowledge_number_validator,
+    ) is not None:
+        return CpuAction("pass")
     if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
         return CpuAction("draw")
+    all_out = build_composite_practice_all_out_payload(cpu, room)
+    if all_out is not None:
+        return CpuAction("play_composite", all_out)
     return CpuAction("pass")
+
+
+def composite_practice_future_plan(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[dict]:
+    plan = build_composite_practice_plan(
+        cpu,
+        room_without_field(room),
+        max_steps=COMPOSITE_PRACTICE_MAX_PLAN_STEPS,
+        validator=validator,
+    )
+    return plan if plan is not None and plan.get("steps") else None
+
+
+def build_composite_practice_all_out_payload(
+    cpu: CpuPlayer,
+    room,
+    rng=None,
+) -> Optional[dict]:
+    """Build a last-resort random composite attempt that uses the whole hand.
+
+    The visible side still has to match and beat the field. Every other card is
+    used exactly once in a random multiplication expression. This deliberately
+    does not search for a correct equation; failure and its normal composite
+    penalty are the intended hand-reshaping fallback.
+    """
+    hand = list(cpu.hand)
+    if len(hand) < 2:
+        return None
+
+    field = getattr(room, "field", []) or []
+    if field:
+        visible_counts = (len(field),)
+    else:
+        visible_counts = tuple(range(1, min(9, len(hand) - 1) + 1))
+    visible_counts = tuple(
+        count for count in visible_counts
+        if 1 <= count < len(hand)
+    )
+    if not visible_counts:
+        return None
+
+    rng = rng or secrets.SystemRandom()
+    attempts = []
+    for _ in range(COMPOSITE_PRACTICE_ALL_OUT_ATTEMPTS):
+        cards = hand[:]
+        rng.shuffle(cards)
+        visible_count = rng.choice(visible_counts)
+        visible_cards = cards[:visible_count]
+        material_cards = cards[visible_count:]
+
+        assigned_by_id = {}
+        material_ids = {card.get("card_id") for card in material_cards}
+        for card in cards:
+            if not is_joker(card):
+                continue
+            choices = (2, 3, 5, 7, 11, 13) if card.get("card_id") in material_ids else tuple(range(1, 14))
+            assigned_by_id[card.get("card_id")] = int(rng.choice(choices))
+
+        visible_value = composite_practice_cards_number(visible_cards, assigned_by_id)
+        if visible_value is None or not beats_field(visible_value, visible_count, room):
+            continue
+
+        chunks = random_composite_factor_chunks(material_cards, rng)
+        factor_values = [composite_practice_cards_number(chunk, assigned_by_id) for chunk in chunks]
+        if any(value is None or value < 2 for value in factor_values):
+            # One concatenated chunk avoids a syntax-only failure where possible.
+            chunks = [material_cards]
+            factor_values = [composite_practice_cards_number(material_cards, assigned_by_id)]
+        if any(value is None or value < 2 for value in factor_values):
+            continue
+
+        payload = composite_practice_all_out_payload(
+            visible_cards,
+            chunks,
+            assigned_by_id,
+        )
+        attempts.append(payload)
+
+    return rng.choice(attempts) if attempts else None
+
+
+def composite_practice_cards_number(cards: List[Card], assigned_by_id: dict) -> Optional[int]:
+    if not cards:
+        return None
+    parts = []
+    for card in cards:
+        if is_joker(card):
+            rank = assigned_by_id.get(card.get("card_id"))
+        else:
+            rank = card.get("rank")
+        if rank is None:
+            return None
+        parts.append(str(rank))
+    try:
+        return int("".join(parts))
+    except ValueError:
+        return None
+
+
+def random_composite_factor_chunks(material_cards: List[Card], rng) -> List[List[Card]]:
+    if len(material_cards) <= 1:
+        return [material_cards]
+    cut_count = rng.randint(1, min(3, len(material_cards) - 1))
+    cuts = set(rng.sample(range(1, len(material_cards)), cut_count))
+    chunks = []
+    start = 0
+    for index in range(1, len(material_cards) + 1):
+        if index in cuts or index == len(material_cards):
+            chunks.append(material_cards[start:index])
+            start = index
+    return chunks
+
+
+def composite_practice_all_out_payload(
+    visible_cards: List[Card],
+    chunks: List[List[Card]],
+    assigned_by_id: dict,
+) -> dict:
+    material_cards = [card for chunk in chunks for card in chunk]
+    tokens = []
+    for chunk_index, chunk in enumerate(chunks):
+        if chunk_index:
+            tokens.append({"kind": "op", "op": "×"})
+        tokens.extend(
+            {"kind": "card", "card_id": card.get("card_id")}
+            for card in chunk
+        )
+    return {
+        "selected": {
+            "cards": visible_cards,
+            "assigned_numbers": [
+                str(assigned_by_id[card.get("card_id")])
+                for card in visible_cards
+                if is_joker(card)
+            ],
+        },
+        "consume": {"cards": material_cards},
+        "composite": {
+            "tokens": tokens,
+            "assigned_numbers": [
+                str(assigned_by_id[card.get("card_id")])
+                for card in material_cards
+                if is_joker(card)
+            ],
+        },
+    }
 
 
 def choose_composite_practice_prime_finish(
@@ -2853,7 +3018,7 @@ def fish_extra_prime_values_from_materials() -> tuple[int, ...]:
 def fish_343_material_paths() -> tuple[Path, ...]:
     server_dir = Path(__file__).resolve().parent
     candidates = [
-        server_dir / "fish_343_primes.txt",
+        server_dir / "data" / "knowledge" / "fish_343_primes.txt",
         server_dir / "materials" / "343primes.txt",
         server_dir / "343primes.txt",
     ]
@@ -2986,7 +3151,7 @@ CPU_PROFILES = {
     "composite_practice": CpuProfile(
         key="composite_practice",
         label="合成数練習CPU",
-        description="5手以内の合成数分け切りを優先し、合成数上がり、3枚以下の素数上がり、強札温存の順に評価します。",
+        description="5手以内の合成数分け切りを優先し、合成数上がり、3枚以下の素数上がり、強札温存、ドロー後のランダム合成数全出しの順で評価します。",
         rule_keys=("composite-practice-11-n",),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",

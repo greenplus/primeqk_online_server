@@ -13,6 +13,7 @@ from collections import defaultdict
 FACE_VALUES = {"t": 10, "j": 11, "q": 12, "k": 13}
 VALUE_SYMBOLS = {10: "t", 11: "j", 12: "q", 13: "k"}
 TOKEN_RE = re.compile(r"^[0-9tjqk]+$", re.IGNORECASE)
+CARD_TOKEN_RE = re.compile(r"^[1-9tjqk]+$", re.IGNORECASE)
 TOKEN_SPLIT_RE = re.compile(r"[\s,、，]+")
 HEADING_RE = re.compile(r"^\s*(\d+)(?:\s*[~～]\s*(\d+))?\s*枚(.*)$")
 
@@ -91,28 +92,59 @@ class RegisteredPrimeTemplateIndex:
 def tokenize_registered_prime_pattern(pattern: str) -> tuple[int, ...]:
     """Convert pasted physical-card notation to ranks.
 
-    t/j/q/k mean 10/11/12/13. A literal 0 is accepted as a ten card for
-    compatibility with the source data format; it is not a joker.
+    t/j/q/k mean 10/11/12/13. Zero is not a card rank: decimal values that
+    contain zero must be resolved through ``registered_value_encodings``.
     """
     pattern = pattern.strip().lower()
-    if not TOKEN_RE.fullmatch(pattern):
+    if not CARD_TOKEN_RE.fullmatch(pattern):
         raise ValueError("invalid token")
     return tuple(
-        10 if char == "0" else FACE_VALUES[char] if char in FACE_VALUES else int(char)
+        FACE_VALUES[char] if char in FACE_VALUES else int(char)
         for char in pattern
     )
 
 
 def registered_prime_pattern_value(pattern: str) -> int:
-    text = "".join(str(FACE_VALUES.get(char, char)) for char in pattern.strip().lower())
+    pattern = pattern.strip().lower()
+    if pattern.isdigit():
+        return int(pattern)
+    if not CARD_TOKEN_RE.fullmatch(pattern):
+        raise ValueError("invalid token")
+    text = "".join(str(FACE_VALUES.get(char, char)) for char in pattern)
     return int(text)
 
 
 def registered_number_pattern_value(pattern: str) -> int:
     pattern = pattern.strip().lower()
-    if not TOKEN_RE.fullmatch(pattern):
+    if pattern.isdigit():
+        return int(pattern)
+    if not CARD_TOKEN_RE.fullmatch(pattern):
         raise ValueError("invalid token")
     return registered_prime_pattern_value(pattern)
+
+
+def registered_pattern_cards(
+    pattern: str,
+    *,
+    allow_unencoded_value: bool = False,
+) -> tuple[int, ...]:
+    """Resolve a value/pattern to one valid physical-card representation.
+
+    Ordinary nonzero decimal digits retain their explicit card pattern. A
+    decimal value containing zero is instead resolved through valid face-card
+    boundaries, which prevents legacy interpretations such as ``101 -> A,T,A``.
+    """
+    pattern = pattern.strip().lower()
+    if not pattern.isdigit():
+        return tokenize_registered_prime_pattern(pattern)
+    if "0" not in pattern:
+        return tokenize_registered_prime_pattern(pattern)
+    encodings = registered_value_encodings(int(pattern))
+    if not encodings:
+        if allow_unencoded_value:
+            return ()
+        raise ValueError("value has no physical-card encoding")
+    return encodings[0]
 
 
 def registered_cards_value(cards: tuple[int, ...]) -> int:
@@ -317,7 +349,7 @@ def parse_registered_prime_text(text: str) -> RegisteredPrimeParseResult:
                 continue
 
             try:
-                cards = tokenize_registered_prime_pattern(token)
+                cards = registered_pattern_cards(token, allow_unencoded_value=True)
                 value = registered_prime_pattern_value(token)
             except ValueError:
                 errors.append(RegisteredPrimeError(line_number, token, "invalid token"))
@@ -463,9 +495,12 @@ def _csv_cards(row: dict[str, str]) -> tuple[int, ...]:
     cards = []
     for value in values:
         try:
-            cards.append(int(value))
+            rank = int(value)
         except (TypeError, ValueError):
             return ()
+        if rank < 1 or rank > 13:
+            return ()
+        cards.append(rank)
     return tuple(cards)
 
 
@@ -486,7 +521,7 @@ def parse_registered_composite_expression(expression: str) -> tuple[RegisteredCo
         if not current:
             return
         text = "".join(current)
-        ranks = tokenize_registered_prime_pattern(text)
+        ranks = registered_pattern_cards(text)
         tokens.append(RegisteredCompositeExpressionToken(
             kind="cards",
             ranks=ranks,
@@ -533,13 +568,13 @@ def generate_explicit_composite_expression_entries(
             token_options.append([token.text])
             continue
 
-        options = [token.text]
-        if any(char in FACE_VALUES for char in token.text.lower()):
-            token_value = registered_number_pattern_value(token.text)
-            options.extend(
-                registered_cards_label(cards)
-                for cards in registered_value_encodings(token_value)
-            )
+        token_value = registered_number_pattern_value(token.text)
+        options = [
+            registered_cards_label(cards)
+            for cards in registered_value_encodings(token_value)
+        ]
+        if not options:
+            raise ValueError("factor has no physical-card encoding")
         token_options.append(list(dict.fromkeys(options)))
 
     entries = []
