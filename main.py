@@ -2803,10 +2803,13 @@ def find_prime_realizations(
 ) -> List[dict]:
     text = str(number)
     rank_counts = [0] * 14
+    cards_by_rank: list[list[dict]] = [[] for _ in range(14)]
+    joker_cards: list[dict] = []
     available_jokers = 0
     for card in source_cards:
         if card.get("is_joker") or card.get("suit") == "X":
             available_jokers += 1
+            joker_cards.append(card)
             continue
         try:
             rank = int(card.get("rank"))
@@ -2814,6 +2817,7 @@ def find_prime_realizations(
             continue
         if 0 <= rank <= 13:
             rank_counts[rank] += 1
+            cards_by_rank[rank].append(card)
 
     rank_options = tuple(
         (str(rank), rank)
@@ -2848,15 +2852,15 @@ def find_prime_realizations(
                 continue
             next_counts = list(counts)
             next_counts[rank] -= 1
-            best = min(
-                best,
-                min_jokers_to_match(
-                    index + len(option),
-                    tuple(next_counts),
-                    jokers_left,
-                    used_count + 1,
-                ),
+            tail = min_jokers_to_match(
+                index + len(option),
+                tuple(next_counts),
+                jokers_left,
+                used_count + 1,
             )
+            if tail == 0:
+                return 0
+            best = min(best, tail)
 
         if jokers_left > 0:
             for option in joker_options:
@@ -2882,34 +2886,41 @@ def find_prime_realizations(
     if minimum_joker_count == impossible:
         return []
 
-    used: list[dict] = []
-    assigned_by_card_id: dict[str, str] = {}
+    # Search rank-count states rather than physical-card permutations. Cards
+    # with the same rank are interchangeable for the visible realization; the
+    # previous physical-card DFS revisited up to 4! equivalent paths before it
+    # could discover the next distinct spelling on large hands.
+    used_tokens: list[tuple[str, int | str]] = []
     results: list[dict] = []
     seen_patterns: set[tuple[str, ...]] = set()
 
     def card_pattern() -> tuple[str, ...]:
-        pattern = []
-        for card in used:
-            if card.get("is_joker") or card.get("suit") == "X":
-                pattern.append(f"X={assigned_by_card_id.get(card['card_id'], '?')}")
-            else:
-                pattern.append(str(card.get("rank")))
-        return tuple(pattern)
+        return tuple(
+            f"X={value}" if kind == "joker" else str(value)
+            for kind, value in used_tokens
+        )
 
     def collect_result() -> None:
-        joker_count = assist_joker_count(used)
+        joker_count = sum(1 for kind, _ in used_tokens if kind == "joker")
         if joker_count != minimum_joker_count:
             return
         pattern = card_pattern()
         if pattern in seen_patterns:
             return
         seen_patterns.add(pattern)
-        assigned_numbers = [
-            assigned_by_card_id[card["card_id"]]
-            for card in used
-            if card.get("is_joker") or card.get("suit") == "X"
-        ]
-        cards = used[:]
+        used_rank_counts = [0] * 14
+        used_jokers = 0
+        cards: list[dict] = []
+        assigned_numbers: list[str] = []
+        for kind, value in used_tokens:
+            if kind == "joker":
+                cards.append(joker_cards[used_jokers])
+                used_jokers += 1
+                assigned_numbers.append(str(value))
+                continue
+            rank = int(value)
+            cards.append(cards_by_rank[rank][used_rank_counts[rank]])
+            used_rank_counts[rank] += 1
         results.append({
             "number": number,
             "cards": cards,
@@ -2918,49 +2929,55 @@ def find_prime_realizations(
             "joker_count": joker_count,
         })
 
-    def visit(index: int, remaining: list[dict], used_joker_count: int = 0) -> None:
+    def visit(
+        index: int,
+        counts: tuple[int, ...],
+        jokers_left: int,
+        used_joker_count: int = 0,
+    ) -> None:
         if len(results) >= limit:
             return
         if used_joker_count > minimum_joker_count:
             return
-        if required_card_count is not None and len(used) > required_card_count:
+        if required_card_count is not None and len(used_tokens) > required_card_count:
             return
         if index == len(text):
-            if required_card_count is None or len(used) == required_card_count:
+            if required_card_count is None or len(used_tokens) == required_card_count:
                 collect_result()
             return
 
-        candidates = sorted(
-            enumerate(remaining),
-            key=lambda item: 1 if item[1].get("is_joker") or item[1].get("suit") == "X" else 0,
-        )
-        for i, card in candidates:
-            options: list[str]
-            if card.get("is_joker") or card.get("suit") == "X":
-                options = [str(v) for v in range(14)]
-            else:
-                options = [str(card.get("rank"))]
+        for option, rank in rank_options:
+            if counts[rank] <= 0 or not text.startswith(option, index):
+                continue
+            next_counts = list(counts)
+            next_counts[rank] -= 1
+            used_tokens.append(("rank", rank))
+            visit(
+                index + len(option),
+                tuple(next_counts),
+                jokers_left,
+                used_joker_count,
+            )
+            used_tokens.pop()
+            if len(results) >= limit:
+                return
 
-            for option in options:
+        if jokers_left > 0:
+            for option in joker_options:
                 if not text.startswith(option, index):
                     continue
-                is_joker = card.get("is_joker") or card.get("suit") == "X"
-                used.append(card)
-                if is_joker:
-                    assigned_by_card_id[card["card_id"]] = option
-                next_remaining = remaining[:i] + remaining[i + 1:]
+                used_tokens.append(("joker", option))
                 visit(
                     index + len(option),
-                    next_remaining,
-                    used_joker_count + (1 if is_joker else 0),
+                    counts,
+                    jokers_left - 1,
+                    used_joker_count + 1,
                 )
-                if is_joker:
-                    assigned_by_card_id.pop(card["card_id"], None)
-                used.pop()
+                used_tokens.pop()
                 if len(results) >= limit:
                     return
 
-    visit(0, source_cards[:])
+    visit(0, tuple(rank_counts), available_jokers)
     results.sort(key=lambda result: (
         len(result["cards"]),
         result.get("joker_count", 0),
@@ -3631,6 +3648,74 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         result.get("remaining_finish_exists")
         or remaining_result.get("remaining_finish_exists")
     )
+    return result
+
+
+def assist_snapshot_signature(player: "Player", room: Room) -> tuple:
+    def card_signature(card: dict) -> tuple:
+        return (
+            str(card.get("card_id")),
+            card.get("rank"),
+            card.get("suit"),
+            bool(card.get("is_joker")),
+        )
+
+    return (
+        tuple(card_signature(card) for card in player.hand),
+        tuple(card_signature(card) for card in room.field),
+        room.last_number,
+        bool(room.reverse_order),
+        tuple(sorted(int(number) for number in player.registered_primes)),
+        tuple(sorted(int(number) for number in player.registered_composites)),
+        tuple(
+            sorted(
+                (int(entry.value), str(entry.expression))
+                for entry in player.registered_composite_entries
+            )
+        ),
+    )
+
+
+async def build_prime_assist_candidates_nonblocking(
+    player: "Player",
+    room: Room,
+    data: dict,
+) -> dict:
+    """Build assist data without monopolizing the WebSocket event loop."""
+    initial_signature = assist_snapshot_signature(player, room)
+    player_snapshot = copy.copy(player)
+    player_snapshot.hand = copy.deepcopy(player.hand)
+    player_snapshot.registered_primes = set(player.registered_primes)
+    player_snapshot.registered_composites = set(player.registered_composites)
+    player_snapshot.registered_composite_entries = tuple(
+        player.registered_composite_entries
+    )
+    if hasattr(player, "_assist_recommendation_cache"):
+        player_snapshot._assist_recommendation_cache = copy.deepcopy(
+            player._assist_recommendation_cache
+        )
+
+    room_snapshot = copy.copy(room)
+    room_snapshot.field = copy.deepcopy(room.field)
+    data_snapshot = copy.deepcopy(data)
+    result = await asyncio.to_thread(
+        build_prime_assist_candidates,
+        player_snapshot,
+        room_snapshot,
+        data_snapshot,
+    )
+
+    # Reuse the recommendation cache only when neither hand nor field changed
+    # while the worker was running. A stale result can still be discarded by
+    # the client's assist_request_id, but must never replace a fresh cache.
+    if (
+        getattr(player, "room", room) is room
+        and assist_snapshot_signature(player, room) == initial_signature
+        and hasattr(player_snapshot, "_assist_recommendation_cache")
+    ):
+        player._assist_recommendation_cache = copy.deepcopy(
+            player_snapshot._assist_recommendation_cache
+        )
     return result
 ################################################
 # Webhook
@@ -4580,7 +4665,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 room = player.room
                 assist_payload = {
                     "type": "prime_assist_result",
-                    **build_prime_assist_candidates(player, room, data),
+                    **await build_prime_assist_candidates_nonblocking(
+                        player,
+                        room,
+                        data,
+                    ),
                 }
                 if "assist_request_id" in data:
                     assist_payload["assist_request_id"] = data["assist_request_id"]

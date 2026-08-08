@@ -300,12 +300,13 @@ def _strongest_available(
     records: list[AssistRecord],
     available_mask: int,
 ) -> AssistRecord | None:
-    available = [
-        record
-        for record in records
-        if record.mask & available_mask == record.mask
-    ]
-    return max(available, key=_record_strength_key) if available else None
+    # Groups produced by _group_by_count are already weakest-to-strongest.
+    # Avoid rebuilding a list and recomputing each candidate's consumed-card
+    # dictionary on every rally node.
+    for record in reversed(records):
+        if record.mask & available_mask == record.mask:
+            return record
+    return None
 
 
 def _build_resource_context(
@@ -573,7 +574,7 @@ def _route_choice_key(route: dict, sequence: list[AssistRecord]) -> tuple:
 def _record_strength_key(record: AssistRecord) -> tuple:
     return (
         record.strength,
-        -len(candidate_consumed_cards(record.candidate)),
+        -record.mask.bit_count(),
         record.fingerprint,
     )
 
