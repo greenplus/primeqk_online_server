@@ -8,6 +8,7 @@ from functools import lru_cache
 from itertools import combinations, product
 from io import StringIO
 from collections import defaultdict
+from typing import Iterable
 
 
 FACE_VALUES = {"t": 10, "j": 11, "q": 12, "k": 13}
@@ -21,7 +22,8 @@ MAX_REGISTERED_PRIME_TEXT_LENGTH = 200_000
 MAX_REGISTERED_PRIMES = 20_000
 MAX_REGISTERED_PRIME_DIGITS = 72
 MAX_ONE_CARDS_IN_PRIME_ENCODING = 4
-MAX_COMPOSITE_AUTO_RANK_COPIES = 4
+MAX_COMPOSITE_AUTO_EXPRESSIONS_PER_VALUE = 10
+MAX_COMPOSITE_AVAILABLE_JOKERS = 2
 MAX_COMPOSITE_AUTO_EXPONENT = 122
 MAX_COMPOSITE_AUTO_FACTOR_TRIAL = 1_000_000
 
@@ -599,6 +601,7 @@ def generate_composite_expression_entries(
     value: int,
     pattern: str,
     source_line: int,
+    excluded_expressions: Iterable[str] = (),
 ) -> tuple[RegisteredCompositeEntry, ...]:
     factorization = prime_factorization_for_composite_expression(value)
     if not factorization:
@@ -618,36 +621,111 @@ def generate_composite_expression_entries(
         for parts in product(*variants):
             expressions.add("*".join(parts))
 
-    entries = []
+    excluded = {expression.lower() for expression in excluded_expressions}
+    ranked_entries = []
     for expression in sorted(expressions, key=lambda text: (text.count("*"), len(text), text)):
+        if expression.lower() in excluded:
+            continue
         try:
             expression_tokens = parse_registered_composite_expression(expression)
         except ValueError:
             continue
-        if not composite_expression_rank_counts_allowed(expression_tokens):
+        required_jokers = minimum_composite_expression_jokers(value, expression_tokens)
+        if required_jokers > MAX_COMPOSITE_AVAILABLE_JOKERS:
             continue
-        entries.append(RegisteredCompositeEntry(
+        entry = RegisteredCompositeEntry(
             source_line=source_line,
             pattern=pattern,
             value=value,
             expression=expression,
             expression_tokens=expression_tokens,
-        ))
-    return tuple(entries)
+        )
+        ranked_entries.append((required_jokers, entry))
+
+    if not ranked_entries:
+        return ()
+    minimum_jokers = min(required_jokers for required_jokers, _ in ranked_entries)
+    entries = [
+        entry
+        for required_jokers, entry in ranked_entries
+        if required_jokers == minimum_jokers
+    ]
+    entries.sort(key=composite_expression_selection_key)
+    return tuple(entries[:MAX_COMPOSITE_AUTO_EXPRESSIONS_PER_VALUE])
 
 
-def composite_expression_rank_counts_allowed(
+def minimum_composite_expression_jokers(
+    value: int,
     expression_tokens: tuple[RegisteredCompositeExpressionToken, ...],
-) -> bool:
-    counts: dict[int, int] = {}
-    for token in expression_tokens:
-        if token.kind != "cards":
-            continue
-        for rank in token.ranks:
+) -> int:
+    expression_ranks = tuple(
+        rank
+        for token in expression_tokens
+        if token.kind == "cards"
+        for rank in token.ranks
+    )
+    visible_encodings = registered_value_encodings(value)
+    if not visible_encodings:
+        return MAX_COMPOSITE_AVAILABLE_JOKERS + 1
+
+    best = MAX_COMPOSITE_AVAILABLE_JOKERS + 1
+    for visible_ranks in visible_encodings:
+        counts: dict[int, int] = {}
+        for rank in visible_ranks + expression_ranks:
             counts[rank] = counts.get(rank, 0) + 1
-            if counts[rank] > MAX_COMPOSITE_AUTO_RANK_COPIES:
-                return False
-    return True
+        required = sum(max(0, count - 4) for count in counts.values())
+        best = min(best, required)
+    return best
+
+
+def composite_expression_selection_key(entry: RegisteredCompositeEntry) -> tuple:
+    material_card_count = sum(
+        len(token.ranks)
+        for token in entry.expression_tokens
+        if token.kind == "cards"
+    )
+    operator_count = sum(1 for token in entry.expression_tokens if token.kind == "op")
+    return (
+        material_card_count,
+        operator_count,
+        len(entry.expression),
+        entry.expression,
+    )
+
+
+def dedupe_composite_entries(
+    entries: Iterable[RegisteredCompositeEntry],
+) -> tuple[RegisteredCompositeEntry, ...]:
+    unique = []
+    seen = set()
+    for entry in entries:
+        key = (entry.value, entry.expression.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    return tuple(unique)
+
+
+def build_composite_entries_for_values(
+    value_order: Iterable[int],
+    first_sources: dict[int, tuple[str, int]],
+    explicit_by_value: dict[int, list[RegisteredCompositeEntry]],
+) -> tuple[RegisteredCompositeEntry, ...]:
+    entries = []
+    for value in value_order:
+        explicit_entries = dedupe_composite_entries(explicit_by_value.get(value, ()))
+        explicit_expressions = {entry.expression.lower() for entry in explicit_entries}
+        pattern, source_line = first_sources[value]
+        auto_entries = generate_composite_expression_entries(
+            value,
+            pattern,
+            source_line,
+            excluded_expressions=explicit_expressions,
+        )
+        entries.extend(explicit_entries)
+        entries.extend(auto_entries)
+    return tuple(entries)
 
 
 def prime_factorization_for_composite_expression(value: int) -> tuple[tuple[int, int], ...]:
@@ -724,8 +802,10 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
         )
 
     errors: list[RegisteredPrimeError] = []
-    entries: list[RegisteredCompositeEntry] = []
     seen_values: set[int] = set()
+    value_order: list[int] = []
+    first_sources: dict[int, tuple[str, int]] = {}
+    explicit_by_value: dict[int, list[RegisteredCompositeEntry]] = defaultdict(list)
     duplicate_count = 0
 
     for line_number, line in enumerate(text.splitlines(), start=1):
@@ -749,9 +829,11 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
             continue
         if value in seen_values:
             duplicate_count += 1
+        else:
+            value_order.append(value)
+            first_sources[value] = (token, line_number)
         seen_values.add(value)
 
-        explicit_entry_added = False
         if "=" in stripped:
             expression = stripped.split("=", 1)[1].split("|", 1)[0].strip()
             if expression:
@@ -765,23 +847,30 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
                 except ValueError:
                     errors.append(RegisteredPrimeError(line_number, expression, "invalid expression"))
                 else:
-                    entries.extend(explicit_entries)
-                    explicit_entry_added = True
-        if not explicit_entry_added:
-            entries.extend(generate_composite_expression_entries(value, token, line_number))
+                    explicit_by_value[value].extend(explicit_entries)
 
         if len(seen_values) > MAX_REGISTERED_PRIMES:
             errors.append(RegisteredPrimeError(line_number, token, "too many composites"))
+            entries = build_composite_entries_for_values(
+                value_order,
+                first_sources,
+                explicit_by_value,
+            )
             return RegisteredCompositeParseResult(
-                entries=tuple(entries),
+                entries=entries,
                 composite_values=tuple(sorted(seen_values)),
                 errors=tuple(errors),
                 duplicate_count=duplicate_count,
                 truncated=True,
             )
 
+    entries = build_composite_entries_for_values(
+        value_order,
+        first_sources,
+        explicit_by_value,
+    )
     return RegisteredCompositeParseResult(
-        entries=tuple(entries),
+        entries=entries,
         composite_values=tuple(sorted(seen_values)),
         errors=tuple(errors),
         duplicate_count=duplicate_count,

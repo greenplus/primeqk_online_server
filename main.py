@@ -29,6 +29,11 @@ from assist_recommendation import (
     rank_recommended_assist_candidates,
 )
 from campaign_store import CampaignSettings, CampaignStore, utc_now
+from composite_practice_stats_store import (
+    ACTOR_CPU,
+    ACTOR_OWNER,
+    CompositePracticeStatsStore,
+)
 from tournament import TournamentRun, hash_resume_token, issue_resume_token, parse_datetime
 from tournament_store import TournamentStore
 from recruitment_store import (
@@ -86,6 +91,7 @@ RECRUITMENT_STORE = RecruitmentStore(
     notification_pair_limit=RECRUITMENT_DISCORD_PAIR_LIMIT,
     notification_window_seconds=RECRUITMENT_DISCORD_WINDOW_SECONDS,
 )
+COMPOSITE_PRACTICE_STATS_STORE = CompositePracticeStatsStore()
 TOURNAMENT_ADMIN_TOKEN = os.getenv("TOURNAMENT_ADMIN_TOKEN", "").strip()
 COMPOSITE_PRACTICE_ACCESS_TOKEN = os.getenv("COMPOSITE_PRACTICE_ACCESS_TOKEN", "").strip()
 COMPOSITE_PRACTICE_ROOM_ID = "composite_practice_1"
@@ -125,6 +131,7 @@ async def lifespan(_app):
         await CAMPAIGN_STORE.connect()
     await TOURNAMENT_STORE.connect()
     await RECRUITMENT_STORE.connect()
+    await COMPOSITE_PRACTICE_STATS_STORE.connect()
     for run in await TOURNAMENT_STORE.load_active_runs():
         TOURNAMENT_RUNS_BY_ROOM[run.room_id] = run
     TOURNAMENT_SCHEDULER_TASK = asyncio.create_task(tournament_scheduler_loop())
@@ -148,6 +155,7 @@ async def lifespan(_app):
     await CAMPAIGN_STORE.close()
     await TOURNAMENT_STORE.close()
     await RECRUITMENT_STORE.close()
+    await COMPOSITE_PRACTICE_STATS_STORE.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1005,6 +1013,25 @@ def player_can_access_room(player: "Player", room: Room) -> bool:
 
 def room_discord_join_notifications_enabled(room: Room) -> bool:
     return room.room_id != COMPOSITE_PRACTICE_ROOM_ID
+
+
+async def composite_practice_stats_payload() -> dict:
+    snapshot = await COMPOSITE_PRACTICE_STATS_STORE.snapshot()
+    return {"type": "composite_practice_stats", **snapshot}
+
+
+async def record_composite_practice_play(player: "Player", room: Room, number: int) -> None:
+    if room.room_id != COMPOSITE_PRACTICE_ROOM_ID:
+        return
+    actor_kind = ACTOR_CPU if is_cpu_player(player) else ACTOR_OWNER
+    try:
+        await COMPOSITE_PRACTICE_STATS_STORE.record_play(
+            actor_kind=actor_kind,
+            composite_number=number,
+        )
+    except Exception as exc:
+        # 分析用記録の障害で対局を止めない。
+        print(f"composite practice stats record failed: {exc}")
 
 
 async def send_tournament_status(player: "Player") -> None:
@@ -4212,6 +4239,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         practice_authorized=True,
                     ))
                 continue
+            elif msg_type == "get_composite_practice_stats":
+                if client_surface != "plus_practice" or not player.composite_practice_authorized:
+                    await player.send_json({
+                        "type": "error",
+                        "code": "practice_authorization_required",
+                        "message": "合成数カウントの閲覧には練習部屋の認証が必要です。",
+                    })
+                    continue
+                await player.send_json(await composite_practice_stats_payload())
+                continue
             elif msg_type == "set_name":
                 requested_name = data.get("name", "")
                 if not isinstance(requested_name, str):
@@ -5401,6 +5438,8 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         )
         await next_turn(room)
         return
+
+    await record_composite_practice_play(player, room, sel_number)
 
     if room.rule.special_numbers_composite_only and sel_number in {57, 1729}:
         push_to_reserve(room, sel_cards)
