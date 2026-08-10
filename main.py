@@ -109,6 +109,7 @@ PLUS_TOURNAMENT_RULE_KEYS = frozenset(
 TOURNAMENT_RUNS_BY_ROOM: dict[str, TournamentRun] = {}
 TOURNAMENT_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_MATCH_ROOMS: dict[str, "Room"] = {}
+TOURNAMENT_MATCH_VIEWERS: dict[str, set["Player"]] = {}
 ROOM_RESUME_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_LOCK = asyncio.Lock()
 TOURNAMENT_SCHEDULER_TASK = None
@@ -526,11 +527,24 @@ class Room:
                     })
                 except Exception:
                     await mark_player_disconnected(room_player)
+            if self.tournament_match_id:
+                await broadcast_tournament_match_state(self)
             return
         await self.broadcast(message)
 
     async def log_chat(self, message: str, sender="system"):
-        await self.broadcast({"type": "chat", "sender": sender, "message": message})
+        payload = {"type": "chat", "sender": sender, "message": message}
+        if self.room_id == TOURNAMENT_ROOM_ID:
+            run = tournament_run_for_room(self)
+            if run is not None:
+                await broadcast_tournament_lobby(run, payload)
+                return
+        if self.tournament_match_id:
+            payload.update({
+                "scope": "tournament_match",
+                "match_id": self.tournament_match_id,
+            })
+        await self.broadcast(payload)
 
     # その他、ルームに関連するロジック（プレイヤー追加、削除、ゲーム開始、次のターンなど）をメソッドとして実装
     async def update_game_state(self):
@@ -587,6 +601,8 @@ class Room:
                     })
                 except Exception:
                     await mark_player_disconnected(room_player)
+            if self.tournament_match_id:
+                await broadcast_tournament_match_state(self)
             return
         await self.broadcast(state_msg)
 
@@ -766,7 +782,7 @@ def tournament_public_payload(
             "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
             "available_rules": tournament_rule_catalog(),
         }
-    return {
+    payload = {
         **run.public_payload(viewer_participant_id=viewer_participant_id),
         "rule": tournament_rule_payload(PRESETS[run.rule_key]),
         "available_rules": tournament_rule_catalog(),
@@ -776,6 +792,11 @@ def tournament_public_payload(
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
     }
+    payload["active_matches"] = [
+        tournament_match_live_summary(run, match.match_id)
+        for match in run.current_matches
+    ]
+    return payload
 
 
 def tournament_rule_payload(preset: RulePreset) -> dict:
@@ -887,6 +908,192 @@ def tournament_for_player(player: "Player") -> Optional[TournamentRun]:
             None,
         )
     return None
+
+
+def tournament_match_live_summary(run: TournamentRun, match_id: str) -> dict:
+    match = next((item for item in run.matches if item.match_id == match_id), None)
+    if match is None:
+        return {"match_id": match_id, "status": "unavailable"}
+    room = TOURNAMENT_MATCH_ROOMS.get(match_id)
+    participants = run.participants
+    round_matches = [item for item in run.matches if item.round_no == match.round_no]
+    table_no = round_matches.index(match) + 1
+    current_player = (
+        next((item for item in room.players if item.id == room.current_turn_id), None)
+        if room is not None
+        else None
+    )
+    hand_counts = []
+    if room is not None:
+        hand_counts = [
+            {
+                "participant_id": getattr(room_player, "tournament_participant_id", None),
+                "display_name": room_player.name,
+                "count": len(room_player.hand),
+            }
+            for room_player in get_active_players(room)
+        ]
+    return {
+        "match_id": match.match_id,
+        "round_no": match.round_no,
+        "table_no": table_no,
+        "player1_id": match.player1_id,
+        "player2_id": match.player2_id,
+        "player1_name": participants[match.player1_id].display_name,
+        "player2_name": participants[match.player2_id].display_name,
+        "winner_id": match.winner_id,
+        "winner_name": participants[match.winner_id].display_name if match.winner_id else None,
+        "status": match.status,
+        "resolution": match.resolution,
+        "ready_player_ids": list(match.ready_player_ids),
+        "ready_deadline_at": match.ready_deadline_at.isoformat() if match.ready_deadline_at else None,
+        "started_at": match.started_at.isoformat() if match.started_at else None,
+        "completed_at": match.completed_at.isoformat() if match.completed_at else None,
+        "room_state": room.state if room is not None else match.status,
+        "current_turn": current_player.name if current_player is not None else None,
+        "current_turn_participant_id": (
+            getattr(current_player, "tournament_participant_id", None)
+            if current_player is not None
+            else None
+        ),
+        "revolution": bool(room.reverse_order) if room is not None else False,
+        "field_number": str(room.last_number) if room is not None and room.last_number is not None else None,
+        "field": [
+            {
+                "suit": card.get("suit"),
+                "rank": card.get("rank"),
+                "is_joker": bool(card.get("is_joker") or card.get("suit") == "X"),
+            }
+            for card in (room.field if room is not None else [])
+        ],
+        "deck_count": len(room.deck) if room is not None else None,
+        "hand_counts": hand_counts,
+        "connected_player_ids": [
+            participant_id
+            for participant_id in (match.player1_id, match.player2_id)
+            if (
+                TOURNAMENT_SESSIONS.get(participant_id) is not None
+                and TOURNAMENT_SESSIONS[participant_id].ws is not None
+            )
+        ],
+        "viewer_count": len(TOURNAMENT_MATCH_VIEWERS.get(match_id, set())),
+    }
+
+
+def tournament_lobby_recipients(run: TournamentRun) -> list["Player"]:
+    recipients = []
+    seen = set()
+    lobby = rooms.get(run.room_id)
+    candidates = list(lobby.players if lobby is not None else []) + [
+        session
+        for participant_id, session in TOURNAMENT_SESSIONS.items()
+        if participant_id in run.participants
+    ]
+    for recipient in candidates:
+        identity = id(recipient)
+        if identity in seen or recipient.ws is None:
+            continue
+        seen.add(identity)
+        recipients.append(recipient)
+    return recipients
+
+
+async def broadcast_tournament_lobby(run: TournamentRun, payload: dict) -> None:
+    message = {**payload, "scope": "tournament_lobby", "run_id": run.run_id}
+    for recipient in tournament_lobby_recipients(run):
+        try:
+            await recipient.send_json(message)
+        except Exception:
+            await mark_player_disconnected(recipient)
+
+
+def clear_tournament_match_view(player: "Player") -> None:
+    match_id = getattr(player, "tournament_view_match_id", None)
+    if not match_id:
+        return
+    viewers = TOURNAMENT_MATCH_VIEWERS.get(match_id)
+    if viewers is not None:
+        viewers.discard(player)
+        if not viewers:
+            TOURNAMENT_MATCH_VIEWERS.pop(match_id, None)
+    player.tournament_view_match_id = None
+
+
+async def watch_tournament_match(player: "Player", match_id: str) -> None:
+    run = tournament_for_player(player) or TOURNAMENT_RUNS_BY_ROOM.get(TOURNAMENT_ROOM_ID)
+    if run is None or not is_tournament_managed_room(player.room):
+        raise ValueError("大会ロビーへ入室してから観戦してください。")
+    match = next((item for item in run.current_matches if item.match_id == match_id), None)
+    if match is None or match.status not in {"called", "playing"}:
+        raise ValueError("この対戦は現在観戦できません。")
+    own_match = (
+        run.current_match_for_participant(player.tournament_participant_id)
+        if player.tournament_participant_id
+        else None
+    )
+    if own_match is not None and own_match.status == "playing" and own_match.match_id != match_id:
+        raise ValueError("自分の対戦中はほかの対戦を観戦できません。")
+    clear_tournament_match_view(player)
+    player.tournament_view_match_id = match_id
+    TOURNAMENT_MATCH_VIEWERS.setdefault(match_id, set()).add(player)
+    await player.send_json({
+        "type": "tournament_match_view_update",
+        "match": tournament_match_live_summary(run, match_id),
+    })
+
+
+async def broadcast_tournament_match_state(room: "Room") -> None:
+    run = tournament_run_for_room(room)
+    match_id = room.tournament_match_id
+    if run is None or not match_id:
+        return
+    summary = tournament_match_live_summary(run, match_id)
+    await broadcast_tournament_lobby(run, {
+        "type": "tournament_match_summary",
+        "match": summary,
+    })
+    for viewer in list(TOURNAMENT_MATCH_VIEWERS.get(match_id, set())):
+        if viewer.ws is None:
+            clear_tournament_match_view(viewer)
+            continue
+        try:
+            await viewer.send_json({
+                "type": "tournament_match_view_update",
+                "match": summary,
+            })
+        except Exception:
+            clear_tournament_match_view(viewer)
+
+
+async def finish_tournament_match_view(
+    run: TournamentRun,
+    room: Optional["Room"],
+    match_id: str,
+    winner_name: Optional[str],
+) -> None:
+    summary = tournament_match_live_summary(run, match_id)
+    summary["score_lines"] = [
+        record.get("line", "")
+        for record in (room.score_log if room is not None else [])
+        if record.get("line")
+    ]
+    viewers = list(TOURNAMENT_MATCH_VIEWERS.pop(match_id, set()))
+    for viewer in viewers:
+        viewer.tournament_view_match_id = None
+        if viewer.ws is None:
+            continue
+        try:
+            await viewer.send_json({
+                "type": "tournament_match_view_ended",
+                "winner": winner_name,
+                "match": summary,
+            })
+        except Exception:
+            pass
+    await broadcast_tournament_lobby(run, {
+        "type": "tournament_match_summary",
+        "match": summary,
+    })
 
 
 def room_disconnect_grace_seconds(room: "Room", player: "Player") -> int:
@@ -1411,6 +1618,7 @@ async def prepare_tournament_match(
         room.tournament_match_id = match.match_id
         TOURNAMENT_MATCH_ROOMS[match.match_id] = room
     for match_player in (player1, player2):
+        clear_tournament_match_view(match_player)
         old_room = match_player.room
         if old_room is not None and old_room is not room and match_player in old_room.players:
             old_room.players.remove(match_player)
@@ -1516,10 +1724,12 @@ async def close_tournament_match_room(
     winner_id: Optional[str],
     broadcast_result: bool = True,
 ) -> None:
-    room = TOURNAMENT_MATCH_ROOMS.pop(match_id, None)
+    room = TOURNAMENT_MATCH_ROOMS.get(match_id)
+    winner_name = run.participants[winner_id].display_name if winner_id else None
+    await finish_tournament_match_view(run, room, match_id, winner_name)
     if room is None:
         return
-    winner_name = run.participants[winner_id].display_name if winner_id else None
+    TOURNAMENT_MATCH_ROOMS.pop(match_id, None)
     room.state = "waiting"
     room.current_turn_id = None
     if broadcast_result:
@@ -1886,6 +2096,7 @@ class Player:
         self.global_chat_subscribed = False
         self.last_global_chat_at = 0.0
         self.tournament_participant_id: Optional[str] = None
+        self.tournament_view_match_id: Optional[str] = None
         self.disconnected_at: Optional[datetime] = None
         self.room_resume_token_hash: Optional[str] = None
         self.room_session_room_id: Optional[str] = None
@@ -2329,13 +2540,35 @@ def record_score_event(room: Room, player: "Player", notation: str, result: str)
 async def publish_score_log(room: Room, winner: Optional[str]) -> None:
     if not room.score_log:
         return
-    await room.broadcast({
+    payload = {
         "type": "score_record",
         "sender": "system",
         "winner": winner,
         "records": room.score_log,
         "lines": [record.get("line", "") for record in room.score_log if record.get("line")],
-    })
+    }
+    if room.tournament_match_id:
+        payload.update({
+            "scope": "tournament_match",
+            "match_id": room.tournament_match_id,
+        })
+    await room.broadcast(payload)
+    if room.tournament_match_id:
+        run = tournament_run_for_room(room)
+        if run is not None:
+            match = next(
+                (item for item in run.matches if item.match_id == room.tournament_match_id),
+                None,
+            )
+            await broadcast_tournament_lobby(run, {
+                "type": "tournament_score_record",
+                "match_id": room.tournament_match_id,
+                "round_no": match.round_no if match is not None else None,
+                "player1_name": run.participants[match.player1_id].display_name if match is not None else None,
+                "player2_name": run.participants[match.player2_id].display_name if match is not None else None,
+                "winner": winner,
+                "lines": payload["lines"],
+            })
 
 ################################################
 # カード生成と配布のユーティリティ
@@ -4308,6 +4541,31 @@ async def websocket_endpoint(websocket: WebSocket):
                 except ValueError as exc:
                     await player.send_json({"type": "error", "code": "tournament_match_ready", "message": str(exc)})
                 continue
+            elif msg_type == "tournament_watch_match":
+                try:
+                    await watch_tournament_match(player, str(data.get("match_id", "")))
+                except ValueError as exc:
+                    await player.send_json({"type": "error", "code": "tournament_watch_match", "message": str(exc)})
+                continue
+            elif msg_type == "tournament_lobby_chat":
+                run = tournament_for_player(player) or TOURNAMENT_RUNS_BY_ROOM.get(TOURNAMENT_ROOM_ID)
+                if run is None or not is_tournament_managed_room(player.room):
+                    await player.send_json({"type": "error", "code": "tournament_lobby_chat", "message": "大会ロビーへ入室してください。"})
+                    continue
+                message = normalize_chat_message(data.get("message"))
+                if message is None:
+                    await player.send_json({
+                        "type": "error",
+                        "code": "invalid_chat_message",
+                        "message": f"メッセージは1〜{MAX_CHAT_MESSAGE_LENGTH}文字で入力してください。",
+                    })
+                    continue
+                await broadcast_tournament_lobby(run, {
+                    "type": "chat",
+                    "sender": player.name,
+                    "message": message,
+                })
+                continue
             elif msg_type == "tournament_admin_schedule":
                 if not tournament_admin_authorized(data.get("admin_token")):
                     await player.send_json({"type": "error", "code": "tournament_admin", "message": "管理トークンが正しくありません。"})
@@ -4782,13 +5040,27 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"メッセージは1〜{MAX_CHAT_MESSAGE_LENGTH}文字で入力してください。",
                     })
                     continue
-                # 表示用に「プレイヤー」を追加
                 display_sender = f"{player.name}"
-                await room.broadcast({
+                if room.room_id == TOURNAMENT_ROOM_ID:
+                    run = tournament_run_for_room(room)
+                    if run is not None:
+                        await broadcast_tournament_lobby(run, {
+                            "type": "chat",
+                            "sender": display_sender,
+                            "message": message,
+                        })
+                        continue
+                payload = {
                     "type": "chat",
                     "sender": display_sender,
                     "message": message,
-                })
+                }
+                if room.tournament_match_id:
+                    payload.update({
+                        "scope": "tournament_match",
+                        "match_id": room.tournament_match_id,
+                    })
+                await room.broadcast(payload)
 
     except WebSocketDisconnect:
         if player.ws is websocket and player.room is not None:
@@ -4813,6 +5085,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await leave_room(player, notify_client=False)
     finally:
         if player.ws is websocket or player.ws is None:
+            clear_tournament_match_view(player)
             GLOBAL_CHAT_SUBSCRIBERS.discard(player)
             player.global_chat_subscribed = False
 
@@ -5527,6 +5800,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 # 部屋からの退出
 ################################################
 async def leave_room(player, notify_client: bool = True):
+    clear_tournament_match_view(player)
     if player.room is None:
         if notify_client:
             await player.send_json(room_counts_payload(
@@ -5654,6 +5928,8 @@ async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer
         "current_turn_id": room.current_turn_id,
         "reset_timer": reset_timer,
     })
+    if room.tournament_match_id:
+        await broadcast_tournament_match_state(room)
 
 async def next_turn(room):
     # ターンが変わるので、ドロー済みフラグをリセットする
