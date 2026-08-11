@@ -80,6 +80,9 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 SAMPLE_MEMORY_JSON = KNOWLEDGE_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = KNOWLEDGE_DIR / "registered_prime_daifugo_plus_ge4.json"
 GOLD_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "gold_prime_table_memory.json"
+COMPOSITE_PRACTICE_COUNTERMEASURES_JSON = (
+    KNOWLEDGE_DIR / "composite_practice_countermeasures_v1.json"
+)
 SILVER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "silver_prime_table_memory.json"
 COMPOSITE_PRACTICE_GE3_TEXT = KNOWLEDGE_DIR / "composite_practice_composites_ge3.txt"
 COMPOSITE_PRACTICE_PRIME_JSON = KNOWLEDGE_DIR / "composite_practice_primes_le3_upper.json"
@@ -2753,23 +2756,50 @@ REGISTERED_SAMPLE_DEFS = {
         "composite_text": None,
     },
     "composite_practice_ge3": {
-        "label": "合成数練習：3枚以下上位互換＋大会3回以上",
+        "label": "合成数練習：3枚以下上位互換＋大会3回以上＋対策147式",
         "prime_json": COMPOSITE_PRACTICE_PRIME_JSON,
         "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
+        "supplemental_composite_json": COMPOSITE_PRACTICE_COUNTERMEASURES_JSON,
         "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
         "visible": True,
     },
     "composite_practice_cpu_ge3": {
-        "label": "合成数練習CPU：3枚以下上位互換＋大会3回以上",
+        "label": "合成数練習CPU：3枚以下上位互換＋大会3回以上＋対策147式",
         "prime_json": COMPOSITE_PRACTICE_PRIME_JSON,
         "composite_text": COMPOSITE_PRACTICE_GE3_TEXT,
+        "supplemental_composite_json": COMPOSITE_PRACTICE_COUNTERMEASURES_JSON,
         "access_scope": COMPOSITE_PRACTICE_ACCESS_SCOPE,
         "visible": False,
     },
 }
 DEFAULT_REGISTERED_SAMPLE_KEY = "sashimi2024"
 
-def load_sample_memory_from_files(prime_json: Path, composite_text_path: Optional[Path] = None) -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
+def supplemental_composite_text_from_json(path: Optional[Path]) -> str:
+    if path is None or not path.exists():
+        return ""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    composite_text = str(data.get("compositeText", "")).strip()
+    if composite_text:
+        return composite_text
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"invalid supplemental composite knowledge: {path}")
+    equations = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"invalid supplemental composite entry: {path}")
+        equation = str(entry.get("registeredEquation", "")).strip()
+        if not equation:
+            raise ValueError(f"missing registeredEquation: {path}")
+        equations.append(equation)
+    return "\n".join(equations)
+
+
+def load_sample_memory_from_files(
+    prime_json: Path,
+    composite_text_path: Optional[Path] = None,
+    supplemental_composite_json: Optional[Path] = None,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
     if not prime_json.exists():
         return (), (), (), "", ""
     data = json.loads(prime_json.read_text(encoding="utf-8-sig"))
@@ -2784,6 +2814,13 @@ def load_sample_memory_from_files(prime_json: Path, composite_text_path: Optiona
                 str(data.get("additionalCompositeText", "")).strip(),
             )
             if part.strip()
+        )
+    supplemental_composite_text = supplemental_composite_text_from_json(
+        supplemental_composite_json
+    )
+    if supplemental_composite_text:
+        composite_text = "\n".join(
+            part for part in (composite_text, supplemental_composite_text) if part
         )
     prime_result = parse_registered_prime_text(prime_text)
     composite_result = parse_registered_composite_text(composite_text)
@@ -2806,6 +2843,7 @@ def load_registered_samples() -> dict:
             "data": load_sample_memory_from_files(
                 definition["prime_json"],
                 definition.get("composite_text"),
+                definition.get("supplemental_composite_json"),
             ),
         }
     return samples

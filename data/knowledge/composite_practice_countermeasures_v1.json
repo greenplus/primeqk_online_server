@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "name": "合成数練習部屋 合成数大富豪対策知識",
+  "description": "合成数大富豪対策資料を登録式へ正規化した軽量知識。Aは1へ変換し、T/J/Q/Kは絵札として保持する。",
+  "sourceReferences": [
+    {
+      "id": "otty-2025-12-02",
+      "label": "合成数大富豪対策（2025-12-02）",
+      "url": "https://otty8121013.hatenadiary.jp/entry/2025/12/02/000000"
+    },
+    {
+      "id": "otty-2025-12-19",
+      "label": "合成数大富豪対策（2025-12-19）",
+      "url": "https://otty8121013.hatenadiary.jp/entry/2025/12/19/000000"
+    },
+    {
+      "id": "otty-2025-12-24",
+      "label": "合成数大富豪対策（2025-12-24）",
+      "url": "https://otty8121013.hatenadiary.jp/entry/2025/12/24/000000"
+    },
+    {
+      "id": "hana-misaki-2025-08-19",
+      "label": "Misaki（2025-08-19）",
+      "url": "https://hana3101382283.hatenablog.com/entry/2025/8/19/Misaki"
+    },
+    {
+      "id": "sashimi-original",
+      "label": "さしみオリジナル",
+      "url": null
+    }
+  ],
+  "compositeText": "t4=2^3*k\n1q=2^4*7\n4k=7*59\n5j=7*73\n6j=k*47\n7q=2^3*89\n9k=j*83\njq=2^3*k9\nqj=7*173\n481=37*k\n539=7^2*j\n689=k*53\n869=j*79\n847=7*j^2\n871=k*67\n889=7*q7\n896=2^7*7\n891=3^4*j\n89t=3^4*j*2*5\nj83=7*k^2\nq43=j*1k\nq61=k*97\n4t1=3*k67\n4tt=3*k67*2*5\n45j=k*347\n49k=17^3\n64k=j^2*53\n6q5=5^3*7^2\n8t4=2^3*tk\n8q5=5^4*k\n8q8=2^6*q7\n84j=k*647\n86j=79*t9\n88k=7*q59\n886k=7*q659\njq5=5^3*89\njq8=2^3*k*t7\nj4t=2*5*7*163\nqq5=5^3*97\nqk3=j*1t3\nkq5=3*5^4*7\nk3q=2^t*k\n3qk=7^4*k\n4kq=2^5*q91\n8jq=2^3*tk9\n8qj=k*6247\n9qj=197*463\nttj=83*q17\ntkq=2^6*1583\njkt=2*5*jk1\nqtt=2*5*qt1\nkqt=2*5*kq1\nq25k=t1*qk\nktk=3^2*14557\nkkt=2*3^2*5*1459\nkqj=3^2*61*239\n1573=j*j*k\n1859=j*k*k\n4459=7^3*k\n4489=67^2\n4897=59*83\n6561=3^8\n6743=j*6k\n6875=5^4*j\n8614=2*59*73\n8667=3^4*t7\nt543=k*8j\nj834=2*61*97\nj843=k*9j\nj449=t7^2\nj663=t7*t9\nj881=t9^2\nk343=j*qk\nk834=2*6917\nk843=t9*q7\n16q9=q7^2\nq769=1k^2\n48q5=5^4*7*j\n48q8=2^t*47\n68q5=5^4*t9\n8q71=67*qk\n86q3=71*qk\nt98j=k*8447\nj57q=2^t*1k\nqt43=k*93j\nk88j=q7*t93\nq6kt=2*5*q6k1\nk9qt=2*5*k9q1\n6jkt=2*5*6jk1\n7jkt=2*5*7jk1\n8qtt=2*5*8qt1\n8kqt=2*5*8kq1\n9tqt=2*5*9tq1\njqkt=2*5*jqk1\nqqq5=5^3*9697\n6jjk=q7*48j9\n8tkq=2^6*q6583\n9tkq=2^k*j*t1\n9kjj=j*647*q83\n8qt14=2*j*369k7\n65qtk=9j*71483\n88549=73*qk\n864qt=2*5*864q1\n96q4t=2*5*96q41\n84qtt=2*5*84qt1\n8q6tt=2*5*8q6t1\n87kqt=2*5*87kq1\nkq7jk=tj1*q983\n4jqkt=2*5*4jqk1\n7jqkt=2*5*7jqk1\n8kqtj=3^5*487*6871\nkqqjt=2*5*kqqj1\nqj7361=59^4\n634q8j=7^8*j\n864q1t=2*5*864qj\n97q86t=2*5*97q861\n984q6t=2*5*984q61\nk3j43=j*qtk\nq683=j*j53\n68q3=j^2*563\nqt781=j*k*8467\n5t3=3^6*7\n78q5=5^7\nj7649=7^6\nq94k9=7^6*j\n531441=3^q\n823543=7^7\njttk=7*j*144169\ntjtk=j*919183\n4qqj=3*k9*9883\n83qj=683*q17\n526q659=3^14*j\n15j6544=2^8*3^t\nttjk=j*918283\ntqtj=q7*79693\n4tq9j=68*6qk3\n8jq8k=67*qt639\n8j4q8k=67*q1t639\n84tq85j=6947*qt6k\n54t4jqk=8839*6qt67\nt6694tk=83*q8547j\nq656j7=q49*tk3\nq5qj=k*t9*883\n5q3=47*t9\n1t7469=qk*83*j\n167843=q9j*k\nq3j=947*k",
+  "counts": {
+    "equations": 147,
+    "distinctValues": 147,
+    "sources": 5
+  }
+}
