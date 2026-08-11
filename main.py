@@ -29,6 +29,7 @@ from assist_recommendation import (
     rank_recommended_assist_candidates,
 )
 from campaign_store import (
+    LAUNCH_PERIOD_KEY,
     LEGACY_CAMPAIGN_KEY,
     CampaignSettings,
     CampaignStore,
@@ -1983,6 +1984,9 @@ async def tournament_scheduler_loop() -> None:
 
 
 def campaign_base_payload(now: datetime, period=None) -> dict:
+    schedule_label = "毎週 月曜6:00〜日曜24:00（日本時間）"
+    if period is not None and period.key == LAUNCH_PERIOD_KEY:
+        schedule_label = "初週のみ8/12 6:00開始・8/17 0:00終了（日本時間）"
     return {
         "campaign_key": CAMPAIGN_SETTINGS.key,
         "period_key": period.key if period is not None else None,
@@ -1993,7 +1997,7 @@ def campaign_base_payload(now: datetime, period=None) -> dict:
         "server_now": now.isoformat(),
         "campaign_url": CAMPAIGN_SETTINGS.page_url,
         "schedule": CAMPAIGN_SETTINGS.schedule,
-        "schedule_label": "毎週 月曜6:00〜日曜24:00（日本時間）",
+        "schedule_label": schedule_label,
     }
 
 

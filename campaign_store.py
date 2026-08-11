@@ -13,6 +13,8 @@ DEFAULT_CAMPAIGN_PAGE_URL = "https://greenplus.github.io/qkneo/campaign.html"
 WEEKLY_TIMEZONE = ZoneInfo("Asia/Tokyo")
 LEGACY_CAMPAIGN_KEY = "gold-cpu-100"
 LEGACY_PERIOD_KEY = "2026-07-28-special"
+LAUNCH_PERIOD_KEY = "2026-08-12-launch"
+LAUNCH_WEEK_MONDAY = date(2026, 8, 10)
 
 
 def utc_now() -> datetime:
@@ -124,15 +126,21 @@ class CampaignSettings:
             monday = local.date() - timedelta(days=local.weekday())
             start_local = datetime.combine(monday, time(6), WEEKLY_TIMEZONE)
             end_local = datetime.combine(monday + timedelta(days=7), time(0), WEEKLY_TIMEZONE)
+            period_key = start_local.date().isoformat()
+            label = f"{start_local:%Y/%m/%d}週"
+            if monday == LAUNCH_WEEK_MONDAY:
+                start_local = datetime(2026, 8, 12, 6, 0, tzinfo=WEEKLY_TIMEZONE)
+                period_key = LAUNCH_PERIOD_KEY
+                label = "初週 2026/08/12 6:00開始"
             status = "active"
             if local < start_local:
                 status = "scheduled"
             period = CampaignPeriod(
-                key=start_local.date().isoformat(),
+                key=period_key,
                 starts_at=start_local.astimezone(timezone.utc),
                 ends_at=end_local.astimezone(timezone.utc),
                 goal=self.goal,
-                label=f"{start_local:%Y/%m/%d}週",
+                label=label,
             )
             return status, period
 
