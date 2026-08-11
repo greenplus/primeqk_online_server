@@ -28,7 +28,12 @@ from assist_recommendation import (
     RECOMMENDATION_CACHE_VERSION,
     rank_recommended_assist_candidates,
 )
-from campaign_store import CampaignSettings, CampaignStore, utc_now
+from campaign_store import (
+    LEGACY_CAMPAIGN_KEY,
+    CampaignSettings,
+    CampaignStore,
+    utc_now,
+)
 from composite_practice_stats_store import (
     ACTOR_CPU,
     ACTOR_OWNER,
@@ -451,6 +456,8 @@ class Room:
         self.game_started_at: Optional[datetime] = None
         self.campaign_player_id: Optional[str] = None
         self.campaign_cpu_key: Optional[str] = None
+        self.campaign_period = None
+        self.campaign_largest_prime: Optional[int] = None
         self.tournament_run_id: Optional[str] = None
         self.tournament_match_id: Optional[str] = None
 
@@ -1975,72 +1982,51 @@ async def tournament_scheduler_loop() -> None:
         await asyncio.sleep(2)
 
 
-def campaign_base_payload(now: datetime) -> dict:
+def campaign_base_payload(now: datetime, period=None) -> dict:
     return {
         "campaign_key": CAMPAIGN_SETTINGS.key,
-        "goal": CAMPAIGN_SETTINGS.goal,
-        "starts_at": (
-            CAMPAIGN_SETTINGS.start_at.isoformat()
-            if CAMPAIGN_SETTINGS.start_at is not None
-            else None
-        ),
-        "ends_at": (
-            CAMPAIGN_SETTINGS.end_at.isoformat()
-            if CAMPAIGN_SETTINGS.end_at is not None
-            else None
-        ),
+        "period_key": period.key if period is not None else None,
+        "period_label": period.label if period is not None else None,
+        "goal": period.goal if period is not None else CAMPAIGN_SETTINGS.goal,
+        "starts_at": period.starts_at.isoformat() if period is not None else None,
+        "ends_at": period.ends_at.isoformat() if period is not None else None,
         "server_now": now.isoformat(),
         "campaign_url": CAMPAIGN_SETTINGS.page_url,
+        "schedule": CAMPAIGN_SETTINGS.schedule,
+        "schedule_label": "毎週 月曜6:00〜日曜24:00（日本時間）",
     }
 
 
 @app.get("/api/campaigns/gold-cpu-100")
 async def get_cpu_campaign_status() -> dict:
     now = utc_now()
-    payload = campaign_base_payload(now)
+    state, period = CAMPAIGN_SETTINGS.period_state(now)
+    payload = campaign_base_payload(now, period)
+    empty = {
+        "total_wins": 0,
+        "progress_percent": 0,
+        "rankings": [],
+        "prime_rankings": [],
+        "history": [],
+        "last_updated_at": None,
+    }
 
     if not CAMPAIGN_SETTINGS.enabled:
         return {
             **payload,
             "status": "unavailable",
-            "message": "キャンペーンは現在無効です",
-            "total_wins": None,
-            "progress_percent": None,
-            "rankings": [],
-            "last_updated_at": None,
+            "message": "週次チャレンジは現在無効です",
+            **empty,
         }
 
-    if CAMPAIGN_SETTINGS.start_at is None:
-        return {
-            **payload,
-            "status": "scheduled",
-            "message": CAMPAIGN_SETTINGS.start_error or "開始日時が未設定です",
-            "total_wins": None,
-            "progress_percent": None,
-            "rankings": [],
-            "last_updated_at": None,
-        }
-
-    if CAMPAIGN_SETTINGS.end_at is None or CAMPAIGN_SETTINGS.end_error is not None:
+    if period is None:
         return {
             **payload,
             "status": "unavailable",
-            "message": CAMPAIGN_SETTINGS.end_error or "終了日時が未設定です",
-            "total_wins": None,
-            "progress_percent": None,
-            "rankings": [],
-            "last_updated_at": None,
-        }
-
-    if now < CAMPAIGN_SETTINGS.start_at:
-        return {
-            **payload,
-            "status": "scheduled",
-            "message": "キャンペーン開始前です",
-            "total_wins": 0,
-            "progress_percent": 0,
-            "rankings": [],
-            "last_updated_at": None,
+            "message": CAMPAIGN_SETTINGS.end_error
+            or CAMPAIGN_SETTINGS.start_error
+            or "開催期間を取得できません",
+            **empty,
         }
 
     if not CAMPAIGN_STORE.ready:
@@ -2048,39 +2034,52 @@ async def get_cpu_campaign_status() -> dict:
             **payload,
             "status": "unavailable",
             "message": "集計情報を取得できません",
-            "total_wins": None,
-            "progress_percent": None,
-            "rankings": [],
-            "last_updated_at": None,
+            **empty,
         }
 
     try:
-        leaderboard = await CAMPAIGN_STORE.leaderboard(CAMPAIGN_SETTINGS.key, limit=20)
+        if state == "scheduled":
+            overview = {
+                "total_wins": 0,
+                "rankings": [],
+                "prime_rankings": [],
+                "last_updated_at": None,
+            }
+        else:
+            overview = await CAMPAIGN_STORE.overview(
+                CAMPAIGN_SETTINGS.key,
+                period,
+                limit=20,
+            )
+        history = await CAMPAIGN_STORE.history(
+            (CAMPAIGN_SETTINGS.key, LEGACY_CAMPAIGN_KEY),
+            limit=12,
+        )
     except Exception as exc:
         print(f"campaign leaderboard failed: {exc}")
         return {
             **payload,
             "status": "unavailable",
             "message": "集計情報を取得できません",
-            "total_wins": None,
-            "progress_percent": None,
-            "rankings": [],
-            "last_updated_at": None,
+            **empty,
         }
 
-    total_wins = leaderboard["total_wins"]
+    total_wins = overview["total_wins"]
+    message = ""
+    if state == "scheduled":
+        message = "月曜6:00から新しい週が始まります。歴代記録をご覧ください。"
+    elif state == "finished":
+        message = "この開催は終了しました。最終結果です。"
     return {
         **payload,
-        "status": "finished" if now >= CAMPAIGN_SETTINGS.end_at else "active",
-        "message": (
-            "キャンペーンは終了しました。最終結果です。"
-            if now >= CAMPAIGN_SETTINGS.end_at
-            else ""
-        ),
+        "status": state,
+        "message": message,
         "total_wins": total_wins,
-        "progress_percent": min(100, round(total_wins / CAMPAIGN_SETTINGS.goal * 100, 1)),
-        "rankings": leaderboard["rankings"],
-        "last_updated_at": leaderboard["last_updated_at"],
+        "progress_percent": min(100, round(total_wins / period.goal * 100, 1)),
+        "rankings": overview["rankings"],
+        "prime_rankings": overview["prime_rankings"],
+        "history": history,
+        "last_updated_at": overview["last_updated_at"],
     }
 
 
@@ -2366,8 +2365,11 @@ def prepare_campaign_game(
     room.game_started_at = now
     room.campaign_player_id = None
     room.campaign_cpu_key = None
+    room.campaign_period = None
+    room.campaign_largest_prime = None
 
-    if not CAMPAIGN_SETTINGS.is_active(now):
+    period = CAMPAIGN_SETTINGS.active_period(now)
+    if not CAMPAIGN_SETTINGS.enabled or period is None:
         return False
     if room.room_id not in NEO_BEGINNER_ROOM_IDS or room.rule.key != "half-7-1-c-assist":
         return False
@@ -2385,7 +2387,18 @@ def prepare_campaign_game(
 
     room.campaign_player_id = human_players[0].id
     room.campaign_cpu_key = cpu_key
+    room.campaign_period = period
     return True
+
+
+def remember_campaign_prime(room: Room, player: "Player", number: int) -> None:
+    """Keep the human player's largest legal prime for this eligible game."""
+    if room.campaign_player_id != player.id or room.campaign_period is None:
+        return
+    if not is_prime(number):
+        return
+    if room.campaign_largest_prime is None or number > room.campaign_largest_prime:
+        room.campaign_largest_prime = number
 
 
 async def maybe_record_campaign_win(
@@ -2393,27 +2406,52 @@ async def maybe_record_campaign_win(
     winner_player: Optional["Player"],
     won_at: Optional[datetime] = None,
 ) -> Optional[dict]:
-    if winner_player is None or is_cpu_player(winner_player):
-        return None
-    if room.campaign_player_id != winner_player.id:
-        return None
     if not room.game_id or room.game_started_at is None or not room.campaign_cpu_key:
         return None
 
     now = won_at or utc_now()
-    if not CAMPAIGN_SETTINGS.is_active(now):
+    period = CAMPAIGN_SETTINGS.active_period(now)
+    if period is None or room.campaign_period is None:
         return None
+    if period.key != room.campaign_period.key:
+        return None
+
+    human_player = next(
+        (player for player in room.players if player.id == room.campaign_player_id),
+        None,
+    )
     if (
-        CAMPAIGN_SETTINGS.start_at is None
-        or room.game_started_at < CAMPAIGN_SETTINGS.start_at
+        CAMPAIGN_STORE.ready
+        and human_player is not None
+        and room.campaign_largest_prime is not None
     ):
+        try:
+            await asyncio.wait_for(
+                CAMPAIGN_STORE.record_prime(
+                    campaign_key=CAMPAIGN_SETTINGS.key,
+                    period=period,
+                    game_id=room.game_id,
+                    player_name=human_player.name,
+                    prime_value=room.campaign_largest_prime,
+                    achieved_at=now,
+                ),
+                timeout=3,
+            )
+        except Exception as exc:
+            print(f"campaign prime recording failed: {exc}")
+
+    if winner_player is None or is_cpu_player(winner_player):
+        return None
+    if room.campaign_player_id != winner_player.id:
         return None
 
     base_result = {
         "type": "campaign_result",
         "campaign_key": CAMPAIGN_SETTINGS.key,
+        "period_key": period.key,
+        "period_label": period.label,
         "player_name": winner_player.name,
-        "goal": CAMPAIGN_SETTINGS.goal,
+        "goal": period.goal,
         "campaign_url": CAMPAIGN_SETTINGS.page_url,
     }
     if not CAMPAIGN_STORE.ready:
@@ -2427,6 +2465,7 @@ async def maybe_record_campaign_win(
         counts = await asyncio.wait_for(
             CAMPAIGN_STORE.record_win(
                 campaign_key=CAMPAIGN_SETTINGS.key,
+                period=period,
                 game_id=room.game_id,
                 player_name=winner_player.name,
                 room_id=room.room_id,
@@ -2450,7 +2489,7 @@ async def maybe_record_campaign_win(
         "status": "recorded",
         "player_wins": counts["player_wins"],
         "total_wins": counts["total_wins"],
-        "message": "CPU勝利数キャンペーンに1勝を記録しました。",
+        "message": "今週のCPUチャレンジに1勝を記録しました。",
     }
 
 
@@ -5381,7 +5420,8 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await next_turn(room)
         return
 
-    # 素数なら場に出す
+    # 素数なら場に出す。常設チャレンジ対象局では人間の最大素数も記録する。
+    remember_campaign_prime(room, player, number)
     push_to_reserve(room, played_cards)
     for c in played_cards:
         player.remove_card(c)
