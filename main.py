@@ -458,7 +458,7 @@ class Room:
         self.campaign_player_id: Optional[str] = None
         self.campaign_cpu_key: Optional[str] = None
         self.campaign_period = None
-        self.campaign_largest_prime: Optional[int] = None
+        self.largest_prime_plays_by_player: Dict[str, dict] = {}
         self.tournament_run_id: Optional[str] = None
         self.tournament_match_id: Optional[str] = None
 
@@ -630,6 +630,7 @@ class Room:
             self.state = "waiting"
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
             await self.log_chat(f"{winner}が勝利しました")
+            await send_neo_largest_prime_share_chats(self)
             await maybe_log_talkative_fish_game_over(self)
             await publish_score_log(self, winner)
             if campaign_result is not None and winner_player is not None:
@@ -2370,7 +2371,7 @@ def prepare_campaign_game(
     room.campaign_player_id = None
     room.campaign_cpu_key = None
     room.campaign_period = None
-    room.campaign_largest_prime = None
+    room.largest_prime_plays_by_player = {}
 
     period = CAMPAIGN_SETTINGS.active_period(now)
     if not CAMPAIGN_SETTINGS.enabled or period is None:
@@ -2395,14 +2396,49 @@ def prepare_campaign_game(
     return True
 
 
-def remember_campaign_prime(room: Room, player: "Player", number: int) -> None:
-    """Keep the human player's largest legal prime for this eligible game."""
-    if room.campaign_player_id != player.id or room.campaign_period is None:
-        return
+def remember_largest_prime_play(
+    room: Room,
+    player: "Player",
+    number: int,
+    card_notation: str = "",
+) -> None:
+    """Keep each player's largest successful prime play for the current game."""
     if not is_prime(number):
         return
-    if room.campaign_largest_prime is None or number > room.campaign_largest_prime:
-        room.campaign_largest_prime = number
+    current = room.largest_prime_plays_by_player.get(player.id)
+    if current is not None and number <= current["value"]:
+        return
+    room.largest_prime_plays_by_player[player.id] = {
+        "value": number,
+        "card_notation": card_notation,
+    }
+
+
+async def send_neo_largest_prime_share_chats(room: Room) -> None:
+    """Send each connected human their own NEO result share action."""
+    if room.category != "Neo":
+        return
+    for player in list(room.players):
+        prime_play = room.largest_prime_plays_by_player.get(player.id)
+        if prime_play is None or is_cpu_player(player):
+            continue
+        if hasattr(player, "ws") and player.ws is None:
+            continue
+        prime_value = str(prime_play["value"])
+        try:
+            await player.send_json({
+                "type": "chat",
+                "sender": "system",
+                "message": f"この試合で出した最大の素数は {prime_value} です。",
+                "action": {
+                    "kind": "share_largest_prime",
+                    "prime_value": prime_value,
+                    "card_notation": prime_play.get("card_notation", ""),
+                },
+            })
+        except Exception as exc:
+            # 共有導線の送信失敗で対局終了処理を止めない。
+            print(f"largest prime share chat failed in {room.room_id}: {exc}")
 
 
 async def maybe_record_campaign_win(
@@ -2424,10 +2460,11 @@ async def maybe_record_campaign_win(
         (player for player in room.players if player.id == room.campaign_player_id),
         None,
     )
+    campaign_prime_play = room.largest_prime_plays_by_player.get(room.campaign_player_id)
     if (
         CAMPAIGN_STORE.ready
         and human_player is not None
-        and room.campaign_largest_prime is not None
+        and campaign_prime_play is not None
     ):
         try:
             await asyncio.wait_for(
@@ -2436,7 +2473,7 @@ async def maybe_record_campaign_win(
                     period=period,
                     game_id=room.game_id,
                     player_name=human_player.name,
-                    prime_value=room.campaign_largest_prime,
+                    prime_value=campaign_prime_play["value"],
                     achieved_at=now,
                 ),
                 timeout=3,
@@ -4334,6 +4371,7 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             room.current_turn_id = None
             await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
             await room.log_chat(f"{winner_name}が勝利しました")
+            await send_neo_largest_prime_share_chats(room)
             await maybe_log_talkative_fish_game_over(room)
             await publish_score_log(room, winner_name)
         elif len(active_players) == 0:
@@ -5424,8 +5462,9 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await next_turn(room)
         return
 
-    # 素数なら場に出す。常設チャレンジ対象局では人間の最大素数も記録する。
-    remember_campaign_prime(room, player, number)
+    # 素数なら場に出し、対局中に出したプレイヤーごとの最大素数も記録する。
+    play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
+    remember_largest_prime_play(room, player, number, play_text)
     push_to_reserve(room, played_cards)
     for c in played_cards:
         player.remove_card(c)
@@ -5455,7 +5494,6 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     if hnp_challenge:
         await room.log_chat("HNP！")
     await maybe_log_talkative_fish_sashimi(room, number)
-    play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
     record_score_play_line(room, player, f"{score_prefix}{play_text}{score_win_suffix(player)}")
     await next_turn(room)
 
