@@ -86,6 +86,7 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 SAMPLE_MEMORY_JSON = KNOWLEDGE_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = KNOWLEDGE_DIR / "registered_prime_daifugo_plus_ge4.json"
 GOLD_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "gold_prime_table_memory.json"
+PLATINUM_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "platinum_prime_table_memory.json"
 COMPOSITE_PRACTICE_COUNTERMEASURES_JSON = (
     KNOWLEDGE_DIR / "composite_practice_countermeasures_v1.json"
 )
@@ -447,6 +448,8 @@ class Room:
         self.deck = []
         self.field = []      # 場に出ているカード
         self.reserve = [] # 山札予備軍
+        self.public_unknown_deck_count = 0
+        self.public_known_deck_bottom = []
         self.last_number = None     # “場に出ている”最後の数値を保持
         self.current_turn_id = None
         self.first_player_id = None
@@ -2732,11 +2735,26 @@ def push_to_reserve(room: Room, cards: List[dict]) -> None:
     if cards:
         room.reserve.extend(cards)
 
+def ensure_public_deck_tracker(room: Room) -> None:
+    if not hasattr(room, "public_unknown_deck_count"):
+        room.public_unknown_deck_count = len(getattr(room, "deck", []) or [])
+    if not hasattr(room, "public_known_deck_bottom"):
+        room.public_known_deck_bottom = []
+
+def record_public_deck_draw(room: Room, drawn: dict) -> None:
+    ensure_public_deck_tracker(room)
+    if room.public_unknown_deck_count > 0:
+        room.public_unknown_deck_count -= 1
+    elif room.public_known_deck_bottom:
+        room.public_known_deck_bottom.pop(0)
+
 def flow_field(room: Room) -> None:
     """場が流れたときの共通処理：場を空にし、予備軍を山札の“下”に戻す（順序保持）"""
     room.field = []
     room.last_number = None
     if room.reserve:
+        ensure_public_deck_tracker(room)
+        room.public_known_deck_bottom.extend(room.reserve)
         room.deck.extend(room.reserve)  # pop(0)で上から引く設計なので、extendは“下に戻す”
         room.reserve.clear()
 
@@ -2744,6 +2762,8 @@ def return_cards_to_deck_bottom(room, cards: List[dict]) -> None:
     """合成数の『消費カード』を即座に山札の底に戻す。場は流さない。"""
     if not cards:
         return
+    ensure_public_deck_tracker(room)
+    room.public_known_deck_bottom.extend(cards)
     room.deck.extend(cards)
 
 def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card_count: int) -> int:
@@ -2828,6 +2848,11 @@ REGISTERED_SAMPLE_DEFS = {
     "gold_prime_table": {
         "label": "サンプル：ゴールド素数表",
         "prime_json": GOLD_PRIME_TABLE_JSON,
+        "composite_text": None,
+    },
+    "platinum_prime_table": {
+        "label": "サンプル：プラチナ素数表",
+        "prime_json": PLATINUM_PRIME_TABLE_JSON,
         "composite_text": None,
     },
     "silver_prime_table": {
@@ -4518,6 +4543,7 @@ async def draw_card_for_player(player, room: Room) -> bool:
         return False
 
     drawn = room.deck.pop(0)
+    record_public_deck_draw(room, drawn)
     player.add_card(drawn)
     record_score_line(room, f"{player.name}:{score_state_prefix(room)}D({score_card_symbol(drawn)})")
     await player.send_hand_update()
@@ -5423,6 +5449,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         for _ in range(penalty_cards):
             if room.deck:
                 drawn = room.deck.pop(0)
+                record_public_deck_draw(room, drawn)
                 player.add_card(drawn)
                 drawn_penalties.append(drawn)
 
@@ -5812,6 +5839,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         for _ in range(penalty_cards):
             if room.deck:
                 drawn = room.deck.pop(0)
+                record_public_deck_draw(room, drawn)
                 player.add_card(drawn)
                 drawn_penalties.append(drawn)
         flow_field(room)
@@ -6004,6 +6032,8 @@ async def start_game(room):
     for player, hand in zip(waiting_players, hands):
         player.hand = hand
     room.deck = remaining
+    room.public_unknown_deck_count = len(remaining)
+    room.public_known_deck_bottom = []
 
     room.reserve = []
     room.field = []  # 場のカードは空

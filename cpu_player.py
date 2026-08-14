@@ -37,6 +37,42 @@ CPU_PLANNER_DEFAULT_BUDGET_MS = 250
 COMPOSITE_PRACTICE_MAX_PLAN_STEPS = 5
 COMPOSITE_PRACTICE_BRANCH_CAP = 48
 COMPOSITE_PRACTICE_ALL_OUT_ATTEMPTS = 96
+PLATINUM_PLAN_MAX_STEPS = 5
+PLATINUM_MIN_TRUMP_STRENGTH = 80.0
+PLATINUM_MAX_KNOWLEDGE_CARDS = 14
+PLATINUM_ABSOLUTE_ALWAYS = frozenset({
+    "kk", "kkk", "kkkq", "kkqkj", "kkkqqj", "kkkqqqj", "kkkqqjj",
+    "kkkqjtqj", "kkkqqttqj", "kkkqtttjj", "kkkqtjqjj",
+})
+PLATINUM_ABSOLUTE_KX4 = frozenset({
+    "kkq", "kkqt", "kkjq", "kkqtj", "kkkttj", "kkqqtj", "kkktttj",
+    "kkqjqtj", "kkkqtqtj", "kkqqtjtjj",
+})
+PLATINUM_DUAL_WIELD_TEMPLATES = {
+    "125kjqj": ("kjqj", 99.0), "614kjqj": ("kjqj", 99.0),
+    "956kjqj": ("kjqj", 99.0), "278kjqj": ("kjqj", 99.0),
+    "638kjqj": ("kjqj", 99.0), "758kjqj": ("kjqj", 99.0),
+    "263kjqj": ("kjqj", 99.0), "443kjqj": ("kjqj", 99.0),
+    "451ktqj": ("ktqj", 95.0), "589ktqj": ("ktqj", 95.0),
+    "283ktqj": ("ktqj", 95.0), "547ktqj": ("ktqj", 95.0),
+    "982ktqj": ("ktqj", 95.0), "883ktqj": ("ktqj", 95.0),
+    "69qtjk1": ("ktqj", 95.0), "69qtjk3": ("ktqj", 95.0),
+    "69qtjk7": ("ktqj", 95.0), "69qtjk9": ("ktqj", 95.0),
+    "98726kqk": ("kqk", 95.0), "98726kjj": ("kjj", 95.0),
+    "96251kqk": ("kqk", 95.0), "96251kjj": ("kjj", 95.0),
+    "53648kqk": ("kqk", 95.0), "53648kjj": ("kjj", 95.0),
+    "26348kqk": ("kqk", 95.0), "26348kjj": ("kjj", 95.0),
+    "86861kqk": ("kqk", 95.0), "86861kjj": ("kjj", 95.0),
+}
+PLATINUM_TOKEN_RANKS = {"t": 10, "j": 11, "q": 12, "k": 13}
+
+
+def gold_branch_candidate_cap(cpu: "CpuPlayer") -> int:
+    return 12 if getattr(cpu, "cpu_key", "") == "platinum_planner" else GOLD_PLAN_MAX_BRANCH_CANDIDATES
+
+
+def gold_last_candidate_cap(cpu: "CpuPlayer") -> int:
+    return 16 if getattr(cpu, "cpu_key", "") == "platinum_planner" else GOLD_PLAN_MAX_LAST_CANDIDATES
 COMPOSITE_PRACTICE_RANK_WEIGHTS = {
     0: 100,  # X
     2: 60,
@@ -125,6 +161,15 @@ class CpuPlayer:
         self.decision_deadline: Optional[float] = None
         self.last_decision_timed_out = False
         self.small_finish_index = registered_prime_template_index((), max_cards=3)
+        self.prime_template_index = registered_prime_template_index(
+            (), max_cards=PLATINUM_MAX_KNOWLEDGE_CARDS
+        )
+        self.prime_template_index_values = ()
+        self.platinum_opening_phase = True
+        self.platinum_all_out_attempts = 0
+        self.platinum_initial_hand_size = 11
+        self.platinum_last_strategy_score = 0.0
+        self.rng = secrets.SystemRandom()
 
     async def send_json(self, message: dict):
         return None
@@ -166,10 +211,16 @@ class CpuPlayer:
 
     def replace_registered_primes(self, values: set[int]) -> None:
         self.registered_primes = set(values)
+        sorted_values = tuple(sorted(self.registered_primes))
         self.small_finish_index = registered_prime_template_index(
-            tuple(sorted(self.registered_primes)),
+            sorted_values,
             max_cards=3,
         )
+        self.prime_template_index = registered_prime_template_index(
+            sorted_values,
+            max_cards=PLATINUM_MAX_KNOWLEDGE_CARDS,
+        )
+        self.prime_template_index_values = sorted_values
 
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
@@ -215,6 +266,8 @@ def choose_profile_cpu_action(
         "decision_time_budget_ms",
         CPU_PLANNER_DEFAULT_BUDGET_MS,
     )))
+    if profile and profile.key == "platinum_planner":
+        budget_ms = max(budget_ms, 1000)
     cpu.decision_deadline = time.perf_counter() + budget_ms / 1000
     cpu.last_decision_timed_out = False
     try:
@@ -228,6 +281,23 @@ def choose_profile_cpu_action(
         if profile and profile.key == "composite_practice":
             cpu.decision_deadline = None
             return choose_composite_practice_emergency_action(cpu, room)
+        if profile and profile.key == "platinum_planner":
+            cpu.decision_deadline = None
+            if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+                return CpuAction("draw")
+            if getattr(room, "field", []) or []:
+                if getattr(getattr(room, "rule", None), "allow_composite", False):
+                    payload = build_composite_practice_all_out_payload(
+                        cpu, room, rng=cpu.rng, require_invalid=True
+                    )
+                    if payload is not None:
+                        return platinum_commit_play(cpu, CpuAction("play_composite", payload))
+                return CpuAction("pass")
+            payload = build_gold_all_out_payload(cpu.hand, force_random=True, rng=cpu.rng)
+            if payload is not None:
+                cpu.platinum_all_out_attempts += 1
+                return platinum_commit_play(cpu, CpuAction("play_prime", payload))
+            return CpuAction("pass")
         return choose_cpu_action(cpu, room, validator=validator, max_cards=3)
     finally:
         cpu.decision_deadline = None
@@ -362,6 +432,7 @@ def build_composite_practice_all_out_payload(
     cpu: CpuPlayer,
     room,
     rng=None,
+    require_invalid: bool = False,
 ) -> Optional[dict]:
     """Build a last-resort random composite attempt that uses the whole hand.
 
@@ -414,6 +485,11 @@ def build_composite_practice_all_out_payload(
             chunks = [material_cards]
             factor_values = [composite_practice_cards_number(material_cards, assigned_by_id)]
         if any(value is None or value < 2 for value in factor_values):
+            continue
+        product = 1
+        for value in factor_values:
+            product *= int(value)
+        if require_invalid and product == visible_value:
             continue
 
         payload = composite_practice_all_out_payload(
@@ -676,6 +752,401 @@ def choose_gold_planning_cpu_action(
         return CpuAction("play_prime", {"cards": [joker], "assigned_numbers": []})
 
     return CpuAction("pass")
+
+
+def choose_platinum_planning_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    """Five-step Gold search plus Platinum's draw/all-out recovery policy."""
+    validator = gold_knowledge_number_validator
+    field = getattr(room, "field", []) or []
+    if field:
+        action = choose_platinum_response_action(cpu, room, validator)
+    else:
+        action = choose_platinum_lead_action(cpu, room, validator)
+    return action or CpuAction("pass")
+
+
+def choose_platinum_lead_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    active = getattr(cpu, "gold_active_plan", None)
+    if active and active.get("dual_wield") and getattr(cpu, "gold_plan_step_index", 0) > 0:
+        fused = active.get("dual_wield_fused")
+        if fused and candidate_cards_available(fused, cpu) and candidate_is_playable(fused, cpu, room):
+            clear_gold_active_plan(cpu)
+            return platinum_commit_play(cpu, candidate_to_action(fused))
+
+    action = play_next_gold_plan_step(cpu, room, validator)
+    if action is not None:
+        return platinum_commit_play(cpu, action)
+    clear_gold_active_plan(cpu)
+
+    plan = choose_platinum_strong_plan(cpu, room_without_field(room), validator)
+    if plan is not None:
+        set_gold_active_plan(cpu, plan)
+        action = play_next_gold_plan_step(cpu, room, validator)
+        if action is not None:
+            return platinum_commit_play(cpu, action)
+
+    # Drawing is a separate action. run_cpu_turn calls this selector again with
+    # the new card, so the opening tactic is deliberately searched a second time.
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+
+    if platinum_should_all_out(cpu, room):
+        payload = build_gold_all_out_payload(cpu.hand, force_random=True, rng=cpu.rng)
+        if payload is not None:
+            cpu.platinum_all_out_attempts += 1
+            clear_gold_active_plan(cpu)
+            return platinum_commit_play(cpu, CpuAction("play_prime", payload))
+
+    compression = choose_platinum_compression_action(cpu, room, validator)
+    if compression is not None:
+        return platinum_commit_play(cpu, compression)
+    return None
+
+
+def choose_platinum_response_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    field_count = len(getattr(room, "field", []) or [])
+    active = getattr(cpu, "gold_active_plan", None)
+    if active and platinum_plan_score(active) >= PLATINUM_MIN_TRUMP_STRENGTH:
+        if active_gold_plan_matches_field(cpu, field_count):
+            action = play_next_gold_plan_step(cpu, room, validator)
+            if action is not None:
+                return platinum_commit_play(cpu, action)
+    clear_gold_active_plan(cpu)
+
+    plan = build_same_count_gold_plan(
+        cpu, room, field_count, PLATINUM_PLAN_MAX_STEPS, validator
+    )
+    score = platinum_plan_score(plan)
+    cpu.platinum_last_strategy_score = score
+    if is_executable_gold_plan(plan, cpu) and platinum_plan_is_strong(plan, cpu, room):
+        set_gold_active_plan(cpu, plan)
+        action = play_next_gold_plan_step(cpu, room, validator)
+        if action is not None:
+            return platinum_commit_play(cpu, action)
+
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+
+    if (
+        score < PLATINUM_MIN_TRUMP_STRENGTH
+        and (getattr(cpu, "platinum_opening_phase", True) or platinum_deck_has_trump_value(room))
+        and getattr(getattr(room, "rule", None), "allow_composite", False)
+    ):
+        payload = build_composite_practice_all_out_payload(
+            cpu, room, rng=cpu.rng, require_invalid=True
+        )
+        if payload is not None:
+            cpu.platinum_all_out_attempts += 1
+            return platinum_commit_play(cpu, CpuAction("play_composite", payload))
+
+    action = choose_platinum_normal_field_action(cpu, room, validator)
+    if action is not None:
+        return platinum_commit_play(cpu, action)
+    return None
+
+
+def choose_platinum_strong_plan(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[dict]:
+    candidates = []
+    if getattr(cpu, "platinum_opening_phase", True) and len(cpu.hand) == 11:
+        dual = build_platinum_dual_wield_plan(cpu, room, validator)
+        if dual is not None:
+            cpu.platinum_last_strategy_score = platinum_plan_score(dual)
+            return dual
+    candidates.extend(build_platinum_plans(cpu, room, validator))
+    candidates = [plan for plan in candidates if is_executable_gold_plan(plan, cpu)]
+    if not candidates:
+        cpu.platinum_last_strategy_score = 0.0
+        return None
+    if platinum_opponent_hand_is_expanded(cpu, room):
+        absolute = [plan for plan in candidates if platinum_plan_has_absolute_trump(plan, cpu)]
+        if absolute:
+            candidates = absolute
+    best = max(candidates, key=platinum_plan_sort_key)
+    cpu.platinum_last_strategy_score = platinum_plan_score(best)
+    return best if platinum_plan_is_strong(best, cpu, room) else None
+
+
+def build_platinum_plans(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    """Search Gold-depth routes, stopping once an 80+ route is established."""
+    non_joker_count = len([card for card in cpu.hand if not is_joker(card)])
+    plans = []
+    for rally_count in range(1, min(9, non_joker_count) + 1):
+        plans.extend(search_same_count_gold_plans(
+            cpu,
+            room,
+            rally_count,
+            PLATINUM_PLAN_MAX_STEPS,
+            validator,
+        ))
+        strong = [
+            plan for plan in plans
+            if is_executable_gold_plan(plan, cpu)
+            and platinum_plan_is_strong(plan, cpu, room)
+        ]
+        if strong:
+            strong.sort(key=platinum_plan_sort_key, reverse=True)
+            return strong[:GOLD_PLAN_MAX_ALTERNATIVES]
+    plans.sort(key=platinum_plan_sort_key, reverse=True)
+    return plans[:GOLD_PLAN_MAX_ALTERNATIVES]
+
+
+def platinum_plan_sort_key(plan: dict) -> tuple:
+    return (
+        1 if plan.get("dual_wield") else 0,
+        platinum_plan_score(plan),
+        gold_plan_score(plan),
+    )
+
+
+def platinum_plan_score(plan: Optional[dict]) -> float:
+    if not plan:
+        return 0.0
+    return float(plan.get("dual_wield_score", plan.get("evaluation", {}).get("score", 0.0)))
+
+
+def platinum_plan_is_strong(plan: dict, cpu: CpuPlayer, room) -> bool:
+    return (
+        platinum_plan_score(plan) >= PLATINUM_MIN_TRUMP_STRENGTH
+        or platinum_plan_has_absolute_trump(plan, cpu)
+    )
+
+
+def platinum_plan_has_absolute_trump(plan: dict, cpu: CpuPlayer) -> bool:
+    trump_index = gold_plan_trump_step_index(plan)
+    if trump_index is None:
+        return False
+    steps = plan.get("steps", [])
+    return trump_index < len(steps) and platinum_candidate_is_absolute(steps[trump_index], cpu)
+
+
+def platinum_candidate_is_absolute(candidate: dict, cpu: CpuPlayer) -> bool:
+    token = platinum_candidate_token(candidate)
+    if token in PLATINUM_ABSOLUTE_ALWAYS:
+        return True
+    kx_count = sum(
+        1
+        for card in cpu.hand
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
+    return kx_count >= 4 and token in PLATINUM_ABSOLUTE_KX4
+
+
+def platinum_candidate_token(candidate: dict) -> str:
+    ranks = candidate.get("ranks") or ()
+    if ranks:
+        return "".join(platinum_rank_token(int(rank)) for rank in ranks)
+    assigned = iter(candidate.get("assigned_numbers", []) or [])
+    parts = []
+    for card in candidate.get("cards", []):
+        rank = int(next(assigned)) if is_joker(card) else int(card.get("rank", 0))
+        parts.append(platinum_rank_token(rank))
+    return "".join(parts)
+
+
+def platinum_rank_token(rank: int) -> str:
+    return {10: "t", 11: "j", 12: "q", 13: "k"}.get(rank, str(rank))
+
+
+def platinum_token_ranks(token: str) -> tuple[int, ...]:
+    return tuple(
+        PLATINUM_TOKEN_RANKS[char] if char in PLATINUM_TOKEN_RANKS else int(char)
+        for char in token
+    )
+
+
+def platinum_token_value(token: str) -> int:
+    return int("".join(str(rank) for rank in platinum_token_ranks(token)))
+
+
+def build_platinum_dual_wield_plan(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[dict]:
+    """Find the user-approved initial-11 dual-wield partitions."""
+    if len(cpu.hand) != 11:
+        return None
+    plans = []
+    for token, (trump_token, score) in PLATINUM_DUAL_WIELD_TEMPLATES.items():
+        value = platinum_token_value(token)
+        if value not in cpu.registered_primes:
+            continue
+        fused_ranks = platinum_token_ranks(token)
+        fused = cards_for_ranks_with_jokers(cpu.hand, fused_ranks)
+        if fused is None:
+            continue
+        fused_candidate = {
+            "kind": "prime",
+            "number": value,
+            "cards": fused["cards"],
+            "assigned_numbers": fused["assigned_numbers"],
+            "ranks": fused_ranks,
+            "role": "dual-fused-finish",
+        }
+        opening_cards = remaining_cards(cpu.hand, fused["cards"])
+        opening_cpu = temporary_cpu_with_hand(cpu, opening_cards)
+        opening = choose_gold_finish_candidate(opening_cpu, room_without_field(room), validator)
+        trump_ranks = platinum_token_ranks(trump_token)
+        if platinum_token_value(trump_token) not in cpu.registered_primes:
+            continue
+        if opening is None or len(opening.get("cards", [])) != len(trump_ranks):
+            continue
+        trump_realization = cards_for_ranks_with_jokers(fused["cards"], trump_ranks)
+        if trump_realization is None:
+            continue
+        trump = {
+            "kind": "prime",
+            "number": platinum_token_value(trump_token),
+            "cards": trump_realization["cards"],
+            "assigned_numbers": trump_realization["assigned_numbers"],
+            "ranks": trump_ranks,
+        }
+        finish_cards = remaining_cards(fused["cards"], trump_realization["cards"])
+        finish_cpu = temporary_cpu_with_hand(cpu, finish_cards)
+        finish = choose_gold_finish_candidate(finish_cpu, room_without_field(room), validator)
+        if finish is None:
+            continue
+        sequence = [dict(opening), trump, dict(finish)]
+        sequence[0]["role"] = f"rally-{len(trump_ranks)}"
+        sequence[1]["role"] = f"rally-{len(trump_ranks)}"
+        sequence[2]["role"] = "finish"
+        plan = finalize_gold_plan(cpu, room, sequence, len(trump_ranks))
+        if not plan.get("completed"):
+            continue
+        plan["dual_wield"] = True
+        plan["dual_wield_score"] = score
+        plan["dual_wield_template"] = token
+        plan["dual_wield_fused"] = fused_candidate
+        plan["evaluation"] = {**plan.get("evaluation", {}), "score": score}
+        plans.append(plan)
+    return max(plans, key=platinum_plan_sort_key) if plans else None
+
+
+def platinum_opponent_hand_is_expanded(cpu: CpuPlayer, room) -> bool:
+    opponents = [
+        player for player in (getattr(room, "players", []) or [])
+        if getattr(player, "id", None) != cpu.id and getattr(player, "status", "playing") != "finished"
+    ]
+    if not opponents:
+        count = getattr(room, "opponent_hand_count", None)
+    else:
+        count = max((len(getattr(player, "hand", []) or []) for player in opponents), default=None)
+    if count is None:
+        return False
+    initial = int(getattr(cpu, "platinum_initial_hand_size", 11))
+    return count > initial and count >= max(1, len(getattr(room, "deck", []) or []) - 2)
+
+
+def platinum_deck_has_trump_value(room) -> bool:
+    known = getattr(room, "public_known_deck_bottom", []) or []
+    return any(is_joker(card) or int(card.get("rank", 0)) == 13 for card in known)
+
+
+def platinum_should_all_out(cpu: CpuPlayer, room) -> bool:
+    if not cpu.hand:
+        return False
+    attempts = int(getattr(cpu, "platinum_all_out_attempts", 0))
+    if attempts == 0:
+        return True
+    return bool(getattr(room, "deck", [])) and platinum_deck_has_trump_value(room)
+
+
+def choose_platinum_normal_field_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    field_count = len(getattr(room, "field", []) or [])
+    candidates = [
+        candidate
+        for candidate in dedupe_candidates(gold_plan_candidates(cpu, room, (field_count,), validator))
+        if candidate_is_playable(candidate, cpu, room)
+    ]
+    if not candidates:
+        return None
+    ranked = []
+    for candidate in candidates[:GOLD_PLAN_MAX_BRANCH_CANDIDATES]:
+        child = temporary_cpu_with_hand(
+            cpu, remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+        )
+        plan = build_gold_plan(
+            child,
+            room_without_field(room),
+            max_steps=max(1, PLATINUM_PLAN_MAX_STEPS - 1),
+            validator=validator,
+        )
+        ranked.append((
+            1 if is_executable_gold_plan(plan, child) else 0,
+            platinum_plan_score(plan),
+            len(candidate_consumed_cards(candidate)),
+            -candidate_strength(candidate, room),
+            candidate,
+        ))
+    return candidate_to_action(max(ranked, key=lambda item: item[:-1])[-1])
+
+
+def choose_platinum_compression_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    field_count = len(getattr(room, "field", []) or [])
+    max_cards = min(PLATINUM_MAX_KNOWLEDGE_CARDS, len(cpu.hand) - 1)
+    counts = (field_count,) if field_count else range(1, max_cards + 1)
+    candidates = [
+        candidate
+        for candidate in dedupe_candidates(gold_plan_candidates(cpu, room, counts, validator))
+        if candidate_is_playable(candidate, cpu, room)
+        and len(candidate_consumed_cards(candidate)) < len(cpu.hand)
+    ]
+    if not candidates:
+        return None
+
+    def score(candidate: dict) -> tuple:
+        consumed = candidate_consumed_cards(candidate)
+        protected = sum(
+            1 for card in consumed
+            if is_joker(card) or int(card.get("rank", 0)) == 13
+        )
+        evens = sum(
+            1 for card in consumed
+            if not is_joker(card) and int(card.get("rank", 0)) % 2 == 0
+        )
+        return (
+            1 if len(consumed) >= 10 else 0,
+            -protected,
+            len(consumed),
+            evens,
+            -candidate_strength(candidate, room),
+        )
+
+    return candidate_to_action(max(candidates, key=score))
+
+
+def platinum_commit_play(cpu: CpuPlayer, action: CpuAction) -> CpuAction:
+    if action.kind in ("play_prime", "play_composite"):
+        cpu.platinum_opening_phase = False
+    return action
 
 
 def choose_silver_planning_cpu_action(
@@ -1348,11 +1819,15 @@ def silver_hnp_payload_from_cards(cards: List[Card], nucleus: Card, rng) -> dict
     }
 
 
-def build_gold_all_out_payload(hand: List[Card], force_random: bool) -> Optional[dict]:
+def build_gold_all_out_payload(
+    hand: List[Card],
+    force_random: bool,
+    rng=None,
+) -> Optional[dict]:
     if not hand:
         return None
 
-    rng = secrets.SystemRandom()
+    rng = rng or secrets.SystemRandom()
     cards = hand[:]
     joker = single_joker(cards)
     assigned_by_id = {}
@@ -1617,7 +2092,7 @@ def search_same_count_gold_plans(
                     dedupe_candidates(branch_candidates),
                     key=lambda candidate: gold_plan_candidate_score(candidate, room),
                     reverse=True,
-                )[:GOLD_PLAN_MAX_BRANCH_CANDIDATES]
+                )[:gold_branch_candidate_cap(current_cpu)]
 
                 for candidate in branch_candidates:
                     check_cpu_search_deadline(current_cpu)
@@ -1902,7 +2377,7 @@ def gold_last_rally_candidates(
         dedupe_candidates(candidates),
         key=lambda candidate: gold_plan_candidate_score(candidate, room),
         reverse=True,
-    )[:GOLD_PLAN_MAX_LAST_CANDIDATES]
+    )[:gold_last_candidate_cap(cpu)]
 
 
 def choose_gold_finish_candidate(
@@ -2131,7 +2606,7 @@ def gold_large_finish_split_candidates(
             reverse=True,
         ):
             results.append((rally, finish_tail))
-            if len(results) >= GOLD_PLAN_MAX_BRANCH_CANDIDATES:
+            if len(results) >= gold_branch_candidate_cap(cpu):
                 return results
     return results
 
@@ -2526,11 +3001,22 @@ def knowledge_prime_candidates(
 ) -> List[dict]:
     candidates = []
     count_set = {count for count in counts if count > 0}
-    for number in sorted(cpu.registered_primes):
-        if not validator(number, cpu, getattr(room, "rule", None)):
-            continue
-        for ranks in registered_value_encodings(number, max_cards=9):
-            if len(ranks) not in count_set:
+    values = tuple(sorted(cpu.registered_primes))
+    max_cards = (
+        PLATINUM_MAX_KNOWLEDGE_CARDS
+        if getattr(cpu, "cpu_key", "") == "platinum_planner"
+        else 9
+    )
+    if (
+        max_cards == PLATINUM_MAX_KNOWLEDGE_CARDS
+        and getattr(cpu, "prime_template_index_values", ()) == values
+    ):
+        index = cpu.prime_template_index
+    else:
+        index = registered_prime_template_index(values, max_cards=max_cards)
+    for count in sorted(count_set):
+        for number, ranks in index.templates_by_card_count.get(count, ()):
+            if not validator(number, cpu, getattr(room, "rule", None)):
                 continue
             cards = cards_for_ranks(cpu.hand, ranks)
             if cards is None:
@@ -2544,7 +3030,6 @@ def knowledge_prime_candidates(
                 "assigned_numbers": [],
                 "ranks": ranks,
             })
-            break
     return candidates
 
 
@@ -2838,6 +3323,14 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
     temp.registered_primes = cpu.registered_primes
     temp.registered_composites = cpu.registered_composites
     temp.registered_composite_entries = cpu.registered_composite_entries
+    temp.small_finish_index = cpu.small_finish_index
+    temp.prime_template_index = cpu.prime_template_index
+    temp.prime_template_index_values = cpu.prime_template_index_values
+    temp.platinum_opening_phase = cpu.platinum_opening_phase
+    temp.platinum_all_out_attempts = cpu.platinum_all_out_attempts
+    temp.platinum_initial_hand_size = cpu.platinum_initial_hand_size
+    temp.platinum_last_strategy_score = cpu.platinum_last_strategy_score
+    temp.rng = cpu.rng
     temp.decision_time_budget_ms = cpu.decision_time_budget_ms
     temp.decision_deadline = cpu.decision_deadline
     return temp
@@ -3104,6 +3597,23 @@ CPU_PROFILES = {
         ),
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
+    ),
+    "platinum_planner": CpuProfile(
+        key="platinum_planner",
+        label="プラチナCPU",
+        description="プラチナ素数表と5手探索を使い、弱い手札の全出し・既知山札の回収・絶対的切り札への切替を行うCPUです。",
+        rule_keys=(
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="platinum_prime_table",
+        ),
+        action_selector=choose_platinum_planning_cpu_action,
     ),
     "silver_planner": CpuProfile(
         key="silver_planner",

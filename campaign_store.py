@@ -453,13 +453,19 @@ class CampaignStore:
                 )
                 SELECT
                     ROW_NUMBER() OVER (
-                        ORDER BY prime_value DESC, achieved_at ASC, player_name ASC
+                        ORDER BY
+                            player_bests.prime_value DESC,
+                            player_bests.achieved_at ASC,
+                            player_bests.player_name ASC
                     )::int AS rank,
-                    player_name,
-                    prime_value::text AS prime_value,
-                    LENGTH(prime_value::text)::int AS digit_count
+                    player_bests.player_name,
+                    player_bests.prime_value::text AS prime_value_text,
+                    LENGTH(player_bests.prime_value::text)::int AS digit_count
                 FROM player_bests
-                ORDER BY prime_value DESC, achieved_at ASC, player_name ASC
+                ORDER BY
+                    player_bests.prime_value DESC,
+                    player_bests.achieved_at ASC,
+                    player_bests.player_name ASC
                 LIMIT $3
                 """,
                 campaign_key,
@@ -494,7 +500,7 @@ class CampaignStore:
                 {
                     "rank": int(row["rank"]),
                     "player_name": row["player_name"],
-                    "prime_value": row["prime_value"],
+                    "prime_value": row["prime_value_text"],
                     "digit_count": int(row["digit_count"]),
                 }
                 for row in prime_rows
