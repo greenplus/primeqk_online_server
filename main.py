@@ -651,10 +651,10 @@ PLUS_ROOM_IDS = ("room_7", "room_8", "room_9")
 ROOM_CONFIG = [
     ("room_1", PRESETS["std-5-1"], "Classic"),
     ("room_2", PRESETS["half-7-1-c"], "Classic"),
-    ("room_3", PRESETS["std-7-1"], "Classic"),
-    ("room_4", PRESETS["std-11-f-c"], "Classic"),
+    ("room_3", PRESETS["std-11-f-c"], "Classic"),
+    ("room_4", PRESETS["std-11-n-c"], "Classic"),
     ("room_5", PRESETS["std-11-n-c"], "Classic"),
-    ("room_6", PRESETS["std-11-n-no-c"], "Classic"),
+    ("room_6", PRESETS["std-11-n-c"], "Classic"),
     ("room_7", PRESETS["std-11-n-c-rev"], "Plus"),
     ("room_8", PRESETS["tetrad-11-n-c"], "Plus"),
     ("room_9", PRESETS["semiprime-11-n-c"], "Plus"),
