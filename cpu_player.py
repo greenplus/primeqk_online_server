@@ -40,6 +40,21 @@ COMPOSITE_PRACTICE_ALL_OUT_ATTEMPTS = 96
 PLATINUM_PLAN_MAX_STEPS = 5
 PLATINUM_MIN_TRUMP_STRENGTH = 80.0
 PLATINUM_MAX_KNOWLEDGE_CARDS = 14
+PLATINUM_INTERFERENCE_BORDER = 42
+PLATINUM_OPPONENT_HAND_SCORES = {
+    0: 100,
+    1: 100,
+    2: 89,
+    3: 79,
+    4: 65,
+    5: 46,
+    6: 29,
+    7: 16,
+    8: 8,
+    9: 4,
+    10: 2,
+    11: 1,
+}
 PLATINUM_ABSOLUTE_ALWAYS = frozenset({
     "kk", "kkk", "kkkq", "kkqkj", "kkkqqj", "kkkqqqj", "kkkqqjj",
     "kkkqjtqj", "kkkqqttqj", "kkkqtttjj", "kkkqtjqjj",
@@ -169,6 +184,7 @@ class CpuPlayer:
         self.platinum_all_out_attempts = 0
         self.platinum_initial_hand_size = 11
         self.platinum_last_strategy_score = 0.0
+        self.platinum_last_interference_score = 0
         self.rng = secrets.SystemRandom()
 
     async def send_json(self, message: dict):
@@ -823,6 +839,17 @@ def choose_platinum_response_action(
             action = play_next_gold_plan_step(cpu, room, validator)
             if action is not None:
                 return platinum_commit_play(cpu, action)
+
+    interference = choose_platinum_interference_action(
+        cpu,
+        room,
+        validator,
+        active_plan=active,
+    )
+    if interference is not None:
+        clear_gold_active_plan(cpu)
+        return platinum_commit_play(cpu, interference)
+
     clear_gold_active_plan(cpu)
 
     plan = build_same_count_gold_plan(
@@ -855,6 +882,169 @@ def choose_platinum_response_action(
     if action is not None:
         return platinum_commit_play(cpu, action)
     return None
+
+
+def choose_platinum_interference_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    active_plan: Optional[dict] = None,
+) -> Optional[CpuAction]:
+    """Return a legal blocking play even when it does not complete our plan."""
+    field_count = len(getattr(room, "field", []) or [])
+    if not field_count:
+        return None
+    candidates = gold_plan_candidates(cpu, room, (field_count,), validator)
+    candidates.extend(joker_prime_candidates_for_count(cpu, room, field_count, validator))
+    candidates.extend(gold_special_cut_candidates(cpu, room))
+    candidates = [
+        candidate
+        for candidate in dedupe_candidates(candidates)
+        if candidate_is_playable(candidate, cpu, room)
+    ]
+    if not candidates:
+        cpu.platinum_last_interference_score = 0
+        return None
+
+    scored = [
+        (
+            platinum_interference_score(
+                cpu,
+                room,
+                candidate,
+                active_plan=active_plan,
+                validator=validator,
+            ),
+            candidate_strength(candidate, room),
+            len(candidate_consumed_cards(candidate)),
+            candidate,
+        )
+        for candidate in candidates
+    ]
+    best = max(scored, key=lambda item: item[:-1])
+    cpu.platinum_last_interference_score = best[0]
+    if best[0] < PLATINUM_INTERFERENCE_BORDER:
+        return None
+    return candidate_to_action(best[-1])
+
+
+def platinum_interference_score(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+    active_plan: Optional[dict] = None,
+    validator: Optional[NumberValidator] = None,
+) -> int:
+    score = platinum_opponent_hand_score(cpu, room)
+    if platinum_interference_breaks_plan(cpu, candidate, active_plan):
+        score -= 5
+    if platinum_candidate_uses_last_absolute_trump(
+        cpu,
+        room,
+        candidate,
+        validator or gold_knowledge_number_validator,
+    ):
+        score -= 20
+    if platinum_expected_opponent_kx_remaining(cpu, room) <= 0.1:
+        score += 20
+    return score
+
+
+def platinum_opponent_hand_score(cpu: CpuPlayer, room) -> int:
+    count = platinum_opponent_hand_count(cpu, room)
+    if count is None:
+        return 0
+    return PLATINUM_OPPONENT_HAND_SCORES.get(count, 0)
+
+
+def platinum_opponent_hand_count(cpu: CpuPlayer, room) -> Optional[int]:
+    opponents = [
+        player
+        for player in (getattr(room, "players", []) or [])
+        if getattr(player, "id", None) != cpu.id
+        and getattr(player, "status", "playing") != "finished"
+    ]
+    if opponents:
+        return max(len(getattr(player, "hand", []) or []) for player in opponents)
+    count = getattr(room, "opponent_hand_count", None)
+    return int(count) if count is not None else None
+
+
+def platinum_expected_opponent_kx_remaining(cpu: CpuPlayer, room) -> float:
+    """Expected K/X count using only hand counts and publicly known cards."""
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        return float("inf")
+
+    def card_key(card: Card):
+        return card.get("card_id") or id(card)
+
+    own_ids = {card_key(card) for card in cpu.hand}
+    own_kx = sum(
+        1 for card in cpu.hand
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
+    public_cards = {}
+    for card in (
+        list(getattr(room, "field", []) or [])
+        + list(getattr(room, "reserve", []) or [])
+        + list(getattr(room, "public_known_deck_bottom", []) or [])
+    ):
+        key = card_key(card)
+        if key not in own_ids:
+            public_cards[key] = card
+    public_kx = sum(
+        1 for card in public_cards.values()
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
+    unaccounted_kx = max(0, 6 - own_kx - public_kx)
+    if hasattr(room, "public_unknown_deck_count"):
+        unknown_deck_count = max(0, int(room.public_unknown_deck_count))
+    else:
+        unknown_deck_count = max(
+            0,
+            len(getattr(room, "deck", []) or [])
+            - len(getattr(room, "public_known_deck_bottom", []) or []),
+        )
+    unknown_population = opponent_count + unknown_deck_count
+    if unknown_population <= 0:
+        return 0.0
+    return unaccounted_kx * opponent_count / unknown_population
+
+
+def platinum_interference_breaks_plan(
+    cpu: CpuPlayer,
+    candidate: dict,
+    active_plan: Optional[dict],
+) -> bool:
+    if not active_plan:
+        return False
+    steps = active_plan.get("steps", [])
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    if index >= len(steps):
+        return False
+    return candidate_fingerprint(candidate) != candidate_fingerprint(steps[index])
+
+
+def platinum_candidate_uses_last_absolute_trump(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+    validator: NumberValidator,
+) -> bool:
+    if not platinum_candidate_is_absolute(candidate, cpu):
+        return False
+    remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+    child = temporary_cpu_with_hand(cpu, remaining)
+    empty_room = room_without_field(room)
+    max_count = min(9, len(remaining))
+    candidates = gold_plan_candidates(child, empty_room, range(1, max_count + 1), validator)
+    for count in range(1, max_count + 1):
+        candidates.extend(joker_prime_candidates_for_count(child, empty_room, count, validator))
+    return not any(
+        platinum_candidate_is_absolute(other, child)
+        for other in dedupe_candidates(candidates)
+    )
 
 
 def choose_platinum_strong_plan(
@@ -958,7 +1148,14 @@ def platinum_candidate_token(candidate: dict) -> str:
     assigned = iter(candidate.get("assigned_numbers", []) or [])
     parts = []
     for card in candidate.get("cards", []):
-        rank = int(next(assigned)) if is_joker(card) else int(card.get("rank", 0))
+        if is_joker(card):
+            assigned_value = next(assigned, None)
+            if assigned_value is None:
+                parts.append("x")
+                continue
+            rank = int(assigned_value)
+        else:
+            rank = int(card.get("rank", 0))
         parts.append(platinum_rank_token(rank))
     return "".join(parts)
 
@@ -3330,6 +3527,7 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
     temp.platinum_all_out_attempts = cpu.platinum_all_out_attempts
     temp.platinum_initial_hand_size = cpu.platinum_initial_hand_size
     temp.platinum_last_strategy_score = cpu.platinum_last_strategy_score
+    temp.platinum_last_interference_score = cpu.platinum_last_interference_score
     temp.rng = cpu.rng
     temp.decision_time_budget_ms = cpu.decision_time_budget_ms
     temp.decision_deadline = cpu.decision_deadline
