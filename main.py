@@ -23,6 +23,7 @@ from cpu_player import (
     fish_extra_prime_values,
     get_cpu_profile,
     is_cpu_player,
+    reset_cpu_game_state,
 )
 from assist_recommendation import (
     RECOMMENDATION_CACHE_VERSION,
@@ -451,6 +452,8 @@ class Room:
         self.public_unknown_deck_count = 0
         self.public_known_deck_bottom = []
         self.last_number = None     # “場に出ている”最後の数値を保持
+        self.last_play_player_id = None
+        self.last_play_hand_before = None
         self.current_turn_id = None
         self.first_player_id = None
         self.has_drawn = False
@@ -2752,6 +2755,8 @@ def flow_field(room: Room) -> None:
     """場が流れたときの共通処理：場を空にし、予備軍を山札の“下”に戻す（順序保持）"""
     room.field = []
     room.last_number = None
+    room.last_play_player_id = None
+    room.last_play_hand_before = None
     if room.reserve:
         ensure_public_deck_tracker(room)
         room.public_known_deck_bottom.extend(room.reserve)
@@ -2765,6 +2770,12 @@ def return_cards_to_deck_bottom(room, cards: List[dict]) -> None:
     ensure_public_deck_tracker(room)
     room.public_known_deck_bottom.extend(cards)
     room.deck.extend(cards)
+
+
+def record_field_play(room: Room, player, hand_before: int) -> None:
+    """Remember the public hand count from immediately before the current play."""
+    room.last_play_player_id = player.id
+    room.last_play_hand_before = int(hand_before)
 
 def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card_count: int) -> int:
     """
@@ -5392,6 +5403,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # フラグをトグル
         room.reverse_order = not room.reverse_order
         # カードを場に出す
+        record_field_play(room, player, len(player.hand))
         push_to_reserve(room, played_cards)
         for c in played_cards:
             player.remove_card(c)
@@ -5492,6 +5504,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # 素数なら場に出し、対局中に出したプレイヤーごとの最大素数も記録する。
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
     remember_largest_prime_play(room, player, number, play_text)
+    record_field_play(room, player, len(player.hand))
     push_to_reserve(room, played_cards)
     for c in played_cards:
         player.remove_card(c)
@@ -5863,6 +5876,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
     await record_composite_practice_play(player, room, sel_number)
 
     if room.rule.special_numbers_composite_only and sel_number in {57, 1729}:
+        hand_before = len(player.hand)
         push_to_reserve(room, sel_cards)
         sel_ids = {c["card_id"] for c in sel_cards}
         con_only = [c for c in con_cards if c["card_id"] not in sel_ids]
@@ -5893,6 +5907,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             return
 
         room.reverse_order = not room.reverse_order
+        record_field_play(room, player, hand_before)
         room.field = sel_cards
         room.last_number = sel_number
         await room.update_game_state()
@@ -5912,6 +5927,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 
     # 7) すべてOK → 札を「出した順」でreserveに積む → 手札から除去
     #    出した順は UI から渡す順序（selected→consume）で良ければそのまま。必要なら tokens から順序を決める。
+    record_field_play(room, player, len(player.hand))
     push_to_reserve(room, sel_cards)
 
     # selected と重複するカードは deck に戻さない
@@ -6031,6 +6047,8 @@ async def start_game(room):
     hands, remaining = shuffle_and_deal(deck, room.rule.hand_size, num_players=len(waiting_players))
     for player, hand in zip(waiting_players, hands):
         player.hand = hand
+        if is_cpu_player(player):
+            reset_cpu_game_state(player, initial_hand_size=len(hand))
     room.deck = remaining
     room.public_unknown_deck_count = len(remaining)
     room.public_known_deck_bottom = []
@@ -6038,6 +6056,8 @@ async def start_game(room):
     room.reserve = []
     room.field = []  # 場のカードは空
     room.last_number = None
+    room.last_play_player_id = None
+    room.last_play_hand_before = None
     room.score_log = []
     for player in waiting_players:
         player.sort_hand()

@@ -46,6 +46,7 @@ PLATINUM_COMPRESSION_MIN_HAND_SIZE = 18
 PLATINUM_FORCED_COMPRESSION_HAND_SIZE = 26
 PLATINUM_COMPRESSION_FOLLOWUP_CHECK_CAP = 12
 PLATINUM_ALL_OUT_RESUME_MIN_OPPONENT_HAND_SIZE = 5
+PLATINUM_POST_ALL_OUT_MAX_OPPONENT_PREPLAY_HAND_SIZE = 12
 PLATINUM_INTERFERENCE_BORDER = 42
 PLATINUM_OPPONENT_HAND_SCORES = {
     0: 100,
@@ -896,6 +897,11 @@ def choose_platinum_response_action(
         clear_gold_active_plan(cpu)
         return platinum_commit_play(cpu, interference)
 
+    post_all_out_response = choose_platinum_post_all_out_response(cpu, room, validator)
+    if post_all_out_response is not None:
+        clear_gold_active_plan(cpu)
+        return platinum_commit_play(cpu, post_all_out_response)
+
     clear_gold_active_plan(cpu)
 
     large_hand_action = choose_platinum_large_hand_action(cpu, room, validator)
@@ -949,14 +955,14 @@ def choose_platinum_finish_preserving_response(
     room,
     validator: NumberValidator,
 ) -> Optional[CpuAction]:
-    field_count = len(getattr(room, "field", []) or [])
-    candidates = gold_plan_candidates(cpu, room, (field_count,), validator)
-    candidates.extend(joker_prime_candidates_for_count(cpu, room, field_count, validator))
-    candidates.extend(gold_special_cut_candidates(cpu, room))
+    candidates = platinum_legal_response_candidates(
+        cpu,
+        room,
+        validator,
+        allow_non_trump_joker=True,
+    )
     choices = []
-    for candidate in dedupe_candidates(candidates):
-        if not candidate_is_playable(candidate, cpu, room):
-            continue
+    for candidate in candidates:
         remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
         if not remaining:
             continue
@@ -981,16 +987,17 @@ def choose_platinum_finish_preserving_response(
     return candidate_to_action(candidate)
 
 
-def choose_platinum_interference_action(
+def platinum_legal_response_candidates(
     cpu: CpuPlayer,
     room,
     validator: NumberValidator,
-    active_plan: Optional[dict] = None,
-) -> Optional[CpuAction]:
-    """Return a legal blocking play even when it does not complete our plan."""
+    *,
+    allow_non_trump_joker: bool = False,
+) -> list[dict]:
+    """Enumerate legal same-count responses under Platinum's X policy."""
     field_count = len(getattr(room, "field", []) or [])
-    if not field_count:
-        return None
+    if field_count <= 0:
+        return []
     candidates = gold_plan_candidates(cpu, room, (field_count,), validator)
     candidates.extend(joker_prime_candidates_for_count(cpu, room, field_count, validator))
     candidates.extend(gold_special_cut_candidates(cpu, room))
@@ -999,6 +1006,37 @@ def choose_platinum_interference_action(
         for candidate in dedupe_candidates(candidates)
         if candidate_is_playable(candidate, cpu, room)
     ]
+    if allow_non_trump_joker:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if platinum_unplanned_joker_play_allowed(candidate, cpu)
+    ]
+
+
+def platinum_candidate_preserves_any(
+    cpu: CpuPlayer,
+    candidate: dict,
+    protected_candidates: Iterable[dict],
+) -> bool:
+    remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+    child = temporary_cpu_with_hand(cpu, remaining)
+    return any(
+        candidate_cards_available(protected, child)
+        and platinum_candidate_is_response_trump(protected, child)
+        for protected in protected_candidates
+    )
+
+
+def choose_platinum_interference_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    active_plan: Optional[dict] = None,
+) -> Optional[CpuAction]:
+    """Return a legal blocking play even when it does not complete our plan."""
+    candidates = platinum_legal_response_candidates(cpu, room, validator)
     if not candidates:
         cpu.platinum_last_interference_score = 0
         return None
@@ -1027,16 +1065,15 @@ def choose_platinum_interference_action(
     if held_trumps:
         def interference_choice_key(item: tuple) -> tuple:
             candidate = item[-1]
-            remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
-            child = temporary_cpu_with_hand(cpu, remaining)
-            preserves_trump = any(
-                candidate_cards_available(trump, child)
-                and platinum_candidate_is_trump(trump, child)
-                for trump in held_trumps
+            preserves_trump = platinum_candidate_preserves_any(
+                cpu,
+                candidate,
+                held_trumps,
             )
             return (
                 1 if preserves_trump else 0,
-                0 if platinum_candidate_is_trump(candidate, cpu) else 1,
+                0 if step_uses_joker(candidate) else 1,
+                0 if platinum_candidate_is_response_trump(candidate, cpu) else 1,
                 item[0],
                 -item[1],
                 -item[2],
@@ -1044,10 +1081,73 @@ def choose_platinum_interference_action(
 
         best = max(eligible, key=interference_choice_key)
     else:
-        best = max(eligible, key=lambda item: item[:-1])
+        best = max(eligible, key=lambda item: (
+            0 if step_uses_joker(item[-1]) else 1,
+            item[0],
+            item[1],
+            item[2],
+        ))
     cpu.platinum_last_interference_score = best[0]
     platinum_mark_successful_interference(cpu, room)
     return candidate_to_action(best[-1])
+
+
+def platinum_opponent_preplay_hand_count(cpu: CpuPlayer, room) -> Optional[int]:
+    """Return the opponent hand size immediately before the current field play."""
+    recorded_count = getattr(room, "last_play_hand_before", None)
+    recorded_player_id = getattr(room, "last_play_player_id", None)
+    if recorded_count is not None and recorded_player_id != cpu.id:
+        return int(recorded_count)
+    current_count = platinum_opponent_hand_count(cpu, room)
+    if current_count is None:
+        return None
+    return current_count + len(getattr(room, "field", []) or [])
+
+
+def choose_platinum_post_all_out_response(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    """Keep rallying after all-out when an 80+ same-count trump is available."""
+    if int(getattr(cpu, "platinum_all_out_attempts", 0)) <= 0:
+        return None
+    opponent_preplay_count = platinum_opponent_preplay_hand_count(cpu, room)
+    if (
+        opponent_preplay_count is None
+        or opponent_preplay_count > PLATINUM_POST_ALL_OUT_MAX_OPPONENT_PREPLAY_HAND_SIZE
+    ):
+        return None
+
+    candidates = platinum_legal_response_candidates(cpu, room, validator)
+    strong_trumps = [
+        candidate
+        for candidate in candidates
+        if platinum_candidate_trump_strength(candidate) >= PLATINUM_MIN_TRUMP_STRENGTH
+        or platinum_candidate_is_absolute(candidate, cpu)
+    ]
+    if not strong_trumps:
+        return None
+
+    preserving = [
+        candidate
+        for candidate in candidates
+        if platinum_candidate_preserves_any(cpu, candidate, strong_trumps)
+    ]
+    if preserving:
+        best = max(preserving, key=lambda candidate: (
+            0 if step_uses_joker(candidate) else 1,
+            0 if platinum_candidate_is_response_trump(candidate, cpu) else 1,
+            -candidate_strength(candidate, room),
+            -len(candidate_consumed_cards(candidate)),
+        ))
+    else:
+        best = max(strong_trumps, key=lambda candidate: (
+            0 if step_uses_joker(candidate) else 1,
+            -platinum_candidate_trump_strength(candidate),
+            -len(candidate_consumed_cards(candidate)),
+        ))
+    return candidate_to_action(best)
 
 
 def platinum_interference_score(
@@ -1255,9 +1355,35 @@ def platinum_candidate_uses_last_absolute_trump(
 
 def platinum_candidate_is_trump(candidate: dict, cpu: CpuPlayer) -> bool:
     return (
-        candidate.get("number") in {"X", 57}
+        candidate.get("kind") == "joker_cut"
+        or candidate.get("number") in {"X", 57}
         or platinum_candidate_is_absolute(candidate, cpu)
         or platinum_candidate_token(candidate) in PLATINUM_SMALL_TRUMP_TOKENS
+    )
+
+
+def platinum_candidate_trump_strength(candidate: dict) -> float:
+    if candidate.get("kind") == "joker_cut" or candidate.get("number") == "X":
+        return 100.0
+    step = dict(candidate)
+    step["role"] = f"rally-{len(candidate.get('cards', []))}"
+    return gold_plan_trump_strength_score(
+        {"steps": [step]},
+        gold_plan_evaluation_config(),
+    )
+
+
+def platinum_candidate_is_response_trump(candidate: dict, cpu: CpuPlayer) -> bool:
+    return (
+        platinum_candidate_is_trump(candidate, cpu)
+        or platinum_candidate_trump_strength(candidate) >= PLATINUM_MIN_TRUMP_STRENGTH
+    )
+
+
+def platinum_unplanned_joker_play_allowed(candidate: dict, cpu: CpuPlayer) -> bool:
+    return (
+        not step_uses_joker(candidate)
+        or platinum_candidate_is_response_trump(candidate, cpu)
     )
 
 
@@ -1283,7 +1409,7 @@ def platinum_available_trump_candidates(
     return [
         candidate
         for candidate in dedupe_candidates(candidates)
-        if platinum_candidate_is_trump(candidate, cpu)
+        if platinum_candidate_is_response_trump(candidate, cpu)
     ]
 
 
@@ -1615,16 +1741,13 @@ def platinum_has_trump_utilization_prospect(
         candidates.extend(joker_prime_candidates_for_count(
             cpu, empty_room, count, validator
         ))
-    config = gold_plan_evaluation_config()
     threshold = platinum_required_trump_strength(cpu)
     for candidate in dedupe_candidates(candidates):
         if platinum_candidate_is_absolute(candidate, cpu):
             return True
         if len(candidate.get("cards", [])) >= 5:
             return True
-        trump_step = dict(candidate)
-        trump_step["role"] = f"rally-{len(candidate.get('cards', []))}"
-        if gold_plan_trump_strength_score({"steps": [trump_step]}, config) >= threshold:
+        if platinum_candidate_trump_strength(candidate) >= threshold:
             return True
     return False
 
@@ -1683,6 +1806,7 @@ def choose_platinum_bounded_legal_action(
         candidate
         for candidate in dedupe_candidates(candidates)
         if candidate_is_playable(candidate, cpu, room)
+        and platinum_unplanned_joker_play_allowed(candidate, cpu)
     ]
     if not candidates:
         return None
@@ -1722,6 +1846,9 @@ def choose_platinum_timeout_action(
         return platinum_commit_play(cpu, large_hand_action)
 
     if getattr(room, "field", []) or []:
+        post_all_out_response = choose_platinum_post_all_out_response(cpu, room, validator)
+        if post_all_out_response is not None:
+            return platinum_commit_play(cpu, post_all_out_response)
         if platinum_failed_composite_all_out_allowed(cpu, room, allow_opening=False):
             payload = build_composite_practice_all_out_payload(
                 cpu, room, rng=cpu.rng, require_invalid=True
