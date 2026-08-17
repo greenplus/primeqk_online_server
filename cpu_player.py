@@ -266,6 +266,26 @@ def is_cpu_player(player) -> bool:
     return bool(getattr(player, "is_cpu", False))
 
 
+def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None) -> None:
+    """Reset per-game planner state while preserving the CPU's learned knowledge."""
+    cpu.gold_active_plan = None
+    cpu.gold_plan_step_index = 0
+    cpu.silver_active_plan = None
+    cpu.silver_plan_step_index = 0
+    cpu.decision_deadline = None
+    cpu.last_decision_timed_out = False
+    cpu.platinum_opening_phase = True
+    cpu.platinum_all_out_attempts = 0
+    cpu.platinum_initial_hand_size = int(
+        len(cpu.hand) if initial_hand_size is None else initial_hand_size
+    )
+    cpu.platinum_last_strategy_score = 0.0
+    cpu.platinum_last_interference_score = 0
+    cpu.platinum_relaxed_opponent_min_hand_count = None
+    cpu.platinum_all_out_suppressed_opponent_min_hand_count = None
+    cpu.platinum_current_min_trump_strength = PLATINUM_MIN_TRUMP_STRENGTH
+
+
 def get_cpu_profile(cpu_key: str) -> Optional[CpuProfile]:
     return CPU_PROFILES.get(cpu_key)
 
@@ -1135,11 +1155,11 @@ def platinum_required_trump_strength(cpu: CpuPlayer) -> float:
     ))
 
 
-def platinum_expected_opponent_kx_remaining(cpu: CpuPlayer, room) -> float:
-    """Expected K/X count using only hand counts and publicly known cards."""
+def platinum_unaccounted_kx_distribution(cpu: CpuPlayer, room) -> tuple[int, int, int]:
+    """Return unaccounted K/X, opponent cards, and unknown deck cards."""
     opponent_count = platinum_opponent_hand_count(cpu, room)
     if opponent_count is None:
-        return float("inf")
+        return 0, 0, 0
 
     def card_key(card: Card):
         return card.get("card_id") or id(card)
@@ -1171,10 +1191,31 @@ def platinum_expected_opponent_kx_remaining(cpu: CpuPlayer, room) -> float:
             len(getattr(room, "deck", []) or [])
             - len(getattr(room, "public_known_deck_bottom", []) or []),
         )
+    return unaccounted_kx, opponent_count, unknown_deck_count
+
+
+def platinum_expected_opponent_kx_remaining(cpu: CpuPlayer, room) -> float:
+    """Expected K/X count using only hand counts and publicly known cards."""
+    if platinum_opponent_hand_count(cpu, room) is None:
+        return float("inf")
+    unaccounted_kx, opponent_count, unknown_deck_count = (
+        platinum_unaccounted_kx_distribution(cpu, room)
+    )
     unknown_population = opponent_count + unknown_deck_count
     if unknown_population <= 0:
         return 0.0
     return unaccounted_kx * opponent_count / unknown_population
+
+
+def platinum_expected_unknown_deck_kx(cpu: CpuPlayer, room) -> float:
+    """Expected K/X contribution still hidden in the draw pile."""
+    unaccounted_kx, opponent_count, unknown_deck_count = (
+        platinum_unaccounted_kx_distribution(cpu, room)
+    )
+    unknown_population = opponent_count + unknown_deck_count
+    if unknown_population <= 0:
+        return 0.0
+    return unaccounted_kx * unknown_deck_count / unknown_population
 
 
 def platinum_interference_breaks_plan(
@@ -1510,6 +1551,21 @@ def platinum_deck_has_trump_value(room) -> bool:
     return any(is_joker(card) or int(card.get("rank", 0)) == 13 for card in known)
 
 
+def platinum_deck_has_expected_trump_contribution(cpu: CpuPlayer, room) -> bool:
+    return (
+        platinum_deck_has_trump_value(room)
+        or platinum_expected_unknown_deck_kx(cpu, room) > 0.0
+    )
+
+
+def platinum_interference_danger_active(cpu: CpuPlayer, room) -> bool:
+    """Whether the opponent's finish risk calls for interference over all-out."""
+    score = platinum_opponent_hand_score(cpu, room)
+    if platinum_expected_opponent_kx_remaining(cpu, room) <= 0.1:
+        score += 20
+    return score >= PLATINUM_INTERFERENCE_BORDER
+
+
 def platinum_failed_composite_all_out_allowed(
     cpu: CpuPlayer,
     room,
@@ -1521,6 +1577,12 @@ def platinum_failed_composite_all_out_allowed(
         return False
     if allow_opening and getattr(cpu, "platinum_opening_phase", True):
         return True
+    if int(getattr(cpu, "platinum_all_out_attempts", 0)) > 0:
+        return (
+            bool(getattr(room, "deck", []))
+            and not platinum_interference_danger_active(cpu, room)
+            and platinum_deck_has_expected_trump_contribution(cpu, room)
+        )
     return bool(getattr(room, "deck", [])) and platinum_deck_has_trump_value(room)
 
 
@@ -1530,7 +1592,11 @@ def platinum_should_all_out(cpu: CpuPlayer, room) -> bool:
     attempts = int(getattr(cpu, "platinum_all_out_attempts", 0))
     if attempts == 0:
         return True
-    return bool(getattr(room, "deck", [])) and platinum_deck_has_trump_value(room)
+    return (
+        bool(getattr(room, "deck", []))
+        and not platinum_interference_danger_active(cpu, room)
+        and platinum_deck_has_expected_trump_contribution(cpu, room)
+    )
 
 
 def platinum_has_trump_utilization_prospect(
