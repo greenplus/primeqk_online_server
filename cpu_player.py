@@ -998,10 +998,34 @@ def choose_platinum_interference_action(
         )
         for candidate in candidates
     ]
-    best = max(scored, key=lambda item: item[:-1])
-    cpu.platinum_last_interference_score = best[0]
-    if best[0] < PLATINUM_INTERFERENCE_BORDER:
+    best_score = max(item[0] for item in scored)
+    cpu.platinum_last_interference_score = best_score
+    if best_score < PLATINUM_INTERFERENCE_BORDER:
         return None
+    eligible = [item for item in scored if item[0] >= PLATINUM_INTERFERENCE_BORDER]
+    held_trumps = platinum_available_trump_candidates(cpu, room, validator)
+    if held_trumps:
+        def interference_choice_key(item: tuple) -> tuple:
+            candidate = item[-1]
+            remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+            child = temporary_cpu_with_hand(cpu, remaining)
+            preserves_trump = any(
+                candidate_cards_available(trump, child)
+                and platinum_candidate_is_trump(trump, child)
+                for trump in held_trumps
+            )
+            return (
+                1 if preserves_trump else 0,
+                0 if platinum_candidate_is_trump(candidate, cpu) else 1,
+                item[0],
+                -item[1],
+                -item[2],
+            )
+
+        best = max(eligible, key=interference_choice_key)
+    else:
+        best = max(eligible, key=lambda item: item[:-1])
+    cpu.platinum_last_interference_score = best[0]
     platinum_mark_successful_interference(cpu, room)
     return candidate_to_action(best[-1])
 
@@ -1188,6 +1212,40 @@ def platinum_candidate_uses_last_absolute_trump(
     )
 
 
+def platinum_candidate_is_trump(candidate: dict, cpu: CpuPlayer) -> bool:
+    return (
+        candidate.get("number") in {"X", 57}
+        or platinum_candidate_is_absolute(candidate, cpu)
+        or platinum_candidate_token(candidate) in PLATINUM_SMALL_TRUMP_TOKENS
+    )
+
+
+def platinum_available_trump_candidates(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    """Enumerate currently realizable trumps for interference preservation."""
+    empty_room = room_without_field(room)
+    max_count = min(9, len(cpu.hand))
+    if max_count <= 0:
+        return []
+    candidates = gold_plan_candidates(cpu, empty_room, range(1, max_count + 1), validator)
+    for count in range(1, max_count + 1):
+        candidates.extend(joker_prime_candidates_for_count(
+            cpu,
+            empty_room,
+            count,
+            validator,
+        ))
+    candidates.extend(gold_special_cut_candidates(cpu, empty_room))
+    return [
+        candidate
+        for candidate in dedupe_candidates(candidates)
+        if platinum_candidate_is_trump(candidate, cpu)
+    ]
+
+
 def choose_platinum_strong_plan(
     cpu: CpuPlayer,
     room,
@@ -1263,17 +1321,33 @@ def platinum_opening_multi_play_is_sound(cpu: CpuPlayer, plan: dict) -> bool:
     steps = plan.get("steps", [])
     if not steps:
         return False
-    first_count = len(candidate_consumed_cards(steps[0]))
-    if first_count < PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS:
-        return True
-    if first_count == len(cpu.hand):
-        return True
-    if len(steps) != 2 or steps[1].get("role") != "finish":
+
+    remaining = cpu.hand[:]
+    for step in steps:
+        consumed = candidate_consumed_cards(step)
+        if not temporary_cpu_with_hand(cpu, remaining).has_cards(consumed):
+            return False
+        remaining = remaining_cards(remaining, consumed)
+    if remaining:
         return False
-    after_first = remaining_cards(cpu.hand, candidate_consumed_cards(steps[0]))
+
+    if len(steps) == 1:
+        return True
+    if steps[-1].get("role") != "finish":
+        return False
+    if len(steps) == 2:
+        return True
+
+    rally_steps = steps[:-1]
+    rally_count = len(rally_steps[0].get("cards", []))
     return (
-        len(candidate_consumed_cards(steps[1])) == len(after_first)
-        and not remaining_cards(after_first, candidate_consumed_cards(steps[1]))
+        rally_count > 0
+        and all(
+            str(step.get("role", "")).startswith("rally-")
+            and len(step.get("cards", [])) == rally_count
+            for step in rally_steps
+        )
+        and gold_plan_trump_step_index(plan) == len(steps) - 2
     )
 
 
