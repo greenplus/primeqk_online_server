@@ -945,7 +945,7 @@ def platinum_one_move_finish_candidate(
     validator: NumberValidator,
 ) -> Optional[dict]:
     candidate = choose_gold_finish_candidate(cpu, room, validator)
-    if candidate is None:
+    if candidate is None or not candidate_is_playable(candidate, cpu, room):
         return None
     return candidate if len(candidate_consumed_cards(candidate)) == len(cpu.hand) else None
 
@@ -3245,7 +3245,8 @@ def choose_gold_finish_candidate(
     validator: NumberValidator,
 ) -> Optional[dict]:
     finish_candidates = direct_gold_finish_candidates(cpu, room, validator)
-    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]):
+    field_count = len(getattr(room, "field", []) or [])
+    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]) and field_count <= 1:
         finish_candidates.append({
             "kind": "prime",
             "number": "X",
@@ -3522,7 +3523,8 @@ def gold_finish_candidates(
         for count in range(1, max_cards + 1)
         for candidate in joker_prime_candidates_for_count(cpu, room, count, validator)
     )
-    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]):
+    field_count = len(getattr(room, "field", []) or [])
+    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]) and field_count <= 1:
         candidates.append({
             "kind": "prime",
             "number": "X",

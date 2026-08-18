@@ -1134,14 +1134,19 @@ async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] 
         )
 
 
-def room_resume_session(token: object, requested_room_id: str) -> Optional["Player"]:
+def room_resume_session(
+    token: object,
+    requested_room_id: str,
+    *,
+    allow_connected: bool = False,
+) -> Optional["Player"]:
     if not isinstance(token, str) or not token:
         return None
     session = ROOM_RESUME_SESSIONS.get(hash_resume_token(token))
     if (
         session is None
         or session.room_session_room_id != requested_room_id
-        or session.ws is not None
+        or (session.ws is not None and not allow_connected)
     ):
         return None
     return session
@@ -1151,10 +1156,16 @@ async def bind_room_resume_session(
     incoming: "Player",
     session: "Player",
 ) -> "Player":
+    previous_ws = session.ws
     incoming.ws, session.ws = None, incoming.ws
     session.disconnected_at = None
     session.client_surface = incoming.client_surface
     session.composite_practice_authorized = incoming.composite_practice_authorized
+    if previous_ws is not None and previous_ws is not session.ws:
+        try:
+            await previous_ws.close(code=4001)
+        except Exception:
+            pass
     await session.send_json({"type": "your_id", "id": session.id, "name": session.name})
     await session.send_json({
         "type": "room_session",
@@ -4969,7 +4980,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
 
-                resumed_session = room_resume_session(data.get("resume_token"), rid)
+                resumed_session = room_resume_session(
+                    data.get("resume_token"),
+                    rid,
+                    allow_connected=data.get("automatic_reconnect") is True,
+                )
                 if resumed_session is not None and resumed_session is not player:
                     player = await bind_room_resume_session(player, resumed_session)
                     active_room = player.room or room
