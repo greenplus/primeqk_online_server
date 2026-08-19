@@ -30,7 +30,6 @@ from assist_recommendation import (
     rank_recommended_assist_candidates,
 )
 from campaign_store import (
-    LAUNCH_PERIOD_KEY,
     LEGACY_CAMPAIGN_KEY,
     CampaignSettings,
     CampaignStore,
@@ -78,6 +77,7 @@ RECRUITMENT_DISCORD_WINDOW_SECONDS = int_env(
     3600,
     minimum=1,
 )
+TURN_TIME_LIMIT_SECONDS = int_env("TURN_TIME_LIMIT_SECONDS", 60, minimum=10)
 PLUS_CLIENT_URL = os.getenv("PLUS_CLIENT_URL", "https://greenplus.github.io/qkplus/")
 NEO_CLIENT_URL = os.getenv("NEO_CLIENT_URL", "https://greenplus.github.io/qkneo/")
 LEGACY_CLIENT_URL = os.getenv("LEGACY_CLIENT_URL", "https://greenplus.github.io/primeqk_online/")
@@ -467,6 +467,12 @@ class Room:
         self.largest_prime_plays_by_player: Dict[str, dict] = {}
         self.tournament_run_id: Optional[str] = None
         self.tournament_match_id: Optional[str] = None
+        self.turn_seq = 0
+        self.turn_started_at: Optional[datetime] = None
+        self.turn_deadline_at: Optional[datetime] = None
+        self.turn_timeout_seconds: Optional[int] = None
+        self.turn_timeout_task: Optional[asyncio.Task] = None
+        self.turn_action_lock = asyncio.Lock()
 
     async def broadcast(self, message: dict):
         disconnected = []
@@ -601,7 +607,8 @@ class Room:
             "hand_counts": [
                 {"id": p.id, "name": p.name, "count": len(p.hand)}
                 for p in get_active_players(self)
-            ]
+            ],
+            **turn_clock_payload(self),
         }
         if is_tournament_managed_room(self):
             run = tournament_run_for_room(self)
@@ -634,6 +641,7 @@ class Room:
             campaign_result = await maybe_record_campaign_win(self, winner_player)
             await record_tournament_game_result(self, winner_player)
             self.state = "waiting"
+            stop_turn_clock(self)
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
             await self.log_chat(f"{winner}が勝利しました")
             await send_neo_largest_prime_share_chats(self)
@@ -752,6 +760,10 @@ def room_counts_payload(
             rid: room.rule.registered_number_limit
             for rid, room in visible_rooms.items()
         },
+        "turn_time_limits": {
+            rid: default_turn_time_limit_seconds(room)
+            for rid, room in visible_rooms.items()
+        },
         "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in visible_rooms},
         "registered_sample_options": registered_sample_options(
             include_composite_practice=practice_authorized,
@@ -798,6 +810,7 @@ def tournament_public_payload(
             "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
             "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
             "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+            "turn_time_limit_seconds": TURN_TIME_LIMIT_SECONDS,
             "available_rules": tournament_rule_catalog(),
         }
     payload = {
@@ -809,6 +822,7 @@ def tournament_public_payload(
         "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+        "turn_time_limit_seconds": TURN_TIME_LIMIT_SECONDS,
     }
     payload["active_matches"] = [
         tournament_match_live_summary(run, match.match_id)
@@ -995,6 +1009,7 @@ def tournament_match_live_summary(run: TournamentRun, match_id: str) -> dict:
             )
         ],
         "viewer_count": len(TOURNAMENT_MATCH_VIEWERS.get(match_id, set())),
+        **(turn_clock_payload(room) if room is not None else empty_turn_clock_payload()),
     }
 
 
@@ -1218,6 +1233,7 @@ def room_initialization_payload(room: "Room", player: "Player") -> dict:
         "cpu_profiles": available_cpu_profile_payloads(room.rule),
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+        **turn_clock_payload(room),
         "tournament": tournament_public_payload(
             tournament_run_for_room(room),
             player.tournament_participant_id,
@@ -1761,6 +1777,7 @@ async def close_tournament_match_room(
     TOURNAMENT_MATCH_ROOMS.pop(match_id, None)
     room.state = "waiting"
     room.current_turn_id = None
+    stop_turn_clock(room)
     if broadcast_result:
         await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
     lobby = rooms[run.room_id]
@@ -2002,9 +2019,6 @@ async def tournament_scheduler_loop() -> None:
 
 
 def campaign_base_payload(now: datetime, period=None) -> dict:
-    schedule_label = "毎週 月曜6:00〜日曜24:00（日本時間）"
-    if period is not None and period.key == LAUNCH_PERIOD_KEY:
-        schedule_label = "初週のみ8/12 6:00開始・8/17 0:00終了（日本時間）"
     return {
         "campaign_key": CAMPAIGN_SETTINGS.key,
         "period_key": period.key if period is not None else None,
@@ -2015,11 +2029,12 @@ def campaign_base_payload(now: datetime, period=None) -> dict:
         "server_now": now.isoformat(),
         "campaign_url": CAMPAIGN_SETTINGS.page_url,
         "schedule": CAMPAIGN_SETTINGS.schedule,
-        "schedule_label": schedule_label,
+        "schedule_label": "毎週 月曜6:00〜日曜24:00（日本時間）",
     }
 
 
-@app.get("/api/campaigns/gold-cpu-100")
+@app.get("/api/campaigns/gold-cpu-weekly")
+@app.get("/api/campaigns/gold-cpu-100", include_in_schema=False)
 async def get_cpu_campaign_status() -> dict:
     now = utc_now()
     state, period = CAMPAIGN_SETTINGS.period_state(now)
@@ -4295,6 +4310,143 @@ async def recruitment_notification_loop():
             print(f"recruitment notification loop failed: {exc}")
         await asyncio.sleep(5)
 
+
+################################################
+# 手番時計
+################################################
+def default_turn_time_limit_seconds(room: Room) -> Optional[int]:
+    """入室前に案内する対人戦の標準制限時間。"""
+    if room.room_id == TOURNAMENT_ROOM_ID or room.tournament_match_id:
+        return TURN_TIME_LIMIT_SECONDS
+    if room.rule.hand_size >= 11:
+        return TURN_TIME_LIMIT_SECONDS
+    return None
+
+
+def game_turn_time_limit_seconds(room: Room, active_players: List["Player"]) -> Optional[int]:
+    """大会、または初期手札11枚以上の2人人間対戦だけを時間制限ありにする。"""
+    if room.tournament_match_id:
+        return TURN_TIME_LIMIT_SECONDS
+    if len(active_players) != 2 or any(is_cpu_player(player) for player in active_players):
+        return None
+    return default_turn_time_limit_seconds(room)
+
+
+def empty_turn_clock_payload() -> dict:
+    return {
+        "server_now": utc_now().isoformat(),
+        "turn_seq": None,
+        "turn_started_at": None,
+        "turn_deadline_at": None,
+        "turn_time_limit_seconds": None,
+        "turn_timeout_enabled": False,
+    }
+
+
+def turn_clock_payload(room: Room) -> dict:
+    return {
+        "server_now": utc_now().isoformat(),
+        "turn_seq": room.turn_seq,
+        "turn_started_at": room.turn_started_at.isoformat() if room.turn_started_at else None,
+        "turn_deadline_at": room.turn_deadline_at.isoformat() if room.turn_deadline_at else None,
+        "turn_time_limit_seconds": room.turn_timeout_seconds,
+        "turn_timeout_enabled": room.turn_timeout_seconds is not None,
+    }
+
+
+def cancel_turn_timeout_task(room: Room) -> None:
+    task = room.turn_timeout_task
+    room.turn_timeout_task = None
+    if task is None or task.done():
+        return
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if task is not current:
+        task.cancel()
+
+
+def stop_turn_clock(room: Room) -> None:
+    cancel_turn_timeout_task(room)
+    room.turn_seq += 1
+    room.turn_started_at = None
+    room.turn_deadline_at = None
+    room.turn_timeout_seconds = None
+
+
+def start_turn_clock(room: Room) -> None:
+    cancel_turn_timeout_task(room)
+    room.turn_seq += 1
+    room.turn_started_at = utc_now()
+    room.turn_deadline_at = (
+        room.turn_started_at + timedelta(seconds=room.turn_timeout_seconds)
+        if room.turn_timeout_seconds is not None
+        else None
+    )
+    if room.turn_deadline_at is not None and room.current_turn_id is not None:
+        room.turn_timeout_task = asyncio.create_task(wait_for_turn_timeout(
+            room,
+            room.turn_seq,
+            room.current_turn_id,
+        ))
+
+
+def turn_timeout_due(room: Room, now: Optional[datetime] = None) -> bool:
+    return bool(
+        room.state == "playing"
+        and room.turn_deadline_at is not None
+        and (now or utc_now()) >= room.turn_deadline_at
+    )
+
+
+async def wait_for_turn_timeout(room: Room, turn_seq: int, player_id: str) -> None:
+    try:
+        while (
+            room.state == "playing"
+            and room.turn_seq == turn_seq
+            and room.current_turn_id == player_id
+            and room.turn_deadline_at is not None
+        ):
+            remaining = (room.turn_deadline_at - utc_now()).total_seconds()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            await expire_turn_if_due(room, turn_seq, player_id)
+            return
+    except asyncio.CancelledError:
+        return
+
+
+async def expire_turn_if_due(room: Room, turn_seq: int, player_id: str) -> bool:
+    async with room.turn_action_lock:
+        if (
+            room.state != "playing"
+            or room.turn_seq != turn_seq
+            or room.current_turn_id != player_id
+            or not turn_timeout_due(room)
+        ):
+            return False
+        player = next(
+            (item for item in get_active_players(room) if item.id == player_id),
+            None,
+        )
+        if player is None:
+            return False
+        await pass_turn_for_player(player, room, timed_out=True)
+        return True
+
+
+async def turn_action_can_proceed(player: "Player", room: Room) -> bool:
+    """room.turn_action_lock の内側から呼ぶ。期限後の入力は時間切れとして処理する。"""
+    if player.id != room.current_turn_id:
+        await player.send_json({"type": "error", "message": "あなたのターンではありません。"})
+        return False
+    if turn_timeout_due(room):
+        await pass_turn_for_player(player, room, timed_out=True)
+        return False
+    return True
+
 ################################################
 # CPU処理
 ################################################
@@ -4416,6 +4568,7 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             winner_name = active_players[0].name
             room.state = "waiting"
             room.current_turn_id = None
+            stop_turn_clock(room)
             await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
             await room.log_chat(f"{winner_name}が勝利しました")
             await send_neo_largest_prime_share_chats(room)
@@ -4424,6 +4577,7 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
         elif len(active_players) == 0:
             room.state = "waiting"
             room.current_turn_id = None
+            stop_turn_clock(room)
             await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
             await room.log_chat("対戦者がいなくなったためゲームを終了しました")
             await maybe_log_talkative_fish_game_over(room)
@@ -4574,17 +4728,28 @@ async def draw_card_for_player(player, room: Room) -> bool:
     return True
 
 
-async def pass_turn_for_player(player, room: Room) -> None:
+async def pass_turn_for_player(player, room: Room, *, timed_out: bool = False) -> None:
     await player.send_hand_update()
     flow_field(room)
     await room.update_game_state()
-    await room.broadcast({
+    action_payload = {
         "type": "action_result",
         "action": "pass",
         "player_id": player.id
-    })
-    await room.log_chat(f"{player.name}がパスしました")
-    record_score_play_line(room, player, f"{score_state_prefix(room)}%")
+    }
+    if timed_out:
+        action_payload.update({
+            "reason": "turn_timeout",
+            "automatic": True,
+        })
+    await room.broadcast(action_payload)
+    await room.log_chat(
+        f"{player.name}が時間切れで自動パスしました"
+        if timed_out
+        else f"{player.name}がパスしました"
+    )
+    notation = "%%" if timed_out else "%"
+    record_score_play_line(room, player, f"{score_state_prefix(room)}{notation}")
     await next_turn(room)
 
 ################################################
@@ -5146,22 +5311,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:
                     continue
                 room = player.room
-                if player.id != room.current_turn_id:
-                    await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
-                    continue
+                async with room.turn_action_lock:
+                    if not await turn_action_can_proceed(player, room):
+                        continue
 
-                # モードごとに対応する関数を実行
-                mode = (data.get("mode") or "prime").lower()
-                try:
-                    if mode == "composite":
-                        if not room.rule.allow_composite:
-                            await websocket.send_json({"type": "error", "message": "この部屋では合成数出しは使えません。"})
-                            continue
-                        await handle_composite_play(player, room, data)
-                    else:
-                        await handle_prime_play(player, room, data)
-                except CompositeError as e:
-                    await websocket.send_json({"type":"error","message":e.msg})
+                    # モードごとに対応する関数を実行
+                    mode = (data.get("mode") or "prime").lower()
+                    try:
+                        if mode == "composite":
+                            if not room.rule.allow_composite:
+                                await websocket.send_json({"type": "error", "message": "この部屋では合成数出しは使えません。"})
+                                continue
+                            await handle_composite_play(player, room, data)
+                        else:
+                            await handle_prime_play(player, room, data)
+                    except CompositeError as e:
+                        await websocket.send_json({"type":"error","message":e.msg})
 
 
 
@@ -5169,21 +5334,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not player.room:
                     continue
                 room = player.room
-                if player.id != room.current_turn_id:
-                    await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
-                    continue
-
-                await draw_card_for_player(player, room)
+                async with room.turn_action_lock:
+                    if not await turn_action_can_proceed(player, room):
+                        continue
+                    await draw_card_for_player(player, room)
 
             elif msg_type == "pass":
                 if not player.room:
                     continue
                 room = player.room
-                if player.id != room.current_turn_id:
-                    await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
-                    continue
-
-                await pass_turn_for_player(player, room)
+                async with room.turn_action_lock:
+                    if not await turn_action_can_proceed(player, room):
+                        continue
+                    await pass_turn_for_player(player, room)
 
             elif msg_type == "join_global_chat":
                 if client_surface == "plus_practice":
@@ -6044,6 +6207,7 @@ async def leave_room(player, notify_client: bool = True):
 # ゲーム開始処理
 ################################################
 async def start_game(room):
+    stop_turn_clock(room)
     room.reverse_order = room.rule.start_revolution     # 革命はルールごとの開始時コンディションに戻す
     room.has_drawn = False         # ドロー済みフラグもクリア
 
@@ -6082,6 +6246,8 @@ async def start_game(room):
     # ランダムに先攻プレイヤー決定
     room.current_turn_id = random.choice([p.id for p in waiting_players])
     room.first_player_id = room.current_turn_id
+    room.turn_timeout_seconds = game_turn_time_limit_seconds(room, waiting_players)
+    start_turn_clock(room)
 
     # プレイヤーそれぞれに手札情報を送信
     for player in waiting_players:
@@ -6096,6 +6262,7 @@ async def start_game(room):
         "assist_enabled": room.rule.assist_enabled,
         "registration_enabled": room.rule.registration_enabled,
         "hnp_challenge_enabled": room.rule.hnp_challenge_enabled,
+        **turn_clock_payload(room),
     })
     await room.update_game_state()
     # チャットにログを流す
@@ -6107,11 +6274,14 @@ async def start_game(room):
 # 次のターンに移る
 ################################################
 async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer: bool = True) -> None:
+    if reset_timer:
+        start_turn_clock(room)
     await room.broadcast({
         "type": "turn_update",
         "current_turn": current_turn_name,
         "current_turn_id": room.current_turn_id,
         "reset_timer": reset_timer,
+        **turn_clock_payload(room),
     })
     if room.tournament_match_id:
         await broadcast_tournament_match_state(room)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -13,8 +13,6 @@ DEFAULT_CAMPAIGN_PAGE_URL = "https://greenplus.github.io/qkneo/campaign.html"
 WEEKLY_TIMEZONE = ZoneInfo("Asia/Tokyo")
 LEGACY_CAMPAIGN_KEY = "gold-cpu-100"
 LEGACY_PERIOD_KEY = "2026-07-28-special"
-LAUNCH_PERIOD_KEY = "2026-08-12-launch"
-LAUNCH_WEEK_MONDAY = date(2026, 8, 10)
 
 
 def utc_now() -> datetime:
@@ -126,21 +124,15 @@ class CampaignSettings:
             monday = local.date() - timedelta(days=local.weekday())
             start_local = datetime.combine(monday, time(6), WEEKLY_TIMEZONE)
             end_local = datetime.combine(monday + timedelta(days=7), time(0), WEEKLY_TIMEZONE)
-            period_key = start_local.date().isoformat()
-            label = f"{start_local:%Y/%m/%d}週"
-            if monday == LAUNCH_WEEK_MONDAY:
-                start_local = datetime(2026, 8, 12, 6, 0, tzinfo=WEEKLY_TIMEZONE)
-                period_key = LAUNCH_PERIOD_KEY
-                label = "初週 2026/08/12 6:00開始"
             status = "active"
             if local < start_local:
                 status = "scheduled"
             period = CampaignPeriod(
-                key=period_key,
+                key=start_local.date().isoformat(),
                 starts_at=start_local.astimezone(timezone.utc),
                 ends_at=end_local.astimezone(timezone.utc),
                 goal=self.goal,
-                label=label,
+                label=f"{start_local:%Y/%m/%d}週",
             )
             return status, period
 
@@ -267,8 +259,14 @@ class CampaignStore:
                 '2026-07-28T11:00:00+00:00',
                 '2026-08-02T11:00:00+00:00',
                 300,
-                '2026/07/28〜08/02 特別開催'
-            ) ON CONFLICT (campaign_key, period_key) DO NOTHING;
+                '2026/07/28〜08/02 旧キャンペーン'
+            ) ON CONFLICT (campaign_key, period_key) DO UPDATE SET
+                label = EXCLUDED.label;
+
+            UPDATE campaign_periods
+            SET label = '2026/08/12〜08/16'
+            WHERE campaign_key = '{DEFAULT_CAMPAIGN_KEY}'
+              AND period_key = '2026-08-12-launch';
             """
         )
 
