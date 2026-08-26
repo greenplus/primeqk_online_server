@@ -89,6 +89,7 @@ REGISTERED_TOURNAMENT_JSON = KNOWLEDGE_DIR / "registered_prime_daifugo_plus_ge4.
 GOLD_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "gold_prime_table_memory.json"
 NEO_BEGINNER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "neo_beginner_prime_table_memory.json"
 PLATINUM_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "platinum_prime_table_memory.json"
+DIAMOND_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "diamond_prime_table_memory.json"
 COMPOSITE_PRACTICE_COUNTERMEASURES_JSON = (
     KNOWLEDGE_DIR / "composite_practice_countermeasures_v1.json"
 )
@@ -2896,6 +2897,11 @@ REGISTERED_SAMPLE_DEFS = {
     "platinum_prime_table": {
         "label": "サンプル：プラチナ素数表",
         "prime_json": PLATINUM_PRIME_TABLE_JSON,
+        "composite_text": None,
+    },
+    "diamond_prime_table": {
+        "label": "サンプル：ダイヤ素数表",
+        "prime_json": DIAMOND_PRIME_TABLE_JSON,
         "composite_text": None,
     },
     "silver_prime_table": {

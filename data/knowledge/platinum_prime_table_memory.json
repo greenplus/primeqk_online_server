@@ -9,14 +9,19 @@
   "compositeCsv": "4,6,8,9,t,q,64,q8,5q,q5,49,65,81,91,94,96,25,27,48,98,q1,q9,66,88,99,8t,86,qt,kk,kq,kj,kt,256,625,343,243,729,t24,3q5,8q8,kkq,kkk,kkkq,kkjq,kkqt,kjkq,kqqj,t48576,4782969,67t8864\n",
   "counts": {
     "primeTokens": 540,
+    "uniquePrimeValues": 540,
     "compositeTokens": 50,
     "totalTokens": 590
   },
   "validation": {
+    "primeTokens": 540,
     "primeValues": 540,
     "compositeValues": 50,
+    "duplicatePrimeValues": 0,
+    "duplicatePrimeTokens": [],
     "maxPrimeValue": 131313121210101211,
-    "deterministicPrimeScan": "miller-rabin-u64"
+    "largePrimeValuesScanned": 0,
+    "primeScan": "miller-rabin-u64-deterministic"
   },
   "source": "C:\\Users\\takum\\Documents\\primeqk_online\\materials\\_【QK】プラチナ素数表.txt"
 }

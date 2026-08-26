@@ -602,6 +602,9 @@ def generate_composite_expression_entries(
     pattern: str,
     source_line: int,
     excluded_expressions: Iterable[str] = (),
+    *,
+    max_entries: int | None = MAX_COMPOSITE_AUTO_EXPRESSIONS_PER_VALUE,
+    minimum_jokers_only: bool = True,
 ) -> tuple[RegisteredCompositeEntry, ...]:
     factorization = prime_factorization_for_composite_expression(value)
     if not factorization:
@@ -644,14 +647,19 @@ def generate_composite_expression_entries(
 
     if not ranked_entries:
         return ()
-    minimum_jokers = min(required_jokers for required_jokers, _ in ranked_entries)
-    entries = [
-        entry
-        for required_jokers, entry in ranked_entries
-        if required_jokers == minimum_jokers
-    ]
+    if minimum_jokers_only:
+        minimum_jokers = min(required_jokers for required_jokers, _ in ranked_entries)
+        entries = [
+            entry
+            for required_jokers, entry in ranked_entries
+            if required_jokers == minimum_jokers
+        ]
+    else:
+        entries = [entry for _, entry in ranked_entries]
     entries.sort(key=composite_expression_selection_key)
-    return tuple(entries[:MAX_COMPOSITE_AUTO_EXPRESSIONS_PER_VALUE])
+    if max_entries is None:
+        return tuple(entries)
+    return tuple(entries[:max_entries])
 
 
 def minimum_composite_expression_jokers(
@@ -780,15 +788,43 @@ def term_expression_variants(base: int, exponent: int) -> tuple[str, ...]:
     )
     if exponent == 1:
         return base_texts
-    exponent_texts = tuple(
-        registered_cards_label(cards)
-        for cards in registered_value_encodings(exponent)
-    )
+    exponent_texts = exponent_expression_variants(exponent)
     return tuple(
         f"{base_text}^{exponent_text}"
         for base_text in base_texts
         for exponent_text in exponent_texts
     )
+
+
+@lru_cache(maxsize=512)
+def exponent_expression_variants(value: int, depth: int = 0) -> tuple[str, ...]:
+    """Encode an exponent directly or as a right-associated power tower."""
+    variants = [
+        registered_cards_label(cards)
+        for cards in registered_value_encodings(value)
+    ]
+    if depth >= 3:
+        return tuple(dict.fromkeys(variants))
+
+    for base in range(2, 14):
+        exponent = 2
+        powered = base * base
+        while powered <= value:
+            if powered == value:
+                base_labels = (
+                    registered_cards_label(cards)
+                    for cards in registered_value_encodings(base)
+                )
+                tails = exponent_expression_variants(exponent, depth + 1)
+                variants.extend(
+                    f"{base_label}^{tail}"
+                    for base_label in base_labels
+                    for tail in tails
+                )
+                break
+            exponent += 1
+            powered *= base
+    return tuple(dict.fromkeys(variants))
 
 
 def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult:

@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from functools import lru_cache
 from itertools import permutations, product
 import json
+from math import comb
 from pathlib import Path
+import random
 import secrets
 import time
 from typing import Callable, Iterable, List, Optional
 
 from registered_primes import (
+    generate_composite_expression_entries,
+    registered_pattern_cards,
     registered_prime_template_index,
     registered_prime_templates_for_hand,
     registered_value_encodings,
@@ -41,6 +46,44 @@ PLATINUM_PLAN_MAX_STEPS = 5
 PLATINUM_MIN_TRUMP_STRENGTH = 80.0
 PLATINUM_RELAXED_TRUMP_STRENGTH = 60.0
 PLATINUM_MAX_KNOWLEDGE_CARDS = 14
+DIAMOND_MAX_KNOWLEDGE_CARDS = 20
+DIAMOND_PREFERRED_RALLY_COUNTS = (4, 6)
+DIAMOND_DECISION_BUDGET_MS = 1500
+DIAMOND_FOUR_OBAKE_TOKENS = (
+    "kkkq", "kkkt", "kkqk", "kkqt", "kkjq",
+)
+DIAMOND_FOUR_COUNTER_TOKENS = (
+    "kkkq", "kkkt", "kkqk", "kkqt", "kkjk", "kkjq",
+)
+DIAMOND_SIX_CERTAIN_MIN_VALUE = 131312121011  # KKQQTJ
+DIAMOND_SIX_SOFT_MIN_VALUE = 91212101011  # 9QQTTJ
+DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY = 0.30
+DIAMOND_CONDITIONAL_DESPERATE_MAX_RETURN_PROBABILITY = 0.80
+DIAMOND_RETURN_PROBABILITY_TRIALS = 768
+DIAMOND_RECOVERY_PROBABILITY_TRIALS = 96
+DIAMOND_RECOVERY_CERTAIN_MIN_PROBABILITY = 0.20
+DIAMOND_REVOLUTION_RETURN_MAX_KJQJ_PROBABILITY = 0.20
+DIAMOND_FOUR_PRE_TRUMP_MIN_VALUE = 8121011  # 8QTJ
+DIAMOND_SIX_PRE_TRUMP_MIN_VALUE = 91212101011  # 9QQTTJ
+DIAMOND_OPPONENT_RALLY_INFERENCE_STREAK = 1
+DIAMOND_REVOLUTION_AVOID_COUNTS = frozenset({2, 4})
+DIAMOND_OPENING_SECOND_MIN_TRUMP_STRENGTH = 95.0
+DIAMOND_POST_ALL_OUT_STRONG_CONDITIONAL_MAX_RETURN_PROBABILITY = 0.30
+DIAMOND_POST_ALL_OUT_CONDITIONAL_MIN_TRUMP_STRENGTH = 90.0
+DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH = 80.0
+DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS = 4
+DIAMOND_POST_ALL_OUT_RESULT_CAP = 6
+DIAMOND_POST_ALL_OUT_DRAW_RESPONSE_MIN_HAND_SIZE = 18
+DIAMOND_POST_ALL_OUT_SEARCH_RESERVE_SECONDS = 0.50
+DIAMOND_KQQJ_CONTEXTUAL_MAX_OPPONENT_HAND_SIZE = 20
+DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
+    "opponent-all-out",
+    "post-all-out-lead",
+    "post-all-out-response",
+    "hand-advantage-lead",
+    "hand-advantage-interference",
+})
+ADVANCED_PLANNING_CPU_KEYS = frozenset({"platinum_planner", "diamond_planner"})
 PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS = 9
 PLATINUM_COMPRESSION_MIN_HAND_SIZE = 18
 PLATINUM_FORCED_COMPRESSION_HAND_SIZE = 26
@@ -94,11 +137,27 @@ PLATINUM_SMALL_TRUMP_TOKENS = frozenset({
 
 
 def gold_branch_candidate_cap(cpu: "CpuPlayer") -> int:
-    return 12 if getattr(cpu, "cpu_key", "") == "platinum_planner" else GOLD_PLAN_MAX_BRANCH_CANDIDATES
+    cpu_key = getattr(cpu, "cpu_key", "")
+    if cpu_key == "diamond_planner":
+        return 8
+    if cpu_key in ADVANCED_PLANNING_CPU_KEYS:
+        return 12
+    return GOLD_PLAN_MAX_BRANCH_CANDIDATES
 
 
 def gold_last_candidate_cap(cpu: "CpuPlayer") -> int:
-    return 16 if getattr(cpu, "cpu_key", "") == "platinum_planner" else GOLD_PLAN_MAX_LAST_CANDIDATES
+    cpu_key = getattr(cpu, "cpu_key", "")
+    if cpu_key == "diamond_planner":
+        return 12
+    if cpu_key in ADVANCED_PLANNING_CPU_KEYS:
+        return 16
+    return GOLD_PLAN_MAX_LAST_CANDIDATES
+
+
+def cpu_max_knowledge_cards(cpu: "CpuPlayer") -> int:
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        return DIAMOND_MAX_KNOWLEDGE_CARDS
+    return PLATINUM_MAX_KNOWLEDGE_CARDS
 COMPOSITE_PRACTICE_RANK_WEIGHTS = {
     0: 100,  # X
     2: 60,
@@ -188,7 +247,7 @@ class CpuPlayer:
         self.last_decision_timed_out = False
         self.small_finish_index = registered_prime_template_index((), max_cards=3)
         self.prime_template_index = registered_prime_template_index(
-            (), max_cards=PLATINUM_MAX_KNOWLEDGE_CARDS
+            (), max_cards=cpu_max_knowledge_cards(self)
         )
         self.prime_template_index_values = ()
         self.platinum_opening_phase = True
@@ -199,6 +258,37 @@ class CpuPlayer:
         self.platinum_relaxed_opponent_min_hand_count: Optional[int] = None
         self.platinum_all_out_suppressed_opponent_min_hand_count: Optional[int] = None
         self.platinum_current_min_trump_strength = PLATINUM_MIN_TRUMP_STRENGTH
+        self.diamond_focus_count: Optional[int] = None
+        self.diamond_active_route: Optional[dict] = None
+        self.diamond_last_route_kind = ""
+        self.diamond_last_certainty = "unclassified"
+        self.diamond_recovery_targets: tuple[int, ...] = ()
+        self.diamond_last_preferred_counts: tuple[int, ...] = ()
+        self.diamond_last_obake_counter_tokens: tuple[str, ...] = ()
+        self.diamond_last_return_candidates: tuple[str, ...] = ()
+        self.diamond_opponent_rally_count: Optional[int] = None
+        self.diamond_opponent_rally_streak = 0
+        self.diamond_last_observed_play_key: Optional[tuple] = None
+        self.diamond_interference_mode_count: Optional[int] = None
+        self.diamond_opponent_rally_threat = "none"
+        self.diamond_opponent_estimated_max: Optional[int] = None
+        self.diamond_last_return_probability = 0.0
+        self.diamond_last_recovery_certain_probability = 0.0
+        self.diamond_last_recovery_guaranteed_kx = 0
+        self.diamond_recovery_cache_key: Optional[tuple] = None
+        self.diamond_last_opponent_kjqj_probability = 1.0
+        self.diamond_revolution_strategy_active = False
+        self.diamond_last_context = "opening-lead"
+        self.diamond_last_plan_tier: Optional[int] = None
+        self.diamond_last_finish_strength = 0
+        self.diamond_seen_cards: dict[str, Card] = {}
+        self.diamond_public_response_signature_cache: dict[
+            int,
+            tuple[tuple[int, tuple[int, ...]], ...],
+        ] = {}
+        self.diamond_last_conditional_limit = (
+            DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY
+        )
         self.rng = secrets.SystemRandom()
 
     async def send_json(self, message: dict):
@@ -248,9 +338,10 @@ class CpuPlayer:
         )
         self.prime_template_index = registered_prime_template_index(
             sorted_values,
-            max_cards=PLATINUM_MAX_KNOWLEDGE_CARDS,
+            max_cards=cpu_max_knowledge_cards(self),
         )
         self.prime_template_index_values = sorted_values
+        self.diamond_public_response_signature_cache = {}
 
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
@@ -258,6 +349,7 @@ class CpuPlayer:
     def replace_registered_composites(self, values: set[int], entries=()) -> None:
         self.registered_composites = set(values)
         self.registered_composite_entries = tuple(entries)
+        self.diamond_public_response_signature_cache = {}
 
     def can_use_registered_composite(self, n: int) -> bool:
         return n in self.registered_composites
@@ -285,6 +377,33 @@ def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None
     cpu.platinum_relaxed_opponent_min_hand_count = None
     cpu.platinum_all_out_suppressed_opponent_min_hand_count = None
     cpu.platinum_current_min_trump_strength = PLATINUM_MIN_TRUMP_STRENGTH
+    cpu.diamond_focus_count = None
+    cpu.diamond_active_route = None
+    cpu.diamond_last_route_kind = ""
+    cpu.diamond_last_certainty = "unclassified"
+    cpu.diamond_recovery_targets = ()
+    cpu.diamond_last_preferred_counts = ()
+    cpu.diamond_last_obake_counter_tokens = ()
+    cpu.diamond_last_return_candidates = ()
+    cpu.diamond_opponent_rally_count = None
+    cpu.diamond_opponent_rally_streak = 0
+    cpu.diamond_last_observed_play_key = None
+    cpu.diamond_interference_mode_count = None
+    cpu.diamond_opponent_rally_threat = "none"
+    cpu.diamond_opponent_estimated_max = None
+    cpu.diamond_last_return_probability = 0.0
+    cpu.diamond_last_recovery_certain_probability = 0.0
+    cpu.diamond_last_recovery_guaranteed_kx = 0
+    cpu.diamond_recovery_cache_key = None
+    cpu.diamond_last_opponent_kjqj_probability = 1.0
+    cpu.diamond_revolution_strategy_active = False
+    cpu.diamond_last_context = "opening-lead"
+    cpu.diamond_last_plan_tier = None
+    cpu.diamond_last_finish_strength = 0
+    cpu.diamond_seen_cards = {}
+    cpu.diamond_last_conditional_limit = (
+        DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY
+    )
 
 
 def get_cpu_profile(cpu_key: str) -> Optional[CpuProfile]:
@@ -316,8 +435,10 @@ def choose_profile_cpu_action(
         "decision_time_budget_ms",
         CPU_PLANNER_DEFAULT_BUDGET_MS,
     )))
-    if profile and profile.key == "platinum_planner":
+    if profile and profile.key in ADVANCED_PLANNING_CPU_KEYS:
         budget_ms = max(budget_ms, 1000)
+    if profile and profile.key == "diamond_planner":
+        budget_ms = max(budget_ms, DIAMOND_DECISION_BUDGET_MS)
     cpu.decision_deadline = time.perf_counter() + budget_ms / 1000
     cpu.last_decision_timed_out = False
     try:
@@ -331,7 +452,7 @@ def choose_profile_cpu_action(
         if profile and profile.key == "composite_practice":
             cpu.decision_deadline = None
             return choose_composite_practice_emergency_action(cpu, room)
-        if profile and profile.key == "platinum_planner":
+        if profile and profile.key in ADVANCED_PLANNING_CPU_KEYS:
             cpu.decision_deadline = None
             if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
                 return CpuAction("draw")
@@ -808,6 +929,463 @@ def choose_platinum_planning_cpu_action(
     return action or CpuAction("pass")
 
 
+def diamond_tactical_context(cpu: CpuPlayer, room) -> str:
+    """Classify the public hand-size/turn state used by Diamond policy."""
+    initial = max(1, int(getattr(cpu, "platinum_initial_hand_size", 11)))
+    own_count = len(cpu.hand)
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    responding = bool(getattr(room, "field", []) or [])
+    own_expanded = (
+        own_count > initial + 1
+        or int(getattr(cpu, "platinum_all_out_attempts", 0)) > 0
+    )
+    opponent_expanded = (
+        opponent_count is not None and opponent_count > initial + 1
+    )
+
+    if not own_expanded and not opponent_expanded:
+        return "opening-second" if responding else "opening-lead"
+    if not own_expanded and opponent_expanded:
+        return "opponent-all-out"
+    if own_expanded and opponent_expanded:
+        return "post-all-out-response" if responding else "post-all-out-lead"
+    if own_expanded and not opponent_expanded:
+        return (
+            "hand-advantage-interference"
+            if responding
+            else "hand-advantage-lead"
+        )
+    return "general-response" if responding else "general-lead"
+
+
+def choose_diamond_planning_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    """Choose with Diamond certainty, interference, and recovery policies."""
+    validator = gold_knowledge_number_validator
+    all_out_attempts_before = int(
+        getattr(cpu, "platinum_all_out_attempts", 0)
+    )
+    non_joker_count = len([card for card in cpu.hand if not is_joker(card)])
+    preferred_counts = diamond_rally_count_order(cpu, non_joker_count)
+    cpu.diamond_last_preferred_counts = preferred_counts
+    cpu.diamond_active_route = None
+    previous_context = getattr(cpu, "diamond_last_context", "opening-lead")
+    current_context = diamond_tactical_context(cpu, room)
+    if (
+        current_context in DIAMOND_POST_ALL_OUT_CONTEXTS
+        and previous_context not in DIAMOND_POST_ALL_OUT_CONTEXTS
+    ):
+        clear_gold_active_plan(cpu)
+    cpu.diamond_last_context = current_context
+    cpu.diamond_last_plan_tier = None
+    cpu.diamond_last_finish_strength = 0
+
+    if (
+        getattr(cpu, "diamond_revolution_strategy_active", False)
+        and not getattr(room, "reverse_order", False)
+    ):
+        cpu.diamond_revolution_strategy_active = False
+
+    diamond_observe_opponent_rally(cpu, room)
+    field = getattr(room, "field", []) or []
+    field_count = len(field)
+
+    revolution_return = diamond_1729_revolution_return_candidate(cpu, room)
+    if revolution_return is not None:
+        clear_gold_active_plan(cpu)
+        cpu.diamond_revolution_strategy_active = False
+        action = platinum_commit_play(cpu, candidate_to_action(revolution_return))
+        return diamond_record_action(
+            cpu,
+            action,
+            room,
+            "revolution-return-1729",
+            revolution_return,
+        )
+
+    # After our planned 1729, do not enter the two/four-card exchanges that
+    # expose us to 57 or another 1729. A direct finish is still always legal.
+    if (
+        getattr(cpu, "diamond_revolution_strategy_active", False)
+        and getattr(room, "reverse_order", False)
+        and field_count in DIAMOND_REVOLUTION_AVOID_COUNTS
+    ):
+        finish = platinum_one_move_finish_candidate(cpu, room, validator)
+        if finish is not None:
+            action = platinum_commit_play(cpu, candidate_to_action(finish))
+            return diamond_record_action(cpu, action, room, "revolution-finish", finish)
+        clear_gold_active_plan(cpu)
+        cpu.diamond_focus_count = None
+        cpu.diamond_last_certainty = "unclassified"
+        cpu.diamond_last_route_kind = "revolution-avoid-rally"
+        return CpuAction("pass")
+
+    active = getattr(cpu, "gold_active_plan", None)
+    active_is_strong = bool(
+        active
+        and active_gold_plan_matches_field(cpu, field_count)
+        and platinum_plan_is_strong(active, cpu, room)
+    )
+    if (
+        field
+        and getattr(cpu, "diamond_interference_mode_count", None) == field_count
+        and not active_is_strong
+    ):
+        finish = platinum_one_move_finish_candidate(cpu, room, validator)
+        if finish is not None:
+            action = platinum_commit_play(cpu, candidate_to_action(finish))
+            return diamond_record_action(cpu, action, room, "interference-finish", finish)
+        closing = diamond_threat_closing_response_candidate(
+            cpu,
+            room,
+            validator,
+        )
+        if closing is not None:
+            clear_gold_active_plan(cpu)
+            cpu.diamond_opponent_rally_streak = 0
+            cpu.diamond_interference_mode_count = None
+            cpu.diamond_opponent_rally_threat = "interrupted"
+            action = platinum_commit_play(cpu, candidate_to_action(closing))
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "threat-closing-response",
+                closing,
+            )
+        interference = choose_platinum_interference_action(
+            cpu,
+            room,
+            validator,
+            active_plan=active,
+            force=True,
+        )
+        if interference is not None:
+            clear_gold_active_plan(cpu)
+            cpu.diamond_opponent_rally_streak = 0
+            cpu.diamond_interference_mode_count = None
+            cpu.diamond_opponent_rally_threat = "interrupted"
+            action = platinum_commit_play(cpu, interference)
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "opponent-rally-interference",
+            )
+
+    contextual = choose_diamond_context_action(cpu, room, validator)
+    if contextual is not None:
+        return contextual
+
+    revolution = diamond_1729_revolution_candidate(cpu, room)
+    if revolution is not None and not diamond_has_current_certain_trump(cpu, room):
+        clear_gold_active_plan(cpu)
+        cpu.diamond_revolution_strategy_active = True
+        action = platinum_commit_play(cpu, candidate_to_action(revolution))
+        return diamond_record_action(cpu, action, room, "revolution-1729", revolution)
+
+    action = choose_platinum_planning_cpu_action(cpu, room, validator)
+    active_plan = getattr(cpu, "gold_active_plan", None)
+    focus_count = None
+    if active_plan:
+        rally_count = active_plan.get("rally_count")
+        if rally_count in DIAMOND_PREFERRED_RALLY_COUNTS:
+            focus_count = int(rally_count)
+            cpu.diamond_active_route = active_plan
+    if focus_count is None and action.kind in {"play_prime", "play_composite"}:
+        cards = action.payload.get("cards") or action.payload.get("selected", {}).get("cards") or []
+        if len(cards) in DIAMOND_PREFERRED_RALLY_COUNTS:
+            focus_count = len(cards)
+
+    cpu.diamond_focus_count = focus_count
+    if active_plan:
+        cpu.diamond_last_certainty = (
+            diamond_post_all_out_plan_certainty(active_plan, cpu, room)
+            if active_plan.get("diamond_tier") is not None
+            else diamond_plan_certainty(active_plan, cpu, room)
+        )
+    else:
+        candidate = diamond_candidate_from_action(action)
+        cpu.diamond_last_certainty = (
+            diamond_candidate_certainty(candidate, cpu, room)
+            if candidate is not None
+            else "unclassified"
+        )
+    cpu.diamond_last_route_kind = (
+        f"post-all-out-tier-{active_plan['diamond_tier']}"
+        if active_plan and active_plan.get("diamond_tier") is not None
+        else (
+            f"preferred-{focus_count}"
+            if focus_count is not None
+            else "platinum-fallback"
+        )
+    )
+    if active_plan and active_plan.get("diamond_tier") is not None:
+        cpu.diamond_last_plan_tier = int(active_plan["diamond_tier"])
+        cpu.diamond_last_finish_strength = int(
+            active_plan.get("diamond_finish_strength", 0)
+        )
+    if (
+        action.kind in {"play_prime", "play_composite"}
+        and int(getattr(cpu, "platinum_all_out_attempts", 0))
+        == all_out_attempts_before
+    ):
+        diamond_remember_cards(cpu, diamond_action_consumed_cards(action))
+    return action
+
+
+def diamond_record_action(
+    cpu: CpuPlayer,
+    action: CpuAction,
+    room,
+    route_kind: str,
+    candidate: Optional[dict] = None,
+) -> CpuAction:
+    diamond_remember_cards(cpu, diamond_action_consumed_cards(action))
+    cards = diamond_action_cards(action)
+    cpu.diamond_focus_count = (
+        len(cards) if len(cards) in DIAMOND_PREFERRED_RALLY_COUNTS else None
+    )
+    cpu.diamond_last_route_kind = route_kind
+    if candidate is None:
+        candidate = diamond_candidate_from_action(action)
+    cpu.diamond_last_certainty = (
+        diamond_candidate_certainty(candidate, cpu, room)
+        if candidate is not None
+        else "unclassified"
+    )
+    return action
+
+
+def diamond_action_cards(action: CpuAction) -> list[Card]:
+    if action.kind == "play_composite":
+        return list(action.payload.get("selected", {}).get("cards", []) or [])
+    return list(action.payload.get("cards", []) or [])
+
+
+def diamond_action_consumed_cards(action: CpuAction) -> list[Card]:
+    cards = diamond_action_cards(action)
+    if action.kind == "play_composite":
+        cards.extend(action.payload.get("consume", {}).get("cards", []) or [])
+    return list({card.get("card_id"): card for card in cards}.values())
+
+
+def diamond_remember_cards(cpu: CpuPlayer, cards: Iterable[Card]) -> None:
+    seen = getattr(cpu, "diamond_seen_cards", None)
+    if seen is None:
+        seen = {}
+        cpu.diamond_seen_cards = seen
+    for card in cards:
+        card_id = card.get("card_id")
+        if card_id:
+            seen[str(card_id)] = card
+
+
+def diamond_candidate_from_action(action: CpuAction) -> Optional[dict]:
+    if action.kind != "play_prime":
+        return None
+    cards = diamond_action_cards(action)
+    if not cards:
+        return None
+    assigned = iter(action.payload.get("assigned_numbers", []) or [])
+    ranks = []
+    for card in cards:
+        if is_joker(card):
+            value = next(assigned, None)
+            if value is None or value == "inf":
+                return None
+            ranks.append(int(value))
+        else:
+            ranks.append(int(card.get("rank", 0)))
+    return {
+        "kind": "prime",
+        "number": int("".join(str(rank) for rank in ranks)),
+        "cards": cards,
+        "assigned_numbers": list(action.payload.get("assigned_numbers", []) or []),
+        "ranks": tuple(ranks),
+    }
+
+
+def diamond_observe_opponent_rally(cpu: CpuPlayer, room) -> None:
+    field = list(getattr(room, "field", []) or [])
+    player_id = getattr(room, "last_play_player_id", None)
+    if field:
+        diamond_remember_cards(cpu, field)
+    if not field or player_id is None or player_id == cpu.id:
+        return
+    play_key = (
+        player_id,
+        getattr(room, "last_play_hand_before", None),
+        getattr(room, "last_number", None),
+        tuple(card.get("card_id") for card in field),
+    )
+    if play_key == getattr(cpu, "diamond_last_observed_play_key", None):
+        return
+    cpu.diamond_last_observed_play_key = play_key
+    count = len(field)
+    if count == getattr(cpu, "diamond_opponent_rally_count", None):
+        cpu.diamond_opponent_rally_streak += 1
+    else:
+        cpu.diamond_opponent_rally_count = count
+        cpu.diamond_opponent_rally_streak = 1
+    threat, estimated_max = diamond_infer_opponent_rally_threat(cpu, room, count)
+    cpu.diamond_opponent_rally_threat = threat
+    cpu.diamond_opponent_estimated_max = estimated_max
+    cpu.diamond_interference_mode_count = (
+        count
+        if (
+            cpu.diamond_opponent_rally_streak >= DIAMOND_OPPONENT_RALLY_INFERENCE_STREAK
+            and threat == "certain-likely"
+        )
+        else None
+    )
+
+
+def diamond_infer_opponent_rally_threat(
+    cpu: CpuPlayer,
+    room,
+    count: int,
+) -> tuple[str, Optional[int]]:
+    """Infer a same-count finishing threat after a single public play."""
+    try:
+        field_value = int(getattr(room, "last_number", 0) or 0)
+    except (TypeError, ValueError):
+        field_value = 0
+
+    if count == 4 and field_value >= DIAMOND_FOUR_PRE_TRUMP_MIN_VALUE:
+        feasible = [
+            token for token in DIAMOND_FOUR_OBAKE_TOKENS
+            if diamond_counter_token_is_physically_possible(cpu, room, token)
+        ]
+        if feasible:
+            return (
+                "certain-likely",
+                max(platinum_token_value(token) for token in feasible),
+            )
+
+    if count == 6 and field_value >= DIAMOND_SIX_PRE_TRUMP_MIN_VALUE:
+        available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+        signature = platinum_token_ranks("kkqqtj")
+        opponent_count = platinum_opponent_hand_count(cpu, room)
+        capacity = (
+            opponent_count + (1 if getattr(room, "deck", []) else 0)
+            if opponent_count is not None
+            else len(signature)
+        )
+        if (
+            capacity >= len(signature)
+            and diamond_requirement_is_physically_possible(
+                available,
+                joker_count,
+                signature,
+            )
+        ):
+            return "certain-likely", DIAMOND_SIX_CERTAIN_MIN_VALUE
+
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    estimated_max = diamond_estimated_opponent_max_value(cpu, room, count)
+    if estimated_max is not None and opponent_count is not None and opponent_count <= 5:
+        estimated_candidate = {
+            "kind": "prime",
+            "number": estimated_max,
+            "cards": [{}] * count,
+            "ranks": (),
+        }
+        if (
+            platinum_candidate_trump_strength(estimated_candidate)
+            >= DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH
+        ):
+            return "certain-likely", estimated_max
+
+    return "ride-or-recover", field_value or None
+
+
+def diamond_has_aaax(cpu: CpuPlayer) -> bool:
+    ace_count = sum(
+        1 for card in cpu.hand
+        if not is_joker(card) and int(card.get("rank", 0)) == 1
+    )
+    joker_count = sum(1 for card in cpu.hand if is_joker(card))
+    return ace_count >= 3 and joker_count >= 1
+
+
+def diamond_exact_1729_candidate(cpu: CpuPlayer) -> Optional[dict]:
+    cards = cards_for_ranks(cpu.hand, (1, 7, 2, 9))
+    if cards is None:
+        return None
+    return {
+        "kind": "prime",
+        "number": 1729,
+        "cards": cards,
+        "assigned_numbers": [],
+        "ranks": (1, 7, 2, 9),
+    }
+
+
+def diamond_1729_revolution_candidate(cpu: CpuPlayer, room) -> Optional[dict]:
+    if getattr(room, "field", []) or getattr(room, "reverse_order", False):
+        return None
+    if getattr(getattr(room, "rule", None), "special_numbers_composite_only", False):
+        return None
+    if not diamond_has_aaax(cpu):
+        return None
+    return diamond_exact_1729_candidate(cpu)
+
+
+def diamond_opponent_kjqj_probability(cpu: CpuPlayer, room) -> float:
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        probability = 1.0
+    elif opponent_count < 4:
+        probability = 0.0
+    else:
+        probability = diamond_requirement_union_probability(
+            cpu,
+            room,
+            (platinum_token_ranks("kjqj"),),
+            sample_size=opponent_count,
+            seed_value=13111211,
+        )
+    cpu.diamond_last_opponent_kjqj_probability = probability
+    return probability
+
+
+def diamond_1729_revolution_return_candidate(
+    cpu: CpuPlayer,
+    room,
+) -> Optional[dict]:
+    if (
+        not getattr(cpu, "diamond_revolution_strategy_active", False)
+        or not getattr(room, "reverse_order", False)
+        or getattr(getattr(room, "rule", None), "special_numbers_composite_only", False)
+        or diamond_has_aaax(cpu)
+    ):
+        return None
+    candidate = diamond_exact_1729_candidate(cpu)
+    if candidate is None or not candidate_is_playable(candidate, cpu, room):
+        return None
+    if len(candidate_consumed_cards(candidate)) == len(cpu.hand):
+        return candidate
+    if (
+        diamond_opponent_kjqj_probability(cpu, room)
+        >= DIAMOND_REVOLUTION_RETURN_MAX_KJQJ_PROBABILITY
+    ):
+        return None
+    return candidate
+
+
+def diamond_has_promising_normal_tactic(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> bool:
+    """R22 compatibility helper: only a current certain blocks initial 1729."""
+    return diamond_has_current_certain_trump(cpu, room)
+
+
 def choose_platinum_lead_action(
     cpu: CpuPlayer,
     room,
@@ -1006,6 +1584,11 @@ def platinum_legal_response_candidates(
         for candidate in dedupe_candidates(candidates)
         if candidate_is_playable(candidate, cpu, room)
     ]
+    if (
+        getattr(cpu, "diamond_revolution_strategy_active", False)
+        and field_count in DIAMOND_REVOLUTION_AVOID_COUNTS
+    ):
+        return []
     if allow_non_trump_joker:
         return candidates
     return [
@@ -1034,6 +1617,7 @@ def choose_platinum_interference_action(
     room,
     validator: NumberValidator,
     active_plan: Optional[dict] = None,
+    force: bool = False,
 ) -> Optional[CpuAction]:
     """Return a legal blocking play even when it does not complete our plan."""
     candidates = platinum_legal_response_candidates(cpu, room, validator)
@@ -1058,11 +1642,39 @@ def choose_platinum_interference_action(
     ]
     best_score = max(item[0] for item in scored)
     cpu.platinum_last_interference_score = best_score
-    if best_score < PLATINUM_INTERFERENCE_BORDER:
+    if not force and best_score < PLATINUM_INTERFERENCE_BORDER:
         return None
-    eligible = [item for item in scored if item[0] >= PLATINUM_INTERFERENCE_BORDER]
+    eligible = (
+        scored
+        if force
+        else [item for item in scored if item[0] >= PLATINUM_INTERFERENCE_BORDER]
+    )
     held_trumps = platinum_available_trump_candidates(cpu, room, validator)
-    if held_trumps:
+    if force and getattr(cpu, "cpu_key", "") == "diamond_planner":
+        empty_room = room_without_field(room)
+        held_certain = [
+            candidate for candidate in held_trumps
+            if diamond_candidate_certainty(candidate, cpu, empty_room) == "certain"
+        ]
+
+        def forced_interference_choice_key(item: tuple) -> tuple:
+            candidate = item[-1]
+            return (
+                1 if platinum_candidate_preserves_any(
+                    cpu, candidate, held_certain
+                ) else 0,
+                1 if platinum_candidate_preserves_any(
+                    cpu, candidate, held_trumps
+                ) else 0,
+                1 if candidate.get("kind") == "prime" else 0,
+                0 if step_uses_joker(candidate) else 1,
+                item[1],
+                item[0],
+                -item[2],
+            )
+
+        best = max(eligible, key=forced_interference_choice_key)
+    elif held_trumps:
         def interference_choice_key(item: tuple) -> tuple:
             candidate = item[-1]
             preserves_trump = platinum_candidate_preserves_any(
@@ -1197,7 +1809,16 @@ def platinum_mark_successful_interference(cpu: CpuPlayer, room) -> None:
     if count is None:
         return
     cpu.platinum_relaxed_opponent_min_hand_count = count
-    cpu.platinum_all_out_suppressed_opponent_min_hand_count = count
+    inferred_diamond_plan = (
+        getattr(cpu, "cpu_key", "") == "diamond_planner"
+        and getattr(cpu, "diamond_opponent_rally_threat", "none")
+        == "certain-likely"
+    )
+    cpu.platinum_all_out_suppressed_opponent_min_hand_count = (
+        count
+        if not inferred_diamond_plan or count <= 5
+        else None
+    )
     cpu.platinum_current_min_trump_strength = PLATINUM_RELAXED_TRUMP_STRENGTH
 
 
@@ -1437,7 +2058,14 @@ def choose_platinum_strong_plan(
         absolute = [plan for plan in candidates if platinum_plan_has_absolute_trump(plan, cpu)]
         if absolute:
             candidates = absolute
-    best = max(candidates, key=platinum_plan_sort_key)
+    best = max(
+        candidates,
+        key=(
+            (lambda plan: diamond_plan_sort_key(plan, cpu, room))
+            if getattr(cpu, "cpu_key", "") == "diamond_planner"
+            else platinum_plan_sort_key
+        ),
+    )
     cpu.platinum_last_strategy_score = platinum_plan_score(best)
     return best if platinum_plan_is_strong(best, cpu, room) else None
 
@@ -1465,20 +2093,1748 @@ def build_platinum_plans(
             and platinum_opening_multi_play_is_sound(cpu, plan)
         ]
         if strong:
-            strong.sort(key=platinum_plan_sort_key, reverse=True)
+            strong.sort(
+                key=(
+                    (lambda plan: diamond_plan_sort_key(plan, cpu, room))
+                    if getattr(cpu, "cpu_key", "") == "diamond_planner"
+                    else platinum_plan_sort_key
+                ),
+                reverse=True,
+            )
             return strong[:GOLD_PLAN_MAX_ALTERNATIVES]
     plans = [plan for plan in plans if platinum_opening_multi_play_is_sound(cpu, plan)]
-    plans.sort(key=platinum_plan_sort_key, reverse=True)
+    plans.sort(
+        key=(
+            (lambda plan: diamond_plan_sort_key(plan, cpu, room))
+            if getattr(cpu, "cpu_key", "") == "diamond_planner"
+            else platinum_plan_sort_key
+        ),
+        reverse=True,
+    )
     return plans[:GOLD_PLAN_MAX_ALTERNATIVES]
 
 
 def platinum_rally_count_order(cpu: CpuPlayer, non_joker_count: int) -> tuple[int, ...]:
     upper = min(9, non_joker_count)
     if len(cpu.hand) < PLATINUM_COMPRESSION_MIN_HAND_SIZE or upper < 5:
-        return tuple(range(1, upper + 1))
+        base_order = tuple(range(1, upper + 1))
+    else:
+        base_order = (
+            *range(upper, 4, -1),
+            *range(min(4, upper), 0, -1),
+        )
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        return diamond_rally_count_order(cpu, non_joker_count)
+    return base_order
+
+
+def diamond_preferred_counts(counts: Iterable[int]) -> tuple[int, ...]:
+    base = tuple(dict.fromkeys(int(count) for count in counts if int(count) > 0))
+    preferred = tuple(count for count in DIAMOND_PREFERRED_RALLY_COUNTS if count in base)
+    return preferred + tuple(count for count in base if count not in preferred)
+
+
+def diamond_rally_count_order(cpu: CpuPlayer, non_joker_count: int) -> tuple[int, ...]:
+    """Return the observable Diamond personality without excluding fallbacks."""
+    upper = min(9, non_joker_count)
+    if upper <= 0:
+        return ()
+    if len(cpu.hand) < PLATINUM_COMPRESSION_MIN_HAND_SIZE or upper < 5:
+        base_order = tuple(range(1, upper + 1))
+    else:
+        base_order = (
+            *range(upper, 4, -1),
+            *range(min(4, upper), 0, -1),
+        )
+    ordered = diamond_preferred_counts(base_order)
+    face_card_count = sum(
+        1
+        for card in cpu.hand
+        if not is_joker(card) and 10 <= int(card.get("rank", 0)) <= 13
+    )
+    if face_card_count >= 11 and 6 in ordered and 4 in ordered:
+        ordered = (6, 4) + tuple(
+            count for count in ordered if count not in {4, 6}
+        )
+    if getattr(cpu, "diamond_revolution_strategy_active", False):
+        ordered = tuple(
+            count for count in ordered
+            if count not in DIAMOND_REVOLUTION_AVOID_COUNTS
+        )
+    return ordered
+
+
+def diamond_kk_finish_available(cpu: CpuPlayer) -> bool:
+    visible_cards = cards_for_ranks(cpu.hand, (13, 13))
+    if visible_cards is None:
+        return False
+    entries = [
+        entry for entry in cpu.registered_composite_entries
+        if entry.value == 1313
+    ]
+    return material_for_composite_entries(
+        cpu.hand,
+        entries,
+        visible_cards,
+    ) is not None
+
+
+def diamond_non_certain_three_rally_supported(cpu: CpuPlayer) -> bool:
+    """Require a separate lock resource before trusting three non-certain rallies."""
+    joker_count = sum(1 for card in cpu.hand if is_joker(card))
+    kx_count = sum(
+        1
+        for card in cpu.hand
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
     return (
-        *range(upper, 4, -1),
-        *range(min(4, upper), 0, -1),
+        joker_count >= 2
+        or kx_count >= 4
+        or diamond_kk_finish_available(cpu)
+    )
+
+
+def diamond_conditional_return_probability_limit(
+    cpu: CpuPlayer,
+    *,
+    has_alternative: bool,
+) -> float:
+    limit = (
+        DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY
+        if has_alternative
+        else DIAMOND_CONDITIONAL_DESPERATE_MAX_RETURN_PROBABILITY
+    )
+    cpu.diamond_last_conditional_limit = limit
+    return limit
+
+
+def diamond_publicly_unaccounted_rank_counts(
+    cpu: CpuPlayer,
+    room,
+) -> tuple[dict[int, int], int]:
+    """Conservative standard-deck supply available to an opponent or one draw."""
+    seen = set()
+    accounted = []
+    for card in (
+        list(cpu.hand)
+        + list(getattr(room, "field", []) or [])
+        + list(getattr(room, "reserve", []) or [])
+        + list(getattr(cpu, "diamond_seen_cards", {}).values())
+    ):
+        key = card.get("card_id") or id(card)
+        if key in seen:
+            continue
+        seen.add(key)
+        accounted.append(card)
+
+    rank_counts = {rank: 4 for rank in range(1, 14)}
+    joker_count = 2
+    for card in accounted:
+        if is_joker(card):
+            joker_count = max(0, joker_count - 1)
+            continue
+        rank = int(card.get("rank", 0))
+        if rank in rank_counts:
+            rank_counts[rank] = max(0, rank_counts[rank] - 1)
+    return rank_counts, joker_count
+
+
+@lru_cache(maxsize=32)
+def diamond_counter_material_signatures(token: str) -> tuple[tuple[int, ...], ...]:
+    """Return every non-dominated face-display plus material requirement."""
+    value = platinum_token_value(token)
+    visible = platinum_token_ranks(token)
+    entries = generate_composite_expression_entries(
+        value,
+        token,
+        0,
+        max_entries=None,
+        minimum_jokers_only=False,
+    )
+    signatures = {
+        tuple(sorted(
+            visible
+            + tuple(
+                rank
+                for expression_token in entry.expression_tokens
+                if expression_token.kind == "cards"
+                for rank in expression_token.ranks
+            )
+        ))
+        for entry in entries
+    }
+
+    def dominates(left: tuple[int, ...], right: tuple[int, ...]) -> bool:
+        if len(left) >= len(right):
+            return False
+        left_counts = Counter(left)
+        right_counts = Counter(right)
+        return all(
+            left_counts.get(rank, 0) <= right_counts.get(rank, 0)
+            for rank in set(left_counts) | set(right_counts)
+        )
+
+    non_dominated = [
+        signature for signature in signatures
+        if not any(
+            other != signature and dominates(other, signature)
+            for other in signatures
+        )
+    ]
+    return tuple(sorted(non_dominated, key=lambda item: (len(item), item)))
+
+
+def diamond_requirement_is_physically_possible(
+    available: dict[int, int],
+    joker_count: int,
+    signature: tuple[int, ...],
+) -> bool:
+    required = Counter(signature)
+    deficit = sum(
+        max(0, count - available.get(rank, 0))
+        for rank, count in required.items()
+    )
+    return deficit <= joker_count
+
+
+def diamond_counter_token_is_physically_possible(
+    cpu: CpuPlayer,
+    room,
+    token: str,
+) -> bool:
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        return True
+    draw_allowance = 1 if getattr(room, "deck", []) else 0
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    hand_capacity = opponent_count + draw_allowance
+    return any(
+        len(signature) <= hand_capacity
+        and diamond_requirement_is_physically_possible(
+            available,
+            joker_count,
+            signature,
+        )
+        for signature in diamond_counter_material_signatures(token)
+    )
+
+
+def diamond_draw_satisfies_requirement(
+    drawn: Counter,
+    signature: tuple[int, ...],
+) -> bool:
+    required = Counter(signature)
+    joker_count = drawn.get(0, 0)
+    deficit = sum(
+        max(0, count - drawn.get(rank, 0))
+        for rank, count in required.items()
+    )
+    return deficit <= joker_count
+
+
+def diamond_requirement_union_probability(
+    cpu: CpuPlayer,
+    room,
+    signatures: Iterable[tuple[int, ...]],
+    *,
+    seed_value: int,
+    sample_size: Optional[int] = None,
+) -> float:
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        return 1.0
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    pool = [
+        rank
+        for rank, count in sorted(available.items())
+        for _ in range(count)
+    ] + [0] * joker_count
+    if sample_size is None:
+        sample_size = opponent_count + (1 if getattr(room, "deck", []) else 0)
+    sample_size = min(len(pool), max(0, int(sample_size)))
+    signature_tuple = tuple(dict.fromkeys(
+        signature for signature in signatures
+        if len(signature) <= sample_size
+        and diamond_requirement_is_physically_possible(
+            available,
+            joker_count,
+            signature,
+        )
+    ))
+    if not signature_tuple:
+        return 0.0
+
+    seed = int(seed_value) * 131 + sample_size
+    for rank in range(14):
+        count = joker_count if rank == 0 else available.get(rank, 0)
+        seed = (seed * 257 + rank * 17 + count) & ((1 << 64) - 1)
+    rng = random.Random(seed)
+    successes = 0
+    for _ in range(DIAMOND_RETURN_PROBABILITY_TRIALS):
+        drawn = Counter(rng.sample(pool, sample_size))
+        if any(
+            diamond_draw_satisfies_requirement(drawn, signature)
+            for signature in signature_tuple
+        ):
+            successes += 1
+    return successes / DIAMOND_RETURN_PROBABILITY_TRIALS
+
+
+def diamond_counter_return_probability(
+    candidate: dict,
+    cpu: CpuPlayer,
+    room,
+) -> float:
+    """Deterministic rank-level Monte Carlo over all practical counter forms."""
+    token = platinum_candidate_token(candidate)
+    if token == "kkkq" or token not in DIAMOND_FOUR_OBAKE_TOKENS:
+        return 0.0
+    value = platinum_token_value(token)
+    counter_tokens = tuple(
+        counter for counter in DIAMOND_FOUR_COUNTER_TOKENS
+        if (
+            platinum_token_value(counter) < value
+            if getattr(room, "reverse_order", False)
+            else platinum_token_value(counter) > value
+        )
+    )
+    feasible_tokens = tuple(
+        counter for counter in counter_tokens
+        if diamond_counter_token_is_physically_possible(cpu, room, counter)
+    )
+    cpu.diamond_last_obake_counter_tokens = feasible_tokens
+    cpu.diamond_last_return_candidates = feasible_tokens
+    if not feasible_tokens:
+        return 0.0
+
+    signatures = tuple(dict.fromkeys(
+        signature
+        for counter in feasible_tokens
+        for signature in diamond_counter_material_signatures(counter)
+    ))
+    return diamond_requirement_union_probability(
+        cpu,
+        room,
+        signatures,
+        seed_value=int(candidate.get("number", value)),
+    )
+
+
+def diamond_six_return_probability(
+    candidate: dict,
+    cpu: CpuPlayer,
+    room,
+) -> float:
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return 1.0
+    reverse = getattr(room, "reverse_order", False)
+    values = tuple(sorted(cpu.registered_primes))
+    index = (
+        cpu.prime_template_index
+        if getattr(cpu, "prime_template_index_values", ()) == values
+        else registered_prime_template_index(values, max_cards=6)
+    )
+    return_entries = tuple(
+        (number, tuple(ranks))
+        for number, ranks in index.templates_by_card_count.get(6, ())
+        if (number < value if reverse else number > value)
+    )
+    cpu.diamond_last_return_candidates = tuple(
+        str(number) for number in dict.fromkeys(number for number, _ in return_entries)
+    )
+    signatures = tuple(dict.fromkeys(ranks for _, ranks in return_entries))
+    return diamond_requirement_union_probability(
+        cpu,
+        room,
+        signatures,
+        seed_value=value,
+    )
+
+
+def diamond_candidate_return_probability(
+    candidate: Optional[dict],
+    cpu: CpuPlayer,
+    room,
+) -> float:
+    if not candidate:
+        return 1.0
+    visible_count = len(candidate.get("cards", []) or [])
+    if visible_count == 4 and candidate.get("kind") == "composite":
+        return diamond_counter_return_probability(candidate, cpu, room)
+    if visible_count == 6 and candidate.get("kind") == "prime":
+        return diamond_six_return_probability(candidate, cpu, room)
+    return 1.0
+
+
+def diamond_four_obake_certainty(
+    candidate: dict,
+    cpu: CpuPlayer,
+    room,
+) -> str:
+    token = platinum_candidate_token(candidate)
+    if token not in DIAMOND_FOUR_OBAKE_TOKENS:
+        return "unclassified"
+    if token == "kkkq":
+        cpu.diamond_last_obake_counter_tokens = ()
+        cpu.diamond_last_return_candidates = ()
+        cpu.diamond_last_return_probability = 0.0
+        return "certain"
+    probability = diamond_counter_return_probability(candidate, cpu, room)
+    cpu.diamond_last_return_probability = probability
+    return (
+        "conditional"
+        if cpu.diamond_last_obake_counter_tokens
+        else "certain"
+    )
+
+
+def diamond_candidate_certainty(
+    candidate: Optional[dict],
+    cpu: CpuPlayer,
+    room,
+) -> str:
+    if not candidate:
+        return "unclassified"
+    visible_count = len(candidate.get("cards", []) or [])
+    if platinum_candidate_token(candidate) == "kk":
+        return "certain"
+    if visible_count == 4 and candidate.get("kind") == "composite":
+        token = platinum_candidate_token(candidate)
+        if token in DIAMOND_FOUR_OBAKE_TOKENS:
+            return diamond_four_obake_certainty(candidate, cpu, room)
+        opponent_count = platinum_opponent_hand_count(cpu, room)
+        if (
+            opponent_count is not None
+            and opponent_count <= 18
+            and all(rank >= 10 for rank in candidate.get("ranks", ()))
+        ):
+            return "soft"
+        return "unclassified"
+    if visible_count != 6 or candidate.get("kind") != "prime":
+        return "unclassified"
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return "unclassified"
+    if (
+        not getattr(room, "reverse_order", False)
+        and value >= DIAMOND_SIX_CERTAIN_MIN_VALUE
+        and value in cpu.registered_primes
+    ):
+        return "certain"
+    if value > DIAMOND_SIX_SOFT_MIN_VALUE:
+        check_cpu_search_deadline(cpu)
+        probability = diamond_six_return_probability(candidate, cpu, room)
+        cpu.diamond_last_return_probability = probability
+        return (
+            "conditional"
+            if probability <= DIAMOND_CONDITIONAL_DESPERATE_MAX_RETURN_PROBABILITY
+            else "soft"
+        )
+    if value == DIAMOND_SIX_SOFT_MIN_VALUE:
+        return "soft"
+    return "unclassified"
+
+
+def diamond_four_obake_candidates(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> list[dict]:
+    validator = validator or gold_knowledge_number_validator
+    candidates = knowledge_composite_candidates(cpu, room, (4,))
+    candidates = [
+        candidate for candidate in candidates
+        if platinum_candidate_token(candidate) in DIAMOND_FOUR_OBAKE_TOKENS
+    ]
+    return sorted(
+        dedupe_candidates(candidates),
+        key=lambda candidate: candidate_strength(candidate, room),
+        reverse=True,
+    )
+
+
+def diamond_plan_trump_candidate(plan: Optional[dict]) -> Optional[dict]:
+    if not plan:
+        return None
+    index = gold_plan_trump_step_index(plan)
+    steps = plan.get("steps", [])
+    if index is None or index >= len(steps):
+        return None
+    return steps[index]
+
+
+def diamond_plan_certainty(plan: Optional[dict], cpu: CpuPlayer, room) -> str:
+    return diamond_candidate_certainty(
+        diamond_plan_trump_candidate(plan),
+        cpu,
+        room,
+    )
+
+
+def diamond_public_response_signatures(
+    cpu: CpuPlayer,
+    count: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Return known prime/composite response values with physical materials."""
+    cache = getattr(cpu, "diamond_public_response_signature_cache", None)
+    if cache is None:
+        cache = {}
+        cpu.diamond_public_response_signature_cache = cache
+    if count in cache:
+        return cache[count]
+    values = tuple(sorted(cpu.registered_primes))
+    index = (
+        cpu.prime_template_index
+        if getattr(cpu, "prime_template_index_values", ()) == values
+        else registered_prime_template_index(
+            values,
+            max_cards=cpu_max_knowledge_cards(cpu),
+        )
+    )
+    signatures = {
+        (int(value), tuple(sorted(ranks)))
+        for value, ranks in index.templates_by_card_count.get(count, ())
+    }
+    for entry in cpu.registered_composite_entries:
+        try:
+            visible = registered_pattern_cards(
+                entry.pattern,
+                allow_unencoded_value=True,
+            )
+        except ValueError:
+            continue
+        if len(visible) != count:
+            continue
+        materials = tuple(
+            rank
+            for token in entry.expression_tokens
+            if token.kind == "cards"
+            for rank in token.ranks
+        )
+        signatures.add((
+            int(entry.value),
+            tuple(sorted(tuple(visible) + materials)),
+        ))
+    result = tuple(sorted(
+        signatures,
+        key=lambda item: (item[0], len(item[1]), item[1]),
+    ))
+    cache[count] = result
+    return result
+
+
+def diamond_public_response_values(
+    candidate_value: int,
+    count: int,
+    cpu: CpuPlayer,
+    room,
+    *,
+    opponent_capacity: Optional[int] = None,
+) -> tuple[int, ...]:
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_capacity is None:
+        if opponent_count is None:
+            return (10**100,)
+        opponent_capacity = opponent_count + (
+            1 if getattr(room, "deck", []) else 0
+        )
+    if count > max(0, int(opponent_capacity)):
+        return ()
+
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    reverse = bool(getattr(room, "reverse_order", False))
+    responses = []
+    if count == 1 and joker_count > 0 and not reverse:
+        responses.append(10**100)
+    for value, signature in diamond_public_response_signatures(cpu, count):
+        if not (value < candidate_value if reverse else value > candidate_value):
+            continue
+        if len(signature) > opponent_capacity:
+            continue
+        if diamond_requirement_is_physically_possible(
+            available,
+            joker_count,
+            signature,
+        ):
+            responses.append(value)
+    return tuple(dict.fromkeys(responses))
+
+
+def diamond_candidate_is_publicly_uncounterable(
+    candidate: dict,
+    cpu: CpuPlayer,
+    room,
+    *,
+    opponent_capacity: Optional[int] = None,
+) -> bool:
+    if candidate.get("kind") == "joker_cut" or candidate.get("number") in {"X", 57}:
+        return True
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return False
+    count = len(candidate.get("cards", []) or [])
+    if count <= 0:
+        return False
+    return not diamond_public_response_values(
+        value,
+        count,
+        cpu,
+        room,
+        opponent_capacity=opponent_capacity,
+    )
+
+
+def diamond_estimated_opponent_max_value(
+    cpu: CpuPlayer,
+    room,
+    count: int,
+) -> Optional[int]:
+    """Estimate the strongest same-count value still physically available."""
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        return None
+    capacity = opponent_count + (1 if getattr(room, "deck", []) else 0)
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    values = []
+    if count == 1 and joker_count > 0 and not getattr(room, "reverse_order", False):
+        values.append(10**100)
+    for value, signature in diamond_public_response_signatures(cpu, count):
+        if len(signature) <= capacity and diamond_requirement_is_physically_possible(
+            available,
+            joker_count,
+            signature,
+        ):
+            values.append(value)
+    try:
+        field_value = int(getattr(room, "last_number", 0) or 0)
+    except (TypeError, ValueError):
+        field_value = 0
+    if field_value:
+        values.append(field_value)
+    if not values:
+        return None
+    return min(values) if getattr(room, "reverse_order", False) else max(values)
+
+
+def diamond_face_resource_return_probability(
+    candidate: dict,
+    cpu: CpuPlayer,
+    room,
+) -> Optional[float]:
+    """Approximate a response by the minimum face resources it consumes."""
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return None
+    count = len(candidate.get("cards", []) or [])
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if count <= 0 or opponent_count is None:
+        return None
+    sample_size = opponent_count + (1 if getattr(room, "deck", []) else 0)
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    reverse = bool(getattr(room, "reverse_order", False))
+    requirements = []
+    for response_value, signature in diamond_public_response_signatures(cpu, count):
+        if not (response_value < value if reverse else response_value > value):
+            continue
+        if len(signature) > sample_size:
+            continue
+        if not diamond_requirement_is_physically_possible(
+            available,
+            joker_count,
+            signature,
+        ):
+            continue
+        requirements.append(sum(1 for rank in signature if rank >= 10))
+    if count == 1 and joker_count > 0 and not reverse:
+        requirements.append(1)
+    if not requirements:
+        return 0.0
+
+    minimum_faces = min(requirements)
+    face_cards = joker_count + sum(
+        available.get(rank, 0) for rank in range(10, 14)
+    )
+    population = joker_count + sum(available.values())
+    sample_size = min(sample_size, population)
+    if population <= 0 or sample_size <= 0:
+        return 0.0
+    expected_faces = face_cards * sample_size / population
+    if minimum_faces < expected_faces + 1.0:
+        return None
+    denominator = comb(population, sample_size)
+    if denominator <= 0:
+        return None
+    lower = max(minimum_faces, 0)
+    upper = min(face_cards, sample_size)
+    probability = sum(
+        comb(face_cards, drawn_faces)
+        * comb(population - face_cards, sample_size - drawn_faces)
+        for drawn_faces in range(lower, upper + 1)
+        if 0 <= sample_size - drawn_faces <= population - face_cards
+    ) / denominator
+    return probability
+
+
+def diamond_post_all_out_candidate_certainty(
+    candidate: Optional[dict],
+    cpu: CpuPlayer,
+    room,
+) -> str:
+    if not candidate:
+        return "unclassified"
+    # KQQJ is a useful contextual conditional, but the coarse face-resource
+    # estimate must never turn a zero sample estimate into certain-like play.
+    # It is admitted later only after the opponent has fallen to 20 cards.
+    if platinum_candidate_token(candidate) == "kqqj":
+        candidate.pop("_diamond_face_lock", None)
+        candidate["_diamond_return_probability"] = 1.0
+        candidate["_diamond_post_all_out_certainty"] = "conditional"
+        return "conditional"
+    cached = candidate.get("_diamond_post_all_out_certainty")
+    if cached:
+        return str(cached)
+    certainty = diamond_candidate_certainty(candidate, cpu, room)
+    if certainty == "conditional":
+        candidate["_diamond_return_probability"] = float(
+            getattr(cpu, "diamond_last_return_probability", 1.0)
+        )
+    if certainty == "certain" or diamond_candidate_is_publicly_uncounterable(
+        candidate,
+        cpu,
+        room,
+    ):
+        result = "certain"
+        candidate["_diamond_post_all_out_certainty"] = result
+        return result
+    if certainty in {"conditional", "soft"}:
+        candidate["_diamond_post_all_out_certainty"] = certainty
+        return certainty
+    face_probability = diamond_face_resource_return_probability(
+        candidate,
+        cpu,
+        room,
+    )
+    if face_probability is not None and face_probability <= 0.80:
+        candidate["_diamond_return_probability"] = face_probability
+        candidate["_diamond_face_lock"] = True
+        result = "conditional" if face_probability <= 0.30 else "soft"
+        candidate["_diamond_post_all_out_certainty"] = result
+        return result
+    strength = platinum_candidate_trump_strength(candidate)
+    if strength >= DIAMOND_POST_ALL_OUT_CONDITIONAL_MIN_TRUMP_STRENGTH:
+        result = "conditional"
+    elif strength >= DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH:
+        result = "soft"
+    else:
+        result = "unclassified"
+    candidate["_diamond_post_all_out_certainty"] = result
+    return result
+
+
+def diamond_post_all_out_plan_certainty(
+    plan: dict,
+    cpu: CpuPlayer,
+    room,
+) -> str:
+    override = plan.get("diamond_certainty_override")
+    if override:
+        return str(override)
+    trump = diamond_plan_trump_candidate(plan)
+    certainty = diamond_post_all_out_candidate_certainty(trump, cpu, room)
+    if certainty != "certain" or trump is None:
+        return certainty
+    if diamond_candidate_certainty(trump, cpu, room) == "certain":
+        return "certain"
+
+    # Public information can prove a single candidate uncounterable, but that
+    # does not prove a whole route: an opponent may spend an equal trump on an
+    # earlier weak rally (for example 7 -> K while we hold both jokers).
+    rally_steps = [
+        step
+        for step in plan.get("steps", [])
+        if str(step.get("role", "")).startswith("rally-")
+    ]
+    if rally_steps and all(
+        diamond_candidate_is_publicly_uncounterable(step, cpu, room)
+        for step in rally_steps
+    ):
+        return "certain"
+    return "conditional"
+
+
+def diamond_plan_rally_step_count(plan: dict) -> int:
+    return sum(
+        1
+        for step in plan.get("steps", [])
+        if str(step.get("role", "")).startswith("rally-")
+    )
+
+
+def diamond_plan_finish_strength(plan: dict) -> int:
+    """Score the post-trump finish using the reviewed K/X/57/KK formula."""
+    steps = list(plan.get("steps", []))
+    trump_index = gold_plan_trump_step_index(plan)
+    tail_start = 0 if trump_index is None else trump_index + 1
+    tail = steps[tail_start:]
+    finish = next(
+        (step for step in reversed(tail) if step.get("role") == "finish"),
+        None,
+    )
+    finish_count = (
+        len(candidate_consumed_cards(finish)) if finish is not None else 0
+    )
+    resource_cards = {
+        card.get("card_id"): card
+        for step in tail
+        for card in candidate_consumed_cards(step)
+    }.values()
+    kings = sum(
+        1
+        for card in resource_cards
+        if not is_joker(card) and int(card.get("rank", 0)) == 13
+    )
+    jokers = sum(1 for card in resource_cards if is_joker(card))
+    cut_57_pairs = sum(1 for step in tail if step.get("number") == 57)
+
+    kk_bonus = 0
+    kk_indices = [
+        index
+        for index, step in enumerate(steps)
+        if platinum_candidate_token(step) == "kk"
+    ]
+    for index in kk_indices:
+        previous = steps[index - 1] if index > 0 else None
+        previous_count = len(previous.get("cards", [])) if previous else None
+        if previous_count != 2:
+            kk_bonus = 5
+            break
+    return finish_count + cut_57_pairs + kings * 3 + jokers * 5 + kk_bonus
+
+
+def diamond_post_all_out_plan_tier(
+    plan: dict,
+    cpu: CpuPlayer,
+    room,
+) -> Optional[int]:
+    certainty = diamond_post_all_out_plan_certainty(plan, cpu, room)
+    rally_steps = diamond_plan_rally_step_count(plan)
+    rally_count = int(plan.get("rally_count", 0) or 0)
+    preferred = rally_count in DIAMOND_PREFERRED_RALLY_COUNTS
+    if (
+        certainty != "certain"
+        and rally_steps == 3
+        and not diamond_non_certain_three_rally_supported(cpu)
+    ):
+        return None
+    if certainty == "certain":
+        if rally_steps <= 2:
+            return 1 if preferred else 2
+        if rally_steps == 3:
+            return 3 if preferred else 4
+        if rally_steps == 4 and rally_count <= 6:
+            return 5
+        return None
+
+    trump = diamond_plan_trump_candidate(plan)
+    if trump is None or rally_steps > DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS:
+        return None
+    strength = platinum_candidate_trump_strength(trump)
+    if platinum_candidate_token(trump) == "kqqj":
+        opponent_count = platinum_opponent_hand_count(cpu, room)
+        if (
+            opponent_count is None
+            or opponent_count > DIAMOND_KQQJ_CONTEXTUAL_MAX_OPPONENT_HAND_SIZE
+        ):
+            return None
+        return 8
+    # A face-resource estimate is only an approximate conditional signal.
+    # Even a computed 0% must not promote it to the strong tier-6 path.
+    if (
+        trump.get("_diamond_face_lock")
+        and float(trump.get("_diamond_return_probability", 1.0)) <= 0.0
+    ):
+        return 9
+    if certainty == "conditional":
+        return_probability = trump.get("_diamond_return_probability")
+        if return_probability is None:
+            return_probability = diamond_candidate_return_probability(
+                trump,
+                cpu,
+                room,
+            )
+            trump["_diamond_return_probability"] = return_probability
+        return_probability = float(return_probability)
+        if (
+            return_probability
+            <= DIAMOND_POST_ALL_OUT_STRONG_CONDITIONAL_MAX_RETURN_PROBABILITY
+        ):
+            return 6
+        if strength >= DIAMOND_POST_ALL_OUT_CONDITIONAL_MIN_TRUMP_STRENGTH:
+            return 8
+    if strength >= DIAMOND_POST_ALL_OUT_CONDITIONAL_MIN_TRUMP_STRENGTH:
+        return 8
+    if strength >= DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH:
+        return 9
+    return None
+
+
+def diamond_post_all_out_plan_sort_key(
+    plan: dict,
+    cpu: CpuPlayer,
+    room,
+) -> tuple:
+    tier = diamond_post_all_out_plan_tier(plan, cpu, room)
+    if tier is None:
+        return (-99,)
+    rally_steps = [
+        step
+        for step in plan.get("steps", [])
+        if str(step.get("role", "")).startswith("rally-")
+    ]
+    second_strength = (
+        candidate_strength(rally_steps[1], room)
+        if len(rally_steps) >= 2
+        else -1
+    )
+    trump = diamond_plan_trump_candidate(plan) or {}
+    opponent_count = getattr(cpu, "diamond_opponent_rally_count", None)
+    avoids_opponent_count = (
+        opponent_count is None
+        or int(plan.get("rally_count", 0) or 0) != opponent_count
+    )
+    finish_strength = diamond_plan_finish_strength(plan)
+    return (
+        -tier,
+        1 if avoids_opponent_count else 0,
+        -diamond_plan_rally_step_count(plan),
+        second_strength if tier == 3 else 0,
+        finish_strength,
+        0 if step_uses_joker(trump) else 1,
+        candidate_strength(trump, room) if trump else -1,
+        platinum_plan_score(plan),
+        gold_plan_score(plan),
+    )
+
+
+def diamond_post_all_out_search_has_time(cpu: CpuPlayer) -> bool:
+    deadline = getattr(cpu, "decision_deadline", None)
+    return (
+        deadline is None
+        or time.perf_counter() + DIAMOND_POST_ALL_OUT_SEARCH_RESERVE_SECONDS
+        < deadline
+    )
+
+
+def diamond_forced_pass_plans(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    """Build pass-forcing mixed-count routes, including K -> K -> finish."""
+    if getattr(room, "field", []) or []:
+        return []
+    empty_room = room_without_field(room)
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is None:
+        return []
+    draw_increment = 1 if getattr(room, "deck", []) else 0
+    results = []
+    seen = set()
+
+    def visit(current_cpu: CpuPlayer, selected: list[dict], depth: int) -> None:
+        if len(results) >= DIAMOND_POST_ALL_OUT_RESULT_CAP:
+            return
+        if not diamond_post_all_out_search_has_time(current_cpu):
+            return
+        tail = choose_gold_finish_tail(current_cpu, empty_room, validator)
+        if selected and tail:
+            sequence = selected + tail
+            key = tuple(candidate_fingerprint(step) for step in sequence)
+            if key not in seen:
+                seen.add(key)
+                plan = finalize_gold_plan(
+                    cpu,
+                    empty_room,
+                    sequence,
+                    len(selected[0].get("cards", [])),
+                )
+                plan["diamond_forced_pass"] = True
+                plan["diamond_certainty_override"] = "certain"
+                results.append(plan)
+            return
+        if depth >= DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS:
+            return
+
+        non_joker_count = len([
+            card for card in current_cpu.hand if not is_joker(card)
+        ])
+        counts = diamond_rally_count_order(current_cpu, non_joker_count)
+        candidates = gold_plan_candidates(current_cpu, empty_room, counts, validator)
+        for count in counts:
+            if count <= 9:
+                candidates.extend(joker_prime_candidates_for_count(
+                    current_cpu,
+                    empty_room,
+                    count,
+                    validator,
+                ))
+        candidates.extend(gold_special_cut_candidates(current_cpu, empty_room))
+        capacity = opponent_count + draw_increment * (depth + 1)
+        candidates = [
+            candidate
+            for candidate in dedupe_candidates(candidates)
+            if len(candidate_consumed_cards(candidate)) < len(current_cpu.hand)
+            and diamond_candidate_is_publicly_uncounterable(
+                candidate,
+                current_cpu,
+                empty_room,
+                opponent_capacity=capacity,
+            )
+        ]
+        candidates.sort(key=lambda candidate: (
+            1 if len(candidate.get("cards", [])) in DIAMOND_PREFERRED_RALLY_COUNTS else 0,
+            len(candidate_consumed_cards(candidate)),
+            0 if step_uses_joker(candidate) else 1,
+            -candidate_strength(candidate, empty_room),
+        ), reverse=True)
+        for candidate in candidates[:gold_branch_candidate_cap(current_cpu)]:
+            step = dict(candidate)
+            step["role"] = f"rally-{len(candidate.get('cards', []))}"
+            child = temporary_cpu_with_hand(
+                current_cpu,
+                remaining_cards(
+                    current_cpu.hand,
+                    candidate_consumed_cards(candidate),
+                ),
+            )
+            visit(child, selected + [step], depth + 1)
+
+    visit(cpu, [], 0)
+    return results
+
+
+def diamond_reserved_trump_plans(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    counts: Iterable[int],
+) -> list[dict]:
+    """Search backwards from a strong trump before the general five-step tree."""
+    if getattr(room, "field", []) or []:
+        return []
+    empty_room = room_without_field(room)
+    results = []
+    seen = set()
+    for rally_count in counts:
+        if not diamond_post_all_out_search_has_time(cpu):
+            break
+        trump_candidates = gold_plan_candidates(
+            cpu,
+            empty_room,
+            (rally_count,),
+            validator,
+        )
+        if rally_count <= 9:
+            trump_candidates.extend(joker_prime_candidates_for_count(
+                cpu,
+                empty_room,
+                rally_count,
+                validator,
+            ))
+        trump_candidates = [
+            candidate
+            for candidate in dedupe_candidates(trump_candidates)
+            if len(candidate_consumed_cards(candidate)) < len(cpu.hand)
+            and (
+                diamond_post_all_out_candidate_certainty(
+                    candidate,
+                    cpu,
+                    room,
+                )
+                in {"certain", "conditional"}
+                or platinum_candidate_trump_strength(candidate)
+                >= DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH
+            )
+        ]
+        trump_candidates.sort(key=lambda candidate: (
+            {
+                "unclassified": 0,
+                "soft": 1,
+                "conditional": 2,
+                "certain": 3,
+            }.get(
+                diamond_post_all_out_candidate_certainty(
+                    candidate,
+                    cpu,
+                    room,
+                ),
+                0,
+            ),
+            platinum_candidate_trump_strength(candidate),
+            0 if step_uses_joker(candidate) else 1,
+            -len(candidate_consumed_cards(candidate)),
+        ), reverse=True)
+
+        for trump in trump_candidates[:gold_last_candidate_cap(cpu)]:
+            if not diamond_post_all_out_search_has_time(cpu):
+                break
+            reserved = remaining_cards(
+                cpu.hand,
+                candidate_consumed_cards(trump),
+            )
+            reserved_cpu = temporary_cpu_with_hand(cpu, reserved)
+            trump_strength = candidate_strength(trump, empty_room)
+
+            def visit(
+                current_cpu: CpuPlayer,
+                bound_strength: int,
+                selected_desc: list[dict],
+            ) -> None:
+                if len(results) >= DIAMOND_POST_ALL_OUT_RESULT_CAP:
+                    return
+                if not diamond_post_all_out_search_has_time(current_cpu):
+                    return
+                tail = choose_gold_finish_tail(current_cpu, empty_room, validator)
+                if tail:
+                    sequence = list(reversed(selected_desc)) + [trump] + tail
+                    key = tuple(candidate_fingerprint(step) for step in sequence)
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(finalize_gold_plan(
+                            cpu,
+                            empty_room,
+                            sequence,
+                            rally_count,
+                        ))
+                    return
+                if len(selected_desc) >= DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS - 1:
+                    return
+
+                branches = gold_plan_candidates(
+                    current_cpu,
+                    empty_room,
+                    (rally_count,),
+                    validator,
+                )
+                if rally_count <= 9:
+                    branches.extend(joker_prime_candidates_for_count(
+                        current_cpu,
+                        empty_room,
+                        rally_count,
+                        validator,
+                    ))
+                branches = [
+                    candidate
+                    for candidate in dedupe_candidates(branches)
+                    if len(candidate_consumed_cards(candidate)) < len(current_cpu.hand)
+                    and candidate_strength(candidate, empty_room) < bound_strength
+                ]
+                branches.sort(key=lambda candidate: (
+                    0 if step_uses_joker(candidate) else 1,
+                    candidate_strength(candidate, empty_room),
+                    -len(candidate_consumed_cards(candidate)),
+                ), reverse=True)
+                for branch in branches[:gold_branch_candidate_cap(current_cpu)]:
+                    child = temporary_cpu_with_hand(
+                        current_cpu,
+                        remaining_cards(
+                            current_cpu.hand,
+                            candidate_consumed_cards(branch),
+                        ),
+                    )
+                    visit(
+                        child,
+                        candidate_strength(branch, empty_room),
+                        selected_desc + [branch],
+                    )
+
+            visit(reserved_cpu, trump_strength, [])
+    return results
+
+
+def diamond_post_all_out_plans(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    plans = []
+    field_count = len(getattr(room, "field", []) or [])
+    non_joker_count = len([card for card in cpu.hand if not is_joker(card)])
+    count_order = (
+        (field_count,)
+        if field_count
+        else diamond_rally_count_order(cpu, non_joker_count)
+    )
+    preferred = tuple(
+        count for count in count_order if count in DIAMOND_PREFERRED_RALLY_COUNTS
+    )
+    fallback = tuple(count for count in count_order if count not in preferred)
+
+    plans.extend(diamond_reserved_trump_plans(
+        cpu,
+        room,
+        validator,
+        preferred,
+    ))
+    if any(diamond_post_all_out_plan_tier(plan, cpu, room) == 1 for plan in plans):
+        return plans
+    plans.extend(diamond_reserved_trump_plans(
+        cpu,
+        room,
+        validator,
+        fallback,
+    ))
+    if any(
+        diamond_post_all_out_plan_tier(plan, cpu, room) in {1, 2}
+        for plan in plans
+    ):
+        return plans
+    plans.extend(diamond_forced_pass_plans(cpu, room, validator))
+    if any(
+        diamond_post_all_out_plan_tier(plan, cpu, room) in {1, 2}
+        for plan in plans
+    ):
+        return plans
+
+    def search(counts: Iterable[int]) -> None:
+        for rally_count in counts:
+            if not diamond_post_all_out_search_has_time(cpu):
+                return
+            try:
+                found = search_same_count_gold_plans(
+                    cpu,
+                    room,
+                    rally_count,
+                    PLATINUM_PLAN_MAX_STEPS,
+                    validator,
+                )
+            except CpuSearchDeadline:
+                if plans:
+                    return
+                raise
+            plans.extend(
+                plan
+                for plan in found
+                if is_executable_gold_plan(plan, cpu)
+                and diamond_plan_rally_step_count(plan) > 0
+            )
+
+    search(preferred)
+    if any(diamond_post_all_out_plan_tier(plan, cpu, room) == 1 for plan in plans):
+        return plans
+    search(fallback)
+    unique = {}
+    for plan in plans:
+        key = tuple(candidate_fingerprint(step) for step in plan.get("steps", []))
+        unique[key] = plan
+    return list(unique.values())
+
+
+def diamond_draw_can_create_four_card_overtrump(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> bool:
+    if (
+        len(cpu.hand) < DIAMOND_POST_ALL_OUT_DRAW_RESPONSE_MIN_HAND_SIZE
+        or len(getattr(room, "field", []) or []) != 4
+        or getattr(room, "has_drawn", False)
+        or not getattr(room, "deck", [])
+    ):
+        return False
+    threshold = max(
+        int(getattr(room, "last_number", 0) or 0),
+        platinum_token_value("kjqj"),
+    )
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    ranks = [rank for rank, count in available.items() if count > 0]
+    if joker_count:
+        ranks.append(0)
+    for rank in ranks:
+        synthetic = {
+            "card_id": f"diamond-one-draw-{rank}",
+            "suit": "X" if rank == 0 else "?",
+            "rank": rank,
+            "is_joker": rank == 0,
+        }
+        child = temporary_cpu_with_hand(cpu, cpu.hand + [synthetic])
+        candidates = gold_plan_candidates(child, room, (4,), validator)
+        candidates.extend(joker_prime_candidates_for_count(
+            child,
+            room,
+            4,
+            validator,
+        ))
+        if any(
+            candidate_is_playable(candidate, child, room)
+            and int(candidate.get("number", 0)) > threshold
+            for candidate in dedupe_candidates(candidates)
+            if candidate.get("number") != "X"
+        ):
+            return True
+    return False
+
+
+def diamond_threat_closing_response_candidate(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[dict]:
+    field_count = len(getattr(room, "field", []) or [])
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if (
+        field_count <= 0
+        or opponent_count is None
+        or (
+            opponent_count > 5
+            and getattr(cpu, "diamond_opponent_rally_threat", "none")
+            != "certain-likely"
+        )
+    ):
+        return None
+    estimated = diamond_estimated_opponent_max_value(cpu, room, field_count)
+    if estimated is None:
+        return None
+    target_strength = (
+        -estimated if getattr(room, "reverse_order", False) else estimated
+    )
+    candidates = [
+        candidate
+        for candidate in platinum_legal_response_candidates(
+            cpu,
+            room,
+            validator,
+            allow_non_trump_joker=True,
+        )
+        if candidate_strength(candidate, room) >= target_strength
+    ]
+    if not candidates:
+        return None
+
+    def closing_key(candidate: dict) -> tuple:
+        remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+        child = temporary_cpu_with_hand(cpu, remaining)
+        tail = choose_gold_finish_tail(child, room_without_field(room), validator)
+        return (
+            1 if tail else 0,
+            0 if step_uses_joker(candidate) else 1,
+            -candidate_strength(candidate, room),
+            len(candidate_consumed_cards(candidate)),
+        )
+
+    return max(candidates, key=closing_key)
+
+
+def choose_diamond_context_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    context = diamond_tactical_context(cpu, room)
+    cpu.diamond_last_context = context
+    if context not in DIAMOND_POST_ALL_OUT_CONTEXTS:
+        return None
+    if getattr(cpu, "gold_active_plan", None):
+        return None
+
+    finish = platinum_one_move_finish_candidate(cpu, room, validator)
+    if finish is not None:
+        action = platinum_commit_play(cpu, candidate_to_action(finish))
+        return diamond_record_action(
+            cpu,
+            action,
+            room,
+            "context-finish",
+            finish,
+        )
+
+    if getattr(room, "field", []) or []:
+        closing = diamond_threat_closing_response_candidate(
+            cpu,
+            room,
+            validator,
+        )
+        if closing is not None:
+            clear_gold_active_plan(cpu)
+            action = platinum_commit_play(cpu, candidate_to_action(closing))
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "threat-closing-response",
+                closing,
+            )
+        if diamond_draw_can_create_four_card_overtrump(cpu, room, validator):
+            clear_gold_active_plan(cpu)
+            cpu.diamond_last_route_kind = "four-card-overtrump-draw"
+            cpu.diamond_last_certainty = "conditional"
+            return CpuAction("draw")
+
+    plans = diamond_post_all_out_plans(cpu, room, validator)
+    eligible = [
+        plan
+        for plan in plans
+        if diamond_post_all_out_plan_tier(plan, cpu, room) is not None
+    ]
+    if not eligible:
+        return None
+    best = max(
+        eligible,
+        key=lambda plan: diamond_post_all_out_plan_sort_key(plan, cpu, room),
+    )
+    tier = diamond_post_all_out_plan_tier(best, cpu, room)
+    if (
+        tier is not None
+        and tier >= 8
+        and not getattr(room, "has_drawn", False)
+        and getattr(room, "deck", [])
+        and platinum_deck_has_expected_trump_contribution(cpu, room)
+    ):
+        clear_gold_active_plan(cpu)
+        cpu.diamond_last_route_kind = "post-all-out-recovery-draw"
+        cpu.diamond_last_certainty = diamond_post_all_out_plan_certainty(
+            best,
+            cpu,
+            room,
+        )
+        return CpuAction("draw")
+
+    best["diamond_tier"] = tier
+    best["diamond_finish_strength"] = diamond_plan_finish_strength(best)
+    set_gold_active_plan(cpu, best)
+    action = play_next_gold_plan_step(cpu, room, validator)
+    if action is None:
+        clear_gold_active_plan(cpu)
+        return None
+    action = platinum_commit_play(cpu, action)
+    cpu.diamond_active_route = best
+    cpu.diamond_last_plan_tier = tier
+    cpu.diamond_last_finish_strength = best["diamond_finish_strength"]
+    recorded = diamond_record_action(
+        cpu,
+        action,
+        room,
+        f"post-all-out-tier-{tier}",
+    )
+    cpu.diamond_last_certainty = diamond_post_all_out_plan_certainty(
+        best,
+        cpu,
+        room,
+    )
+    return recorded
+
+
+def diamond_recovery_draw_count(cpu: CpuPlayer, room) -> int:
+    if hasattr(room, "public_unknown_deck_count"):
+        deck_count = max(0, int(room.public_unknown_deck_count)) + len(
+            getattr(room, "public_known_deck_bottom", []) or []
+        )
+    else:
+        deck_count = len(getattr(room, "deck", []) or [])
+    if deck_count <= 0:
+        return 0
+    penalty_rule = getattr(getattr(room, "rule", None), "penalty_rule", None)
+    requested = 1 if getattr(penalty_rule, "name", "") == "ALWAYS_1" else len(cpu.hand)
+    return min(max(0, requested), deck_count)
+
+
+def diamond_recovery_draw_model(
+    cpu: CpuPlayer,
+    room,
+) -> tuple[list[int], list[Card], int]:
+    """Return unknown-rank pool, guaranteed bottom cards reached, and draw count."""
+    draw_count = diamond_recovery_draw_count(cpu, room)
+    if draw_count <= 0:
+        return [], [], 0
+    known_bottom = list(getattr(room, "public_known_deck_bottom", []) or [])
+    if hasattr(room, "public_unknown_deck_count"):
+        unknown_deck_count = max(0, int(room.public_unknown_deck_count))
+    else:
+        unknown_deck_count = max(
+            0,
+            len(getattr(room, "deck", []) or []) - len(known_bottom),
+        )
+    unknown_draw_count = min(draw_count, unknown_deck_count)
+    known_draw_count = min(
+        len(known_bottom),
+        max(0, draw_count - unknown_deck_count),
+    )
+    guaranteed = known_bottom[:known_draw_count]
+
+    available, joker_count = diamond_publicly_unaccounted_rank_counts(cpu, room)
+    for card in known_bottom:
+        if is_joker(card):
+            joker_count = max(0, joker_count - 1)
+        else:
+            rank = int(card.get("rank", 0))
+            if rank in available:
+                available[rank] = max(0, available[rank] - 1)
+    pool = [
+        rank
+        for rank, count in sorted(available.items())
+        for _ in range(count)
+    ] + [0] * joker_count
+    return pool, guaranteed, min(unknown_draw_count, len(pool))
+
+
+def diamond_recovery_certain_probability(cpu: CpuPlayer, room) -> float:
+    """Estimate P(no certain -> certain) from a failed all-out recovery."""
+    if diamond_has_current_certain_trump(cpu, room):
+        cpu.diamond_last_recovery_certain_probability = 0.0
+        cpu.diamond_last_recovery_guaranteed_kx = 0
+        cpu.diamond_recovery_targets = ()
+        cpu.diamond_recovery_cache_key = None
+        return 0.0
+
+    def public_card_key(card: Card) -> tuple:
+        return (
+            str(card.get("card_id", "")),
+            0 if is_joker(card) else int(card.get("rank", 0)),
+        )
+
+    cache_key = (
+        tuple(sorted(public_card_key(card) for card in cpu.hand)),
+        tuple(public_card_key(card) for card in getattr(room, "field", []) or []),
+        tuple(public_card_key(card) for card in getattr(room, "reserve", []) or []),
+        tuple(
+            public_card_key(card)
+            for card in getattr(room, "public_known_deck_bottom", []) or []
+        ),
+        int(getattr(room, "public_unknown_deck_count", 0) or 0),
+        len(getattr(room, "deck", []) or []),
+        platinum_opponent_hand_count(cpu, room),
+        bool(getattr(room, "reverse_order", False)),
+    )
+    if cache_key == getattr(cpu, "diamond_recovery_cache_key", None):
+        return float(cpu.diamond_last_recovery_certain_probability)
+    cpu.diamond_recovery_cache_key = cache_key
+
+    pool, guaranteed, unknown_draw_count = diamond_recovery_draw_model(cpu, room)
+    guaranteed_kx = sum(
+        1
+        for card in guaranteed
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
+    non_kx_pool = sum(1 for rank in pool if rank not in {0, 13})
+    guaranteed_kx += max(0, unknown_draw_count - non_kx_pool)
+    cpu.diamond_last_recovery_guaranteed_kx = guaranteed_kx
+
+    if unknown_draw_count <= 0:
+        probability = 1.0 if (
+            guaranteed
+            and diamond_has_current_certain_trump(
+                temporary_cpu_with_hand(cpu, cpu.hand + guaranteed),
+                room,
+            )
+        ) else 0.0
+        targets = {
+            0 if is_joker(card) else int(card.get("rank", 0))
+            for card in guaranteed
+            if is_joker(card) or int(card.get("rank", 0)) == 13
+        }
+        cpu.diamond_recovery_targets = tuple(sorted(targets))
+        cpu.diamond_last_recovery_certain_probability = probability
+        return probability
+
+    seed = len(cpu.hand) * 1009 + unknown_draw_count * 9176 + len(pool)
+    for card in cpu.hand:
+        rank = 0 if is_joker(card) else int(card.get("rank", 0))
+        seed = (seed * 257 + rank + 1) & ((1 << 64) - 1)
+    rng = random.Random(seed)
+    successes = 0
+    success_ranks = Counter()
+    all_ranks = Counter()
+    for trial in range(DIAMOND_RECOVERY_PROBABILITY_TRIALS):
+        sampled = rng.sample(pool, unknown_draw_count)
+        present = set(sampled)
+        all_ranks.update(present)
+        synthetic = [
+            {
+                "card_id": f"diamond-recovery-{trial}-{index}",
+                "suit": "X" if rank == 0 else "?",
+                "rank": rank,
+                "is_joker": rank == 0,
+            }
+            for index, rank in enumerate(sampled)
+        ]
+        child = temporary_cpu_with_hand(cpu, cpu.hand + guaranteed + synthetic)
+        if diamond_has_current_certain_trump(child, room):
+            successes += 1
+            success_ranks.update(present)
+    probability = successes / DIAMOND_RECOVERY_PROBABILITY_TRIALS
+    target_scores = []
+    if successes:
+        for rank in success_ranks:
+            lift = (
+                success_ranks[rank] / successes
+                - all_ranks[rank] / DIAMOND_RECOVERY_PROBABILITY_TRIALS
+            )
+            if lift > 0:
+                target_scores.append((lift, success_ranks[rank], rank))
+    targets = {
+        0 if is_joker(card) else int(card.get("rank", 0))
+        for card in guaranteed
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    }
+    targets.update(rank for _, _, rank in sorted(target_scores, reverse=True)[:3])
+    cpu.diamond_recovery_targets = tuple(sorted(targets))
+    cpu.diamond_last_recovery_certain_probability = probability
+    return probability
+
+
+def diamond_recovery_has_certain_prospect(cpu: CpuPlayer, room) -> bool:
+    """R20 gate before relaxing a conditional plan from 30% to 80%."""
+    probability = diamond_recovery_certain_probability(cpu, room)
+    return (
+        cpu.diamond_last_recovery_guaranteed_kx >= 1
+        or probability >= DIAMOND_RECOVERY_CERTAIN_MIN_PROBABILITY
+    )
+
+
+def diamond_conditional_plan_is_acceptable(
+    plan: dict,
+    cpu: CpuPlayer,
+    room,
+) -> bool:
+    trump = diamond_plan_trump_candidate(plan)
+    if diamond_candidate_certainty(trump, cpu, room) != "conditional":
+        return False
+    probability = diamond_candidate_return_probability(trump, cpu, room)
+    has_alternative = (
+        diamond_has_current_certain_trump(cpu, room)
+        or diamond_recovery_has_certain_prospect(cpu, room)
+    )
+    limit = diamond_conditional_return_probability_limit(
+        cpu,
+        has_alternative=has_alternative,
+    )
+    return probability <= limit
+
+
+def diamond_revolution_candidate_tier(candidate: dict, cpu: CpuPlayer) -> int:
+    if not candidate:
+        return 0
+    if candidate.get("kind") == "joker_cut" or candidate.get("number") in {"X", 57}:
+        return 5
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return 0
+    text = str(value)
+    ranks = tuple(int(rank) for rank in (candidate.get("ranks") or ()))
+    if value == 10 or text.startswith("101"):
+        return 5
+    if ranks and ranks[0] == 1:
+        return 4
+    if ranks and all(1 <= rank <= 9 for rank in ranks):
+        return 3
+    return 2
+
+
+def diamond_plan_sort_key(plan: dict, cpu: CpuPlayer, room) -> tuple:
+    check_cpu_search_deadline(cpu)
+    certainty_tiers = {
+        "unclassified": 0,
+        "soft": 1,
+        "conditional": 2,
+        "certain": 3,
+    }
+    certainty = diamond_plan_certainty(plan, cpu, room)
+    preserves_x = not any(step_uses_joker(step) for step in plan.get("steps", []))
+    trump = diamond_plan_trump_candidate(plan) or {}
+    rally_steps = sum(
+        1 for step in plan.get("steps", [])
+        if str(step.get("role", "")).startswith("rally-")
+    )
+    return_probability = (
+        diamond_candidate_return_probability(trump, cpu, room)
+        if certainty == "conditional"
+        else 0.0
+    )
+    revolution_active = (
+        getattr(cpu, "diamond_revolution_strategy_active", False)
+        and getattr(room, "reverse_order", False)
+    )
+    if revolution_active:
+        revolution_tier = diamond_revolution_candidate_tier(trump, cpu)
+    else:
+        revolution_tier = 0
+    if revolution_active:
+        return (
+            revolution_tier,
+            -rally_steps,
+            1 if preserves_x else 0,
+            candidate_strength(trump, room) if trump else -1,
+            platinum_plan_score(plan),
+            gold_plan_score(plan),
+        )
+    return (
+        certainty_tiers.get(certainty, 0),
+        -rally_steps,
+        -return_probability,
+        1 if preserves_x else 0,
+        candidate_strength(trump, room) if trump else -1,
+        1 if plan.get("dual_wield") else 0,
+        platinum_plan_score(plan),
+        gold_plan_score(plan),
+    )
+
+
+def diamond_has_current_certain_trump(cpu: CpuPlayer, room) -> bool:
+    empty_room = room_without_field(room)
+    candidates = knowledge_prime_candidates(
+        cpu,
+        empty_room,
+        gold_knowledge_number_validator,
+        DIAMOND_PREFERRED_RALLY_COUNTS,
+    )
+    candidates.extend(knowledge_composite_candidates(cpu, empty_room, (2, 4)))
+    return any(
+        diamond_candidate_is_certain_fast(candidate, cpu, room)
+        for candidate in candidates
+    )
+
+
+def diamond_candidate_is_certain_fast(candidate: dict, cpu: CpuPlayer, room) -> bool:
+    """Physical certainty check without running return-probability simulations."""
+    token = platinum_candidate_token(candidate)
+    visible_count = len(candidate.get("cards", []) or [])
+    if token == "kk":
+        return True
+    if visible_count == 4 and candidate.get("kind") == "composite":
+        if token not in DIAMOND_FOUR_OBAKE_TOKENS:
+            return False
+        if token == "kkkq":
+            return True
+        value = platinum_token_value(token)
+        counters = (
+            counter
+            for counter in DIAMOND_FOUR_COUNTER_TOKENS
+            if (
+                platinum_token_value(counter) < value
+                if getattr(room, "reverse_order", False)
+                else platinum_token_value(counter) > value
+            )
+        )
+        return not any(
+            diamond_counter_token_is_physically_possible(cpu, room, counter)
+            for counter in counters
+        )
+    if visible_count != 6 or candidate.get("kind") != "prime":
+        return False
+    try:
+        value = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        not getattr(room, "reverse_order", False)
+        and value >= DIAMOND_SIX_CERTAIN_MIN_VALUE
+        and value in cpu.registered_primes
     )
 
 
@@ -1500,6 +3856,22 @@ def platinum_opening_multi_play_is_sound(cpu: CpuPlayer, plan: dict) -> bool:
 
     if len(steps) == 1:
         return True
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        trump_index = gold_plan_trump_step_index(plan)
+        trump = (
+            steps[trump_index]
+            if trump_index is not None and trump_index < len(steps)
+            else None
+        )
+        if (
+            trump is not None
+            and platinum_candidate_token(trump) in DIAMOND_FOUR_OBAKE_TOKENS
+        ):
+            prefix = steps[:trump_index]
+            if not 1 <= len(prefix) <= 3:
+                return False
+            if any(step.get("kind") != "prime" for step in prefix):
+                return False
     if steps[-1].get("role") != "finish":
         return False
     if len(steps) == 2:
@@ -1533,6 +3905,33 @@ def platinum_plan_score(plan: Optional[dict]) -> float:
 
 
 def platinum_plan_is_strong(plan: dict, cpu: CpuPlayer, room) -> bool:
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        context = diamond_tactical_context(cpu, room)
+        if context in DIAMOND_POST_ALL_OUT_CONTEXTS:
+            tier = diamond_post_all_out_plan_tier(plan, cpu, room)
+            if tier is None:
+                return False
+            if (
+                context == "opponent-all-out"
+                and platinum_plan_score(plan)
+                < DIAMOND_OPENING_SECOND_MIN_TRUMP_STRENGTH
+            ):
+                return False
+            return True
+        certainty = diamond_plan_certainty(plan, cpu, room)
+        if certainty == "certain":
+            return True
+        if certainty == "conditional":
+            return diamond_conditional_plan_is_acceptable(plan, cpu, room)
+        if certainty == "soft":
+            return False
+        if (
+            diamond_tactical_context(cpu, room)
+            in {"opening-second", "opponent-all-out"}
+            and platinum_plan_score(plan)
+            < DIAMOND_OPENING_SECOND_MIN_TRUMP_STRENGTH
+        ):
+            return False
     return (
         platinum_plan_score(plan) >= platinum_required_trump_strength(cpu)
         or platinum_plan_has_absolute_trump(plan, cpu)
@@ -1549,6 +3948,20 @@ def platinum_plan_has_absolute_trump(plan: dict, cpu: CpuPlayer) -> bool:
 
 def platinum_candidate_is_absolute(candidate: dict, cpu: CpuPlayer) -> bool:
     token = platinum_candidate_token(candidate)
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        if token == "kkkq":
+            return True
+        try:
+            value = int(candidate.get("number"))
+        except (TypeError, ValueError):
+            value = -1
+        if (
+            candidate.get("kind") == "prime"
+            and len(candidate.get("cards", []) or []) == 6
+            and value >= DIAMOND_SIX_CERTAIN_MIN_VALUE
+            and value in cpu.registered_primes
+        ):
+            return True
     if token in PLATINUM_ABSOLUTE_ALWAYS:
         return True
     kx_count = sum(
@@ -1686,6 +4099,12 @@ def platinum_deck_has_expected_trump_contribution(cpu: CpuPlayer, room) -> bool:
 
 def platinum_interference_danger_active(cpu: CpuPlayer, room) -> bool:
     """Whether the opponent's finish risk calls for interference over all-out."""
+    if (
+        getattr(cpu, "cpu_key", "") == "diamond_planner"
+        and getattr(cpu, "diamond_opponent_rally_threat", "none")
+        == "certain-likely"
+    ):
+        return True
     score = platinum_opponent_hand_score(cpu, room)
     if platinum_expected_opponent_kx_remaining(cpu, room) <= 0.1:
         score += 20
@@ -1704,6 +4123,12 @@ def platinum_failed_composite_all_out_allowed(
     if allow_opening and getattr(cpu, "platinum_opening_phase", True):
         return True
     if int(getattr(cpu, "platinum_all_out_attempts", 0)) > 0:
+        if getattr(cpu, "cpu_key", "") == "diamond_planner":
+            return (
+                bool(getattr(room, "deck", []))
+                and not platinum_interference_danger_active(cpu, room)
+                and not diamond_has_current_certain_trump(cpu, room)
+            )
         return (
             bool(getattr(room, "deck", []))
             and not platinum_interference_danger_active(cpu, room)
@@ -1718,6 +4143,12 @@ def platinum_should_all_out(cpu: CpuPlayer, room) -> bool:
     attempts = int(getattr(cpu, "platinum_all_out_attempts", 0))
     if attempts == 0:
         return True
+    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        return (
+            bool(getattr(room, "deck", []))
+            and not platinum_interference_danger_active(cpu, room)
+            and not diamond_has_current_certain_trump(cpu, room)
+        )
     return (
         bool(getattr(room, "deck", []))
         and not platinum_interference_danger_active(cpu, room)
@@ -1790,17 +4221,19 @@ def choose_platinum_bounded_legal_action(
     room,
     validator: NumberValidator,
     prefer_compression: bool = False,
+    include_joker_candidates: bool = True,
 ) -> Optional[CpuAction]:
     """Choose a legal one-ply play without recursively constructing a route."""
     field_count = len(getattr(room, "field", []) or [])
-    max_count = min(PLATINUM_MAX_KNOWLEDGE_CARDS, len(cpu.hand))
+    max_count = min(cpu_max_knowledge_cards(cpu), len(cpu.hand))
     counts = (field_count,) if field_count else range(1, max_count + 1)
     candidates = gold_plan_candidates(cpu, room, counts, validator)
-    for count in counts:
-        if count <= 9:
-            candidates.extend(joker_prime_candidates_for_count(
-                cpu, room, count, validator
-            ))
+    if include_joker_candidates:
+        for count in counts:
+            if count <= 9:
+                candidates.extend(joker_prime_candidates_for_count(
+                    cpu, room, count, validator
+                ))
     candidates.extend(gold_special_cut_candidates(cpu, room))
     candidates = [
         candidate
@@ -1841,9 +4274,6 @@ def choose_platinum_timeout_action(
 ) -> CpuAction:
     """Recover from a search deadline without treating kamatoto as the default."""
     platinum_refresh_trump_strength_requirement(cpu, room)
-    large_hand_action = choose_platinum_large_hand_action(cpu, room, validator)
-    if large_hand_action is not None:
-        return platinum_commit_play(cpu, large_hand_action)
 
     if getattr(room, "field", []) or []:
         post_all_out_response = choose_platinum_post_all_out_response(cpu, room, validator)
@@ -1856,7 +4286,12 @@ def choose_platinum_timeout_action(
             if payload is not None:
                 cpu.platinum_all_out_attempts += 1
                 return platinum_commit_play(cpu, CpuAction("play_composite", payload))
-        action = choose_platinum_bounded_legal_action(cpu, room, validator)
+        action = choose_platinum_bounded_legal_action(
+            cpu,
+            room,
+            validator,
+            include_joker_candidates=False,
+        )
         return platinum_commit_play(cpu, action) if action is not None else CpuAction("pass")
 
     if platinum_should_all_out(cpu, room):
@@ -1870,6 +4305,7 @@ def choose_platinum_timeout_action(
         room,
         validator,
         prefer_compression=len(cpu.hand) >= PLATINUM_COMPRESSION_MIN_HAND_SIZE,
+        include_joker_candidates=False,
     )
     return platinum_commit_play(cpu, action) if action is not None else CpuAction("pass")
 
@@ -1916,7 +4352,7 @@ def choose_platinum_compression_action(
     if len(cpu.hand) < PLATINUM_COMPRESSION_MIN_HAND_SIZE:
         return None
     field_count = len(getattr(room, "field", []) or [])
-    max_cards = min(PLATINUM_MAX_KNOWLEDGE_CARDS, len(cpu.hand) - 1)
+    max_cards = min(cpu_max_knowledge_cards(cpu), len(cpu.hand) - 1)
     counts = (field_count,) if field_count else range(1, max_cards + 1)
     candidates = [
         candidate
@@ -1980,7 +4416,7 @@ def platinum_compression_followup_available(
     ):
         return True
 
-    large_max = min(PLATINUM_MAX_KNOWLEDGE_CARDS, len(remaining))
+    large_max = min(cpu_max_knowledge_cards(cpu), len(remaining))
     if large_max < PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS:
         return False
     large = gold_plan_candidates(
@@ -2965,7 +5401,14 @@ def search_same_count_gold_plans(
             if len(results) >= GOLD_PLAN_MAX_RESULTS_PER_COUNT * 2:
                 break
 
-    results.sort(key=gold_plan_score, reverse=True)
+    results.sort(
+        key=(
+            (lambda plan: diamond_plan_sort_key(plan, cpu, room))
+            if getattr(cpu, "cpu_key", "") == "diamond_planner"
+            else gold_plan_score
+        ),
+        reverse=True,
+    )
     return results[:GOLD_PLAN_MAX_RESULTS_PER_COUNT]
 
 
@@ -3518,11 +5961,14 @@ def gold_finish_candidates(
 ) -> list[dict]:
     max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
     candidates = gold_plan_candidates(cpu, room, range(1, max_cards + 1), validator)
-    candidates.extend(
-        candidate
-        for count in range(1, max_cards + 1)
-        for candidate in joker_prime_candidates_for_count(cpu, room, count, validator)
-    )
+    for count in range(1, max_cards + 1):
+        check_cpu_search_deadline(cpu)
+        candidates.extend(joker_prime_candidates_for_count(
+            cpu,
+            room,
+            count,
+            validator,
+        ))
     field_count = len(getattr(room, "field", []) or [])
     if len(cpu.hand) == 1 and is_joker(cpu.hand[0]) and field_count <= 1:
         candidates.append({
@@ -3547,6 +5993,7 @@ def joker_prime_finish_candidates(
 
     candidates = []
     for number in sorted(cpu.registered_primes):
+        check_cpu_search_deadline(cpu)
         if not validator(number, cpu, getattr(room, "rule", None)):
             continue
         for ranks in registered_value_encodings(number, max_cards=9):
@@ -3583,6 +6030,7 @@ def joker_prime_candidates_for_count(
 
     candidates = []
     for number in sorted(cpu.registered_primes):
+        check_cpu_search_deadline(cpu)
         if not validator(number, cpu, getattr(room, "rule", None)):
             continue
         for ranks in registered_value_encodings(number, max_cards=9):
@@ -3636,8 +6084,15 @@ def gold_plan_candidates(
     counts: Iterable[int],
     validator: NumberValidator,
 ) -> List[dict]:
-    candidates = knowledge_prime_candidates(cpu, room, validator, counts)
-    candidates.extend(knowledge_composite_candidates(cpu, room, counts))
+    count_tuple = tuple(counts)
+    candidates = knowledge_prime_candidates(cpu, room, validator, count_tuple)
+    candidates.extend(knowledge_composite_candidates(cpu, room, count_tuple))
+    if getattr(cpu, "diamond_revolution_strategy_active", False):
+        candidates = [
+            candidate for candidate in candidates
+            if len(candidate.get("cards", []) or [])
+            not in DIAMOND_REVOLUTION_AVOID_COUNTS
+        ]
     return candidates
 
 
@@ -3863,20 +6318,25 @@ def knowledge_prime_candidates(
     candidates = []
     count_set = {count for count in counts if count > 0}
     values = tuple(sorted(cpu.registered_primes))
+    cpu_key = getattr(cpu, "cpu_key", "")
     max_cards = (
-        PLATINUM_MAX_KNOWLEDGE_CARDS
-        if getattr(cpu, "cpu_key", "") == "platinum_planner"
+        cpu_max_knowledge_cards(cpu)
+        if cpu_key in ADVANCED_PLANNING_CPU_KEYS
         else 9
     )
     if (
-        max_cards == PLATINUM_MAX_KNOWLEDGE_CARDS
+        cpu_key in ADVANCED_PLANNING_CPU_KEYS
         and getattr(cpu, "prime_template_index_values", ()) == values
     ):
         index = cpu.prime_template_index
     else:
         index = registered_prime_template_index(values, max_cards=max_cards)
     for count in sorted(count_set):
-        for number, ranks in index.templates_by_card_count.get(count, ()):
+        for template_offset, (number, ranks) in enumerate(
+            index.templates_by_card_count.get(count, ())
+        ):
+            if template_offset % 32 == 0:
+                check_cpu_search_deadline(cpu)
             if not validator(number, cpu, getattr(room, "rule", None)):
                 continue
             cards = cards_for_ranks(cpu.hand, ranks)
@@ -3901,11 +6361,10 @@ def knowledge_composite_candidates(
 ) -> List[dict]:
     if not getattr(getattr(room, "rule", None), "allow_composite", False):
         return []
-    max_visible_cards = (
-        9
-        if getattr(getattr(room, "rule", None), "key", None) == "composite-practice-11-n"
-        else 4
-    )
+    if getattr(getattr(room, "rule", None), "key", None) == "composite-practice-11-n":
+        max_visible_cards = 9
+    else:
+        max_visible_cards = 4
     count_set = {count for count in counts if 1 <= count <= max_visible_cards}
     if not count_set:
         return []
@@ -3915,13 +6374,18 @@ def knowledge_composite_candidates(
         entries_by_value.setdefault(entry.value, []).append(entry)
 
     candidates = []
-    for value in sorted(set(cpu.registered_composites) | set(entries_by_value)):
+    for value_offset, value in enumerate(
+        sorted(set(cpu.registered_composites) | set(entries_by_value))
+    ):
+        if value_offset % 16 == 0:
+            check_cpu_search_deadline(cpu)
         for visible_ranks in registered_value_encodings(value, max_cards=max_visible_cards):
             if len(visible_ranks) not in count_set:
                 continue
-            visible_cards = cards_for_ranks(cpu.hand, visible_ranks)
-            if visible_cards is None:
+            visible = cards_for_ranks_with_jokers(cpu.hand, visible_ranks)
+            if visible is None:
                 continue
+            visible_cards = visible["cards"]
             material = material_for_composite_entries(
                 cpu.hand,
                 entries_by_value.get(value, []),
@@ -3935,10 +6399,13 @@ def knowledge_composite_candidates(
                 "kind": "composite",
                 "number": value,
                 "cards": visible_cards,
-                "assigned_numbers": [],
+                "assigned_numbers": visible["assigned_numbers"],
                 "consume_cards": material["cards"],
                 "composite_tokens": material["tokens"],
-                "composite_assigned_numbers": [],
+                "composite_assigned_numbers": material.get(
+                    "assigned_numbers",
+                    [],
+                ),
                 "expression": material.get("expression", ""),
                 "expression_source": material.get("source", "registered"),
                 "ranks": visible_ranks,
@@ -4067,6 +6534,8 @@ def material_for_composite_entry(
     used_ids = set(excluded_ids)
     cards = []
     tokens = []
+    assigned_numbers = []
+    jokers = [card for card in hand if is_joker(card)]
     for expression_token in entry.expression_tokens:
         if expression_token.kind == "op":
             tokens.append({
@@ -4087,13 +6556,23 @@ def material_for_composite_entry(
                 None,
             )
             if card is None:
-                return None
+                card = next(
+                    (
+                        joker for joker in jokers
+                        if joker.get("card_id") not in used_ids
+                    ),
+                    None,
+                )
+                if card is None:
+                    return None
+                assigned_numbers.append(str(rank))
             used_ids.add(card.get("card_id"))
             cards.append(card)
             tokens.append({"kind": "card", "card_id": card.get("card_id")})
     return {
         "cards": cards,
         "tokens": tokens,
+        "assigned_numbers": assigned_numbers,
         "expression": getattr(entry, "expression", ""),
         "source": "registered",
     }
@@ -4197,6 +6676,40 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
         cpu.platinum_all_out_suppressed_opponent_min_hand_count
     )
     temp.platinum_current_min_trump_strength = cpu.platinum_current_min_trump_strength
+    temp.diamond_focus_count = cpu.diamond_focus_count
+    temp.diamond_active_route = cpu.diamond_active_route
+    temp.diamond_last_route_kind = cpu.diamond_last_route_kind
+    temp.diamond_last_certainty = cpu.diamond_last_certainty
+    temp.diamond_recovery_targets = cpu.diamond_recovery_targets
+    temp.diamond_last_preferred_counts = cpu.diamond_last_preferred_counts
+    temp.diamond_last_obake_counter_tokens = cpu.diamond_last_obake_counter_tokens
+    temp.diamond_last_return_candidates = cpu.diamond_last_return_candidates
+    temp.diamond_opponent_rally_count = cpu.diamond_opponent_rally_count
+    temp.diamond_opponent_rally_streak = cpu.diamond_opponent_rally_streak
+    temp.diamond_last_observed_play_key = cpu.diamond_last_observed_play_key
+    temp.diamond_interference_mode_count = cpu.diamond_interference_mode_count
+    temp.diamond_opponent_rally_threat = cpu.diamond_opponent_rally_threat
+    temp.diamond_opponent_estimated_max = cpu.diamond_opponent_estimated_max
+    temp.diamond_last_return_probability = cpu.diamond_last_return_probability
+    temp.diamond_last_recovery_certain_probability = (
+        cpu.diamond_last_recovery_certain_probability
+    )
+    temp.diamond_last_recovery_guaranteed_kx = (
+        cpu.diamond_last_recovery_guaranteed_kx
+    )
+    temp.diamond_recovery_cache_key = cpu.diamond_recovery_cache_key
+    temp.diamond_last_opponent_kjqj_probability = (
+        cpu.diamond_last_opponent_kjqj_probability
+    )
+    temp.diamond_revolution_strategy_active = cpu.diamond_revolution_strategy_active
+    temp.diamond_last_context = cpu.diamond_last_context
+    temp.diamond_last_plan_tier = cpu.diamond_last_plan_tier
+    temp.diamond_last_finish_strength = cpu.diamond_last_finish_strength
+    temp.diamond_seen_cards = dict(cpu.diamond_seen_cards)
+    temp.diamond_public_response_signature_cache = (
+        cpu.diamond_public_response_signature_cache
+    )
+    temp.diamond_last_conditional_limit = cpu.diamond_last_conditional_limit
     temp.rng = cpu.rng
     temp.decision_time_budget_ms = cpu.decision_time_budget_ms
     temp.decision_deadline = cpu.decision_deadline
@@ -4211,6 +6724,24 @@ def room_without_field(room):
     copy.field = []
     copy.last_number = None
     copy.reverse_order = getattr(room, "reverse_order", False)
+    copy.reserve = list(getattr(room, "reserve", []) or [])
+    copy.public_known_deck_bottom = list(
+        getattr(room, "public_known_deck_bottom", []) or []
+    )
+    copy.public_unknown_deck_count = int(
+        getattr(room, "public_unknown_deck_count", 0) or 0
+    )
+    copy.deck = [None] if getattr(room, "deck", []) else []
+    copy.opponent_hand_count = getattr(room, "opponent_hand_count", None)
+    copy.players = []
+    for player in (getattr(room, "players", []) or []):
+        class PublicPlayerCount:
+            pass
+        public_player = PublicPlayerCount()
+        public_player.id = getattr(player, "id", None)
+        public_player.status = getattr(player, "status", "playing")
+        public_player.hand = [None] * len(getattr(player, "hand", []) or [])
+        copy.players.append(public_player)
     return copy
 
 
@@ -4481,6 +7012,23 @@ CPU_PROFILES = {
             sample_key="platinum_prime_table",
         ),
         action_selector=choose_platinum_planning_cpu_action,
+    ),
+    "diamond_planner": CpuProfile(
+        key="diamond_planner",
+        label="ダイヤCPU",
+        description="ダイヤ素数表を使い、4枚・6枚の組み切りを優先してからプラチナ相当の安全策へ移る開発中CPUです。",
+        rule_keys=(
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="diamond_prime_table",
+        ),
+        action_selector=choose_diamond_planning_cpu_action,
     ),
     "silver_planner": CpuProfile(
         key="silver_planner",
