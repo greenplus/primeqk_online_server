@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections import Counter
 from functools import lru_cache
-from itertools import permutations, product
+from itertools import combinations, permutations, product
 import json
 from math import comb
 from pathlib import Path
@@ -19,6 +19,7 @@ from registered_primes import (
     registered_prime_templates_for_hand,
     registered_value_encodings,
 )
+from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from rules import PrimeRule
 
 
@@ -80,7 +81,10 @@ DIAMOND_POST_ALL_OUT_RESULT_CAP = 6
 DIAMOND_POST_ALL_OUT_DRAW_RESPONSE_MIN_HAND_SIZE = 18
 DIAMOND_POST_ALL_OUT_SEARCH_RESERVE_SECONDS = 0.50
 DIAMOND_OPPONENT_ALL_OUT_DRAW_MIN_PLAN_STEPS = 3
+DIAMOND_OPENING_SECOND_HNP_MIN_FIELD_COUNT = 8
+DIAMOND_OPPONENT_ALL_OUT_TIER9_MIN_OPPONENT_HAND_SIZE = 18
 DIAMOND_KQQJ_CONTEXTUAL_MAX_OPPONENT_HAND_SIZE = 20
+DIAMOND_POST_ALL_OUT_KX_POLICY_MIN_HAND_SIZE = 18
 DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "opponent-all-out",
     "post-all-out-lead",
@@ -138,6 +142,13 @@ DIAMOND_OPENING_AUSO_TRUMP_RANGES = {
     3: (131111, 131311),       # KJJ .. KKJ
     4: (13101211, 13111211),  # KTQJ .. KJQJ
 }
+DIAMOND_OPENING_AUSO_NO_DRAW_RETURN_VALUES = frozenset({
+    13101211,  # KTQJ
+    13111013,  # KJTK
+})
+DIAMOND_OPENING_AUSO_ALL_OUT_TRUMP_TOKENS = frozenset({
+    "kjj", "ktqj", "kjtk",
+})
 DIAMOND_OPENING_AUSO_BASE_SCORE = 95.0
 PLATINUM_TOKEN_RANKS = {"t": 10, "j": 11, "q": 12, "k": 13}
 PLATINUM_SMALL_TRUMP_TOKENS = frozenset({
@@ -292,6 +303,8 @@ class CpuPlayer:
         self.diamond_last_context = "opening-lead"
         self.diamond_last_plan_tier: Optional[int] = None
         self.diamond_last_finish_strength = 0
+        self.diamond_opening_was_second: Optional[bool] = None
+        self.diamond_opponent_ever_13_plus = False
         self.diamond_seen_cards: dict[str, Card] = {}
         self.diamond_public_response_signature_cache: dict[
             int,
@@ -300,6 +313,10 @@ class CpuPlayer:
         self.diamond_last_conditional_limit = (
             DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY
         )
+        self.diamond_pending_full_recovery: Optional[dict] = None
+        self.diamond_preserved_closeout_plan: Optional[dict] = None
+        self.diamond_last_kx_policy: dict = {}
+        self.diamond_pending_initial_all_out = False
         self.rng = secrets.SystemRandom()
 
     async def send_json(self, message: dict):
@@ -412,10 +429,16 @@ def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None
     cpu.diamond_last_context = "opening-lead"
     cpu.diamond_last_plan_tier = None
     cpu.diamond_last_finish_strength = 0
+    cpu.diamond_opening_was_second = None
+    cpu.diamond_opponent_ever_13_plus = False
     cpu.diamond_seen_cards = {}
     cpu.diamond_last_conditional_limit = (
         DIAMOND_CONDITIONAL_DEFAULT_MAX_RETURN_PROBABILITY
     )
+    cpu.diamond_pending_full_recovery = None
+    cpu.diamond_preserved_closeout_plan = None
+    cpu.diamond_last_kx_policy = {}
+    cpu.diamond_pending_initial_all_out = False
 
 
 def get_cpu_profile(cpu_key: str) -> Optional[CpuProfile]:
@@ -970,6 +993,191 @@ def diamond_tactical_context(cpu: CpuPlayer, room) -> str:
     return "general-response" if responding else "general-lead"
 
 
+def diamond_should_resume_opening_auso_after_failed_kamatoto(
+    cpu: CpuPlayer,
+    room,
+    previous_context: str,
+    current_context: str,
+) -> bool:
+    """Keep the saved trump -> finish route after the opener's failed all-out."""
+    if (
+        previous_context != "opening-lead"
+        or current_context != "opponent-all-out"
+        or (getattr(room, "field", []) or [])
+    ):
+        return False
+    plan = getattr(cpu, "gold_active_plan", None)
+    if not plan or not plan.get("diamond_opening_auso"):
+        return False
+    steps = list(plan.get("steps", []))
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    if index <= 0 or index >= len(steps):
+        return False
+    trump = steps[index]
+    if diamond_opening_auso_trump_score(trump) is None:
+        return False
+    return all(candidate_cards_available(step, cpu) for step in steps[index:])
+
+
+def diamond_opening_auso_dominating_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    """Prefer a proved shorter closeout before resuming the saved Auso trump.
+
+    The failed kamatoto policy is a no-draw policy, not a command to ignore an
+    already available win.  Keep the saved trump -> finish route as the
+    fallback, but first accept either a one-move finish or a certain complete
+    plan that uses no more moves than the saved tail.  A same-length replan is
+    only useful when the saved tail itself is not certain.
+    """
+    saved = getattr(cpu, "gold_active_plan", None)
+    if not saved or not saved.get("diamond_opening_auso"):
+        return None
+    steps = list(saved.get("steps", []))
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    if index < 0 or index >= len(steps):
+        return None
+    saved_tail_steps = [dict(step) for step in steps[index:]]
+    saved_move_count = len(saved_tail_steps)
+
+    finish = platinum_one_move_finish_candidate(cpu, room, validator)
+    if finish is not None:
+        clear_gold_active_plan(cpu)
+        action = platinum_commit_play(cpu, candidate_to_action(finish))
+        return diamond_record_action(
+            cpu,
+            action,
+            room,
+            "opening-auso-direct-finish",
+            finish,
+        )
+
+    if saved_move_count <= 1:
+        return None
+
+    saved_tail = finalize_gold_plan(
+        cpu,
+        room_without_field(room),
+        saved_tail_steps,
+        int(saved.get("rally_count", 0) or 0),
+    )
+    saved_certainty = diamond_post_all_out_plan_certainty(
+        saved_tail,
+        cpu,
+        room,
+    )
+    try:
+        plans = diamond_post_all_out_plans(cpu, room, validator)
+    except CpuSearchDeadline:
+        # The saved route is deliberately retained as the timeout fallback.
+        return None
+    eligible = []
+    for plan in plans:
+        plan_steps = list(plan.get("steps", []))
+        if (
+            not plan.get("completed")
+            or not plan_steps
+            or len(plan_steps) > saved_move_count
+            or diamond_post_all_out_plan_certainty(plan, cpu, room) != "certain"
+            or not diamond_plan_lead_avoids_opponent_finish(plan, cpu, room)
+        ):
+            continue
+        if len(plan_steps) == saved_move_count and saved_certainty == "certain":
+            continue
+        eligible.append(plan)
+    if not eligible:
+        return None
+
+    best = max(
+        eligible,
+        key=lambda plan: (
+            -len(plan.get("steps", [])),
+            diamond_post_all_out_plan_sort_key(plan, cpu, room),
+        ),
+    )
+    tier = diamond_post_all_out_plan_tier(best, cpu, room)
+    best["diamond_tier"] = tier
+    best["diamond_finish_strength"] = diamond_plan_finish_strength(best)
+    set_gold_active_plan(cpu, best)
+    action = play_next_gold_plan_step(cpu, room, validator)
+    if action is None:
+        set_gold_active_plan(cpu, saved)
+        cpu.gold_plan_step_index = index
+        return None
+    action = platinum_commit_play(cpu, action)
+    cpu.diamond_active_route = best
+    cpu.diamond_last_plan_tier = tier
+    cpu.diamond_last_finish_strength = best["diamond_finish_strength"]
+    recorded = diamond_record_action(
+        cpu,
+        action,
+        room,
+        "opening-auso-short-certain-replan",
+    )
+    cpu.diamond_last_certainty = "certain"
+    return recorded
+
+
+def diamond_should_pass_after_opening_auso_four_trump_return(
+    cpu: CpuPlayer,
+    room,
+) -> bool:
+    """Preserve the three-card finish after KTQJ/KJTK is overtrumped once."""
+    field = getattr(room, "field", []) or []
+    if (
+        len(field) != 4
+        or str(getattr(room, "last_play_player_id", "")) == str(cpu.id)
+        or len(cpu.hand) != 3
+    ):
+        return False
+    plan = getattr(cpu, "gold_active_plan", None)
+    if (
+        not plan
+        or not plan.get("diamond_opening_auso")
+        or plan.get("diamond_opening_auso_return_pass_used")
+    ):
+        return False
+    steps = list(plan.get("steps", []))
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    if index <= 0 or index >= len(steps):
+        return False
+    try:
+        previous_value = int(steps[index - 1].get("number"))
+    except (TypeError, ValueError):
+        return False
+    if previous_value not in DIAMOND_OPENING_AUSO_NO_DRAW_RETURN_VALUES:
+        return False
+    remaining_ids = {
+        str(card.get("card_id"))
+        for step in steps[index:]
+        for card in candidate_consumed_cards(step)
+    }
+    hand_ids = {str(card.get("card_id")) for card in cpu.hand}
+    return remaining_ids == hand_ids
+
+
+def diamond_update_opening_position_history(cpu: CpuPlayer, room) -> None:
+    """Remember whether Diamond started second and whether the opener expanded.
+
+    The large-prime HNP response is an opening-second policy.  Current hand size
+    alone is insufficient because a first player can take a penalty above 12
+    cards and later shrink below the threshold again.
+    """
+    if getattr(cpu, "diamond_opening_was_second", None) is None:
+        first_player_id = getattr(room, "first_player_id", None)
+        if first_player_id is not None:
+            cpu.diamond_opening_was_second = str(first_player_id) != str(cpu.id)
+        else:
+            cpu.diamond_opening_was_second = bool(getattr(room, "field", []) or [])
+    if not getattr(cpu, "diamond_opening_was_second", False):
+        return
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    if opponent_count is not None and opponent_count >= 13:
+        cpu.diamond_opponent_ever_13_plus = True
+
+
 def choose_diamond_planning_cpu_action(
     cpu: CpuPlayer,
     room,
@@ -985,16 +1193,29 @@ def choose_diamond_planning_cpu_action(
     preferred_counts = diamond_rally_count_order(cpu, non_joker_count)
     cpu.diamond_last_preferred_counts = preferred_counts
     cpu.diamond_active_route = None
+    diamond_update_opening_position_history(cpu, room)
     previous_context = getattr(cpu, "diamond_last_context", "opening-lead")
     current_context = diamond_tactical_context(cpu, room)
+    resume_opening_auso = diamond_should_resume_opening_auso_after_failed_kamatoto(
+        cpu,
+        room,
+        previous_context,
+        current_context,
+    )
     if (
         current_context in DIAMOND_POST_ALL_OUT_CONTEXTS
         and previous_context not in DIAMOND_POST_ALL_OUT_CONTEXTS
+        and not resume_opening_auso
     ):
         clear_gold_active_plan(cpu)
     cpu.diamond_last_context = current_context
     cpu.diamond_last_plan_tier = None
     cpu.diamond_last_finish_strength = 0
+    cpu.diamond_last_kx_policy = {}
+
+    pending_initial_all_out = diamond_pending_initial_all_out_action(cpu, room)
+    if pending_initial_all_out is not None:
+        return pending_initial_all_out
 
     if (
         getattr(cpu, "diamond_revolution_strategy_active", False)
@@ -1005,6 +1226,35 @@ def choose_diamond_planning_cpu_action(
     diamond_observe_opponent_rally(cpu, room)
     field = getattr(room, "field", []) or []
     field_count = len(field)
+
+    if resume_opening_auso:
+        dominating = diamond_opening_auso_dominating_action(
+            cpu,
+            room,
+            validator,
+        )
+        if dominating is not None:
+            return dominating
+        candidate = getattr(cpu, "gold_active_plan", {}).get("steps", [])[int(
+            getattr(cpu, "gold_plan_step_index", 0)
+        )]
+        action = play_next_gold_plan_step(cpu, room, validator)
+        if action is not None:
+            action = platinum_commit_play(cpu, action)
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "opening-auso-after-failed-kamatoto",
+                candidate,
+            )
+
+    if diamond_should_pass_after_opening_auso_four_trump_return(cpu, room):
+        cpu.gold_active_plan["diamond_opening_auso_return_pass_used"] = True
+        cpu.diamond_focus_count = None
+        cpu.diamond_last_route_kind = "opening-auso-four-trump-return-pass"
+        cpu.diamond_last_certainty = "unclassified"
+        return CpuAction("pass")
 
     revolution_return = diamond_1729_revolution_return_candidate(cpu, room)
     if revolution_return is not None:
@@ -1035,6 +1285,14 @@ def choose_diamond_planning_cpu_action(
         cpu.diamond_last_certainty = "unclassified"
         cpu.diamond_last_route_kind = "revolution-avoid-rally"
         return CpuAction("pass")
+
+    resumed_kx_policy = diamond_resume_post_all_out_kx_state(
+        cpu,
+        room,
+        validator,
+    )
+    if resumed_kx_policy is not None:
+        return resumed_kx_policy
 
     active = getattr(cpu, "gold_active_plan", None)
     if (
@@ -1115,6 +1373,18 @@ def choose_diamond_planning_cpu_action(
                 room,
                 "opponent-rally-interference",
             )
+
+    post_all_out_kx = choose_diamond_post_all_out_kx_response_action(
+        cpu,
+        room,
+        validator,
+    )
+    if post_all_out_kx is not None:
+        return post_all_out_kx
+
+    opening_second_hnp = diamond_opening_second_hnp_action(cpu, room, validator)
+    if opening_second_hnp is not None:
+        return opening_second_hnp
 
     contextual = choose_diamond_context_action(cpu, room, validator)
     if contextual is not None:
@@ -1198,6 +1468,8 @@ def choose_diamond_planning_cpu_action(
             opening_route_kind = "opening-immediate-trump"
         elif active_plan.get("diamond_opening_auso"):
             opening_route_kind = "opening-auso"
+    elif getattr(cpu, "diamond_pending_initial_all_out", False):
+        opening_route_kind = "opening-auso-policy-all-out-draw"
     cpu.diamond_last_route_kind = (
         "opponent-finish-count-avoidance"
         if avoided_opponent_finish_count
@@ -1277,12 +1549,18 @@ def diamond_remember_cards(cpu: CpuPlayer, cards: Iterable[Card]) -> None:
 
 
 def diamond_candidate_from_action(action: CpuAction) -> Optional[dict]:
-    if action.kind != "play_prime":
+    if action.kind not in {"play_prime", "play_composite"}:
         return None
     cards = diamond_action_cards(action)
     if not cards:
         return None
-    assigned = iter(action.payload.get("assigned_numbers", []) or [])
+    if action.kind == "play_composite":
+        assigned_numbers = list(
+            action.payload.get("selected", {}).get("assigned_numbers", []) or []
+        )
+    else:
+        assigned_numbers = list(action.payload.get("assigned_numbers", []) or [])
+    assigned = iter(assigned_numbers)
     ranks = []
     for card in cards:
         if is_joker(card):
@@ -1292,13 +1570,26 @@ def diamond_candidate_from_action(action: CpuAction) -> Optional[dict]:
             ranks.append(int(value))
         else:
             ranks.append(int(card.get("rank", 0)))
-    return {
-        "kind": "prime",
+    candidate = {
+        "kind": "composite" if action.kind == "play_composite" else "prime",
         "number": int("".join(str(rank) for rank in ranks)),
         "cards": cards,
-        "assigned_numbers": list(action.payload.get("assigned_numbers", []) or []),
+        "assigned_numbers": assigned_numbers,
         "ranks": tuple(ranks),
     }
+    if action.kind == "play_composite":
+        candidate.update({
+            "consume_cards": list(
+                action.payload.get("consume", {}).get("cards", []) or []
+            ),
+            "composite_tokens": list(
+                action.payload.get("composite", {}).get("tokens", []) or []
+            ),
+            "composite_assigned_numbers": list(
+                action.payload.get("composite", {}).get("assigned_numbers", []) or []
+            ),
+        })
+    return candidate
 
 
 def diamond_action_source_candidate(
@@ -2393,6 +2684,14 @@ def choose_platinum_strong_plan(
                     room,
                 ),
             )
+            if diamond_opening_auso_converts_to_initial_all_out(
+                best_opening,
+                cpu,
+            ):
+                clear_gold_active_plan(cpu)
+                cpu.diamond_pending_initial_all_out = True
+                cpu.platinum_last_strategy_score = 0.0
+                return None
             cpu.platinum_last_strategy_score = platinum_plan_score(best_opening)
             return best_opening
     candidates.extend(build_platinum_plans(cpu, room, validator))
@@ -3622,6 +3921,22 @@ def diamond_should_draw_before_opponent_all_out_plan(
     return platinum_deck_has_expected_trump_contribution(cpu, room)
 
 
+def diamond_initial_opponent_all_out_tier9_blocked(
+    cpu: CpuPlayer,
+    room,
+) -> bool:
+    """Reject soft tier 9 only on Diamond's first reply to opening all-out."""
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    return (
+        getattr(cpu, "diamond_opening_was_second", None) is True
+        and getattr(cpu, "platinum_opening_phase", True)
+        and diamond_tactical_context(cpu, room) == "opponent-all-out"
+        and opponent_count is not None
+        and opponent_count
+        >= DIAMOND_OPPONENT_ALL_OUT_TIER9_MIN_OPPONENT_HAND_SIZE
+    )
+
+
 def diamond_post_all_out_plan_tier(
     plan: dict,
     cpu: CpuPlayer,
@@ -3688,6 +4003,8 @@ def diamond_post_all_out_plan_tier(
     if strength >= DIAMOND_POST_ALL_OUT_CONDITIONAL_MIN_TRUMP_STRENGTH:
         return 8
     if strength >= DIAMOND_POST_ALL_OUT_SOFT_MIN_TRUMP_STRENGTH:
+        if diamond_initial_opponent_all_out_tier9_blocked(cpu, room):
+            return None
         return 9
     return None
 
@@ -4291,6 +4608,801 @@ def diamond_threat_closing_response_candidate(
         )
 
     return max(pool, key=closing_key)
+
+
+def diamond_hnp_joker_assignments(cards: list[Card]) -> list[tuple[int, ...]]:
+    """Return joker values that do not make every permutation divisible by 3."""
+    jokers = [card for card in cards if is_joker(card)]
+    fixed_sum = sum(
+        int(card.get("rank", 0)) for card in cards if not is_joker(card)
+    )
+    return [
+        values
+        for values in product((1, 3, 7, 9), repeat=len(jokers))
+        if (fixed_sum + sum(values)) % 3 != 0
+    ]
+
+
+def diamond_opening_second_hnp_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    """Try an 8+-card HNP response while preserving a legal one-move finish.
+
+    This is deliberately narrower than ordinary HNP: Diamond must have started
+    second, the first player's hand must never have reached 13 cards, and the
+    current field must be a prime play of at least eight cards.  A partition is
+    eligible only when every card left out of the HNP forms a known legal finish.
+    """
+    field = list(getattr(room, "field", []) or [])
+    field_count = len(field)
+    if (
+        field_count < DIAMOND_OPENING_SECOND_HNP_MIN_FIELD_COUNT
+        or not getattr(cpu, "diamond_opening_was_second", False)
+        or getattr(cpu, "diamond_opponent_ever_13_plus", False)
+        or getattr(room, "last_play_kind", None) != "prime"
+        or getattr(cpu, "gold_active_plan", None)
+        or field_count >= len(cpu.hand)
+    ):
+        return None
+
+    finish_card_count = len(cpu.hand) - field_count
+    empty_room = room_without_field(room)
+    options = []
+    for finish_cards_tuple in combinations(cpu.hand, finish_card_count):
+        check_cpu_search_deadline(cpu)
+        finish_cards = list(finish_cards_tuple)
+        finish_cpu = temporary_cpu_with_hand(cpu, finish_cards)
+        finish = platinum_one_move_finish_candidate(
+            finish_cpu,
+            empty_room,
+            validator,
+        )
+        if finish is None:
+            continue
+        if {
+            card.get("card_id") for card in candidate_consumed_cards(finish)
+        } != {card.get("card_id") for card in finish_cards}:
+            continue
+        hnp_cards = remaining_cards(cpu.hand, finish_cards)
+        assignments = diamond_hnp_joker_assignments(hnp_cards)
+        if not assignments:
+            continue
+        options.append((finish, finish_cards, hnp_cards, assignments))
+
+    if not options:
+        return None
+
+    options.sort(
+        key=lambda item: (
+            gold_plan_candidate_score(item[0], empty_room),
+            sum(is_joker(card) for card in item[1]),
+            tuple(sorted(str(card.get("card_id")) for card in item[1])),
+        ),
+        reverse=True,
+    )
+    field_number = getattr(room, "last_number", None)
+    for finish, finish_cards, hnp_cards, assignments in options:
+        ordered_assignments = list(assignments)
+        cpu.rng.shuffle(ordered_assignments)
+        for joker_values in ordered_assignments:
+            tokens = build_hnp_tokens(
+                hnp_cards,
+                [str(value) for value in joker_values],
+            )
+            permutation = choose_hnp_permutation(
+                tokens,
+                field_number=int(field_number) if field_number is not None else None,
+                reverse_order=bool(getattr(room, "reverse_order", False)),
+                randbelow=lambda upper: cpu.rng.randrange(upper),
+            )
+            if permutation is None:
+                continue
+
+            hnp_candidate = {
+                "kind": "prime",
+                "number": permutation.number,
+                "cards": permutation.cards,
+                "assigned_numbers": permutation.assigned_numbers,
+                "ranks": tuple(int(token.text) for token in permutation.tokens),
+                "role": f"rally-{field_count}",
+            }
+            finish_cpu = temporary_cpu_with_hand(cpu, finish_cards)
+            tail_plan = finalize_gold_plan(
+                finish_cpu,
+                empty_room,
+                [dict(finish)],
+                0,
+            )
+            if not tail_plan.get("completed"):
+                continue
+            tail_plan["diamond_hnp_tail"] = True
+            tail_plan["diamond_hnp_field_count"] = field_count
+            set_gold_active_plan(cpu, tail_plan)
+            action = platinum_commit_play(cpu, candidate_to_action(hnp_candidate))
+            result = diamond_record_action(
+                cpu,
+                action,
+                room,
+                "opening-second-hnp",
+                hnp_candidate,
+            )
+            cpu.diamond_last_certainty = "conditional"
+            return result
+    return None
+
+
+def diamond_kx_card_count(cards: Iterable[Card]) -> int:
+    return sum(
+        1
+        for card in cards
+        if is_joker(card) or int(card.get("rank", 0)) == 13
+    )
+
+
+def diamond_kx_policy_band(kx_count: int) -> str:
+    if kx_count <= 0:
+        return "0"
+    if kx_count <= 2:
+        return "1-2"
+    if kx_count == 3:
+        return "3"
+    return "4-5"
+
+
+def diamond_set_kx_policy_trace(
+    cpu: CpuPlayer,
+    *,
+    before_kx: int,
+    after_kx: Optional[int] = None,
+    reason: str = "",
+    retained_certain: Optional[dict] = None,
+    predicted_deck: Optional[int] = None,
+    recovery_capacity: Optional[int] = None,
+    pass_reason: str = "",
+) -> None:
+    after = before_kx if after_kx is None else int(after_kx)
+    cpu.diamond_last_kx_policy = {
+        "band": diamond_kx_policy_band(before_kx),
+        "before_kx": int(before_kx),
+        "after_kx": after,
+        "spent_kx": max(0, int(before_kx) - after),
+        "reason": str(reason),
+        "retained_certain": (
+            platinum_candidate_token(retained_certain)
+            if retained_certain is not None
+            else None
+        ),
+        "predicted_deck": (
+            int(predicted_deck) if predicted_deck is not None else None
+        ),
+        "recovery_capacity": (
+            int(recovery_capacity) if recovery_capacity is not None else None
+        ),
+        "full_recovery": bool(
+            predicted_deck is not None
+            and recovery_capacity is not None
+            and int(predicted_deck) <= int(recovery_capacity)
+        ),
+        "pass_reason": str(pass_reason),
+    }
+
+
+def diamond_retained_certain_closeout_plan_is_valid(
+    plan: Optional[dict],
+    cpu: CpuPlayer,
+    room,
+    *,
+    max_rally_steps: int,
+) -> bool:
+    """Require a final certain rally followed by exactly one finishing play."""
+    if not plan or not is_executable_gold_plan(plan, cpu):
+        return False
+    steps = list(plan.get("steps", []))
+    planned_ids = {
+        str(card.get("card_id"))
+        for step in steps
+        for card in candidate_consumed_cards(step)
+    }
+    if planned_ids != {str(card.get("card_id")) for card in cpu.hand}:
+        return False
+    trump_index = gold_plan_trump_step_index(plan)
+    if (
+        trump_index is None
+        or trump_index != len(steps) - 2
+        or steps[-1].get("role") != "finish"
+        or diamond_plan_rally_step_count(plan) > max_rally_steps
+    ):
+        return False
+    if any(
+        diamond_kx_card_count(candidate_consumed_cards(step)) > 0
+        for step in steps[:trump_index]
+    ):
+        return False
+    trump = steps[trump_index]
+    return diamond_candidate_certainty(trump, cpu, room) == "certain"
+
+
+def diamond_retained_certain_closeout_plan(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    *,
+    max_rally_steps: int,
+    max_prefix_steps: Optional[int] = None,
+) -> Optional[dict]:
+    if getattr(room, "field", []) or [] or max_rally_steps <= 0:
+        return None
+    non_joker_count = len([card for card in cpu.hand if not is_joker(card)])
+    counts = diamond_rally_count_order(cpu, non_joker_count)
+    prefix_limit = (
+        max_rally_steps - 1
+        if max_prefix_steps is None
+        else min(max_rally_steps - 1, max(0, int(max_prefix_steps)))
+    )
+    plans = diamond_reserved_trump_plans(
+        cpu,
+        room,
+        validator,
+        counts,
+        result_cap=max(DIAMOND_POST_ALL_OUT_RESULT_CAP, len(counts)),
+        max_prefix_steps=prefix_limit,
+    )
+    eligible = [
+        plan
+        for plan in plans
+        if diamond_retained_certain_closeout_plan_is_valid(
+            plan,
+            cpu,
+            room,
+            max_rally_steps=max_rally_steps,
+        )
+    ]
+    if not eligible:
+        return None
+    best = max(
+        eligible,
+        key=lambda plan: (
+            -diamond_plan_rally_step_count(plan),
+            diamond_plan_finish_strength(plan),
+            1 if diamond_plan_has_protected_x_tail(plan) else 0,
+            platinum_plan_score(plan),
+            gold_plan_score(plan),
+        ),
+    )
+    best["diamond_kx_retained_closeout"] = True
+    return best
+
+
+def diamond_kx_active_plan_suffix(cpu: CpuPlayer) -> Optional[dict]:
+    plan = getattr(cpu, "gold_active_plan", None)
+    if not plan or not plan.get("diamond_kx_response_plan"):
+        return None
+    return diamond_gold_plan_suffix(cpu)
+
+
+def diamond_gold_plan_suffix(cpu: CpuPlayer) -> Optional[dict]:
+    plan = getattr(cpu, "gold_active_plan", None)
+    if not plan:
+        return None
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    steps = list(plan.get("steps", []))[index:]
+    if not steps:
+        return None
+    suffix = dict(plan)
+    suffix["steps"] = steps
+    suffix["remaining"] = []
+    suffix["completed"] = True
+    return suffix
+
+
+def diamond_resume_post_all_out_kx_state(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    """Resume a forced recovery or a separately preserved closeout plan."""
+    field = list(getattr(room, "field", []) or [])
+    pending = getattr(cpu, "diamond_pending_full_recovery", None)
+    if pending and field:
+        cpu.diamond_pending_full_recovery = None
+    elif pending and not field:
+        finish = platinum_one_move_finish_candidate(cpu, room, validator)
+        if finish is not None:
+            cpu.diamond_pending_full_recovery = None
+            cpu.diamond_preserved_closeout_plan = None
+            clear_gold_active_plan(cpu)
+            before_kx = diamond_kx_card_count(cpu.hand)
+            diamond_set_kx_policy_trace(
+                cpu,
+                before_kx=before_kx,
+                after_kx=0,
+                reason="pending-recovery-direct-finish",
+            )
+            action = platinum_commit_play(cpu, candidate_to_action(finish))
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "post-all-out-kx-direct-finish",
+                finish,
+            )
+        if len(getattr(room, "deck", []) or []) <= len(cpu.hand):
+            payload = build_gold_all_out_payload(
+                cpu.hand,
+                force_random=True,
+                rng=cpu.rng,
+            )
+            if payload is not None:
+                before_kx = diamond_kx_card_count(cpu.hand)
+                predicted = len(getattr(room, "deck", []) or [])
+                cpu.diamond_pending_full_recovery = None
+                cpu.diamond_preserved_closeout_plan = None
+                clear_gold_active_plan(cpu)
+                cpu.platinum_all_out_attempts += 1
+                cpu.diamond_last_route_kind = "post-all-out-full-recovery-all-out"
+                cpu.diamond_last_certainty = "unclassified"
+                diamond_set_kx_policy_trace(
+                    cpu,
+                    before_kx=before_kx,
+                    after_kx=before_kx,
+                    reason="full-recovery-all-out",
+                    predicted_deck=predicted,
+                    recovery_capacity=len(cpu.hand),
+                )
+                return platinum_commit_play(cpu, CpuAction("play_prime", payload))
+        cpu.diamond_pending_full_recovery = None
+
+    active_suffix = diamond_kx_active_plan_suffix(cpu)
+    if active_suffix is not None and not diamond_retained_certain_closeout_plan_is_valid(
+        active_suffix,
+        cpu,
+        room_without_field(room),
+        max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+    ):
+        clear_gold_active_plan(cpu)
+
+    preserved = getattr(cpu, "diamond_preserved_closeout_plan", None)
+    if not field and preserved:
+        finish = platinum_one_move_finish_candidate(cpu, room, validator)
+        if finish is not None:
+            cpu.diamond_preserved_closeout_plan = None
+            clear_gold_active_plan(cpu)
+            before_kx = diamond_kx_card_count(cpu.hand)
+            diamond_set_kx_policy_trace(
+                cpu,
+                before_kx=before_kx,
+                after_kx=0,
+                reason="preserved-plan-direct-finish",
+            )
+            action = platinum_commit_play(cpu, candidate_to_action(finish))
+            return diamond_record_action(
+                cpu,
+                action,
+                room,
+                "post-all-out-kx-direct-finish",
+                finish,
+            )
+        if diamond_retained_certain_closeout_plan_is_valid(
+            preserved,
+            cpu,
+            room,
+            max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+        ):
+            preserved["diamond_kx_response_plan"] = True
+            set_gold_active_plan(cpu, preserved)
+            cpu.diamond_preserved_closeout_plan = None
+            next_step = preserved.get("steps", [])[0]
+            before_kx = diamond_kx_card_count(cpu.hand)
+            after_kx = before_kx - diamond_kx_card_count(
+                candidate_consumed_cards(next_step)
+            )
+            diamond_set_kx_policy_trace(
+                cpu,
+                before_kx=before_kx,
+                after_kx=after_kx,
+                reason="resume-preserved-closeout",
+                retained_certain=diamond_plan_trump_candidate(preserved),
+            )
+            action = play_next_gold_plan_step(cpu, room, validator)
+            if action is not None:
+                action = platinum_commit_play(cpu, action)
+                return diamond_record_action(
+                    cpu,
+                    action,
+                    room,
+                    "post-all-out-kx-preserved-closeout",
+                    next_step,
+                )
+            clear_gold_active_plan(cpu)
+        cpu.diamond_preserved_closeout_plan = None
+    return None
+
+
+def diamond_kx_response_scope(cpu: CpuPlayer, room) -> bool:
+    opponent_count = platinum_opponent_hand_count(cpu, room)
+    return bool(
+        diamond_tactical_context(cpu, room) == "post-all-out-response"
+        and getattr(room, "field", [])
+        and len(cpu.hand) >= DIAMOND_POST_ALL_OUT_KX_POLICY_MIN_HAND_SIZE
+        and opponent_count is not None
+        and opponent_count >= DIAMOND_POST_ALL_OUT_KX_POLICY_MIN_HAND_SIZE
+        and diamond_kx_card_count(cpu.hand) > 0
+    )
+
+
+def diamond_response_pass_state(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+) -> tuple[CpuPlayer, object]:
+    consumed = candidate_consumed_cards(candidate)
+    child = temporary_cpu_with_hand(
+        cpu,
+        remaining_cards(cpu.hand, consumed),
+    )
+    diamond_remember_cards(child, consumed)
+    return child, room_without_field(room)
+
+
+def diamond_kx_response_choice_key(record: dict, room) -> tuple:
+    candidate = record["candidate"]
+    certainty = str(record.get("certainty", "unclassified"))
+    certainty_score = {
+        "unclassified": 0,
+        "soft": 1,
+        "conditional": 2,
+        "certain": 3,
+    }.get(certainty, 0)
+    return (
+        certainty_score,
+        -int(record["kx_spent"]),
+        int(record["after_kx"]),
+        candidate_strength(candidate, room),
+        -len(candidate_consumed_cards(candidate)),
+    )
+
+
+def diamond_commit_kx_response(
+    cpu: CpuPlayer,
+    room,
+    record: dict,
+    *,
+    reason: str,
+) -> CpuAction:
+    candidate = record["candidate"]
+    plan = record.get("plan")
+    clear_gold_active_plan(cpu)
+    cpu.diamond_preserved_closeout_plan = None
+    cpu.diamond_pending_full_recovery = None
+    if plan is not None:
+        plan["diamond_kx_response_plan"] = True
+        plan["diamond_kx_reason"] = reason
+        set_gold_active_plan(cpu, plan)
+    if reason == "full-recovery":
+        cpu.diamond_pending_full_recovery = {
+            "predicted_deck": int(record["predicted_deck"]),
+            "recovery_capacity": int(record["recovery_capacity"]),
+            "response": candidate_fingerprint(candidate),
+        }
+    diamond_set_kx_policy_trace(
+        cpu,
+        before_kx=int(record["before_kx"]),
+        after_kx=int(record["after_kx"]),
+        reason=reason,
+        retained_certain=(
+            diamond_plan_trump_candidate(plan) if plan is not None else None
+        ),
+        predicted_deck=record.get("predicted_deck"),
+        recovery_capacity=record.get("recovery_capacity"),
+    )
+    action = platinum_commit_play(cpu, candidate_to_action(candidate))
+    return diamond_record_action(
+        cpu,
+        action,
+        room,
+        f"post-all-out-kx-{reason}",
+        candidate,
+    )
+
+
+def diamond_continue_kx_active_plan(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    active: dict,
+    suffix: dict,
+    next_step: dict,
+    before_kx: int,
+) -> Optional[CpuAction]:
+    after_kx = before_kx - diamond_kx_card_count(
+        candidate_consumed_cards(next_step)
+    )
+    diamond_set_kx_policy_trace(
+        cpu,
+        before_kx=before_kx,
+        after_kx=after_kx,
+        reason=(
+            "kx-free-retained-certain"
+            if after_kx == before_kx
+            else "retained-certain"
+        ),
+        retained_certain=diamond_plan_trump_candidate(suffix),
+    )
+    active["diamond_kx_response_plan"] = True
+    action = play_next_gold_plan_step(cpu, room, validator)
+    if action is None:
+        clear_gold_active_plan(cpu)
+        return None
+    action = platinum_commit_play(cpu, action)
+    return diamond_record_action(
+        cpu,
+        action,
+        room,
+        "post-all-out-kx-continue-closeout",
+        next_step,
+    )
+
+
+def choose_diamond_post_all_out_kx_response_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    """Gate large, balanced post-all-out responses by K/X closeout value."""
+    if not diamond_kx_response_scope(cpu, room):
+        return None
+    if getattr(cpu, "diamond_opponent_rally_threat", "none") == "certain-likely":
+        return None
+
+    before_kx = diamond_kx_card_count(cpu.hand)
+    band = diamond_kx_policy_band(before_kx)
+    finish = platinum_one_move_finish_candidate(cpu, room, validator)
+    if finish is not None:
+        record = {
+            "candidate": finish,
+            "before_kx": before_kx,
+            "after_kx": 0,
+            "kx_spent": before_kx,
+        }
+        return diamond_commit_kx_response(
+            cpu,
+            room,
+            record,
+            reason="direct-finish",
+        )
+
+    preserved_fallback = getattr(cpu, "diamond_preserved_closeout_plan", None)
+    if not diamond_retained_certain_closeout_plan_is_valid(
+        preserved_fallback,
+        cpu,
+        room_without_field(room),
+        max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+    ):
+        preserved_fallback = diamond_gold_plan_suffix(cpu)
+        fallback_trump_index = gold_plan_trump_step_index(preserved_fallback)
+        if (
+            fallback_trump_index is None
+            or fallback_trump_index > 1
+            or not diamond_retained_certain_closeout_plan_is_valid(
+                preserved_fallback,
+                cpu,
+                room_without_field(room),
+                max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+            )
+        ):
+            preserved_fallback = None
+
+    active = getattr(cpu, "gold_active_plan", None)
+    suffix = diamond_gold_plan_suffix(cpu)
+    active_continuation = None
+    if suffix is not None and diamond_retained_certain_closeout_plan_is_valid(
+        suffix,
+        cpu,
+        room_without_field(room),
+        max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+    ):
+        steps = list(active.get("steps", []))
+        index = int(getattr(cpu, "gold_plan_step_index", 0))
+        next_step = steps[index] if index < len(steps) else None
+        if next_step is not None and candidate_is_playable(next_step, cpu, room):
+            active_continuation = (active, suffix, next_step)
+        else:
+            clear_gold_active_plan(cpu)
+
+    candidates = platinum_legal_response_candidates(
+        cpu,
+        room,
+        validator,
+        allow_non_trump_joker=True,
+    )
+    records = []
+    predicted_base = (
+        len(getattr(room, "deck", []) or [])
+        + len(getattr(room, "reserve", []) or [])
+    )
+    for candidate in candidates:
+        consumed = candidate_consumed_cards(candidate)
+        child, empty_room = diamond_response_pass_state(cpu, room, candidate)
+        after_kx = diamond_kx_card_count(child.hand)
+        child_finish = platinum_one_move_finish_candidate(
+            child,
+            empty_room,
+            validator,
+        )
+        finish_plan = None
+        if child_finish is not None:
+            child_finish = dict(child_finish)
+            child_finish["role"] = "finish"
+            finish_plan = finalize_gold_plan(
+                child,
+                empty_room,
+                [child_finish],
+                0,
+            )
+            finish_plan["diamond_kx_direct_tail"] = True
+        predicted_deck = predicted_base + len(consumed)
+        records.append({
+            "candidate": candidate,
+            "child": child,
+            "empty_room": empty_room,
+            "before_kx": before_kx,
+            "after_kx": after_kx,
+            "kx_spent": before_kx - after_kx,
+            "certainty": "unclassified",
+            "plan": finish_plan,
+            "predicted_deck": predicted_deck,
+            "recovery_capacity": len(child.hand),
+            "full_recovery": predicted_deck <= len(child.hand),
+        })
+
+    direct_tails = [record for record in records if record.get("plan") is not None]
+    if direct_tails:
+        chosen = max(
+            direct_tails,
+            key=lambda record: diamond_kx_response_choice_key(record, room),
+        )
+        return diamond_commit_kx_response(
+            cpu,
+            room,
+            chosen,
+            reason="next-move-finish",
+        )
+
+    recoveries = [record for record in records if record["full_recovery"]]
+    if band == "1-2" and recoveries:
+        chosen = max(
+            recoveries,
+            key=lambda record: diamond_kx_response_choice_key(record, room),
+        )
+        return diamond_commit_kx_response(
+            cpu,
+            room,
+            chosen,
+            reason="full-recovery",
+        )
+
+    if active_continuation is not None:
+        active, suffix, next_step = active_continuation
+        continued = diamond_continue_kx_active_plan(
+            cpu,
+            room,
+            validator,
+            active,
+            suffix,
+            next_step,
+            before_kx,
+        )
+        if continued is not None:
+            return continued
+
+    retained = []
+    for record in sorted(
+        records,
+        key=lambda item: diamond_kx_response_choice_key(item, room),
+        reverse=True,
+    ):
+        if not diamond_post_all_out_search_has_time(cpu):
+            break
+        plan = diamond_retained_certain_closeout_plan(
+            record["child"],
+            record["empty_room"],
+            validator,
+            max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS - 1,
+        )
+        if plan is None:
+            continue
+        record["plan"] = plan
+        retained.append(record)
+    if retained:
+        chosen = max(
+            retained,
+            key=lambda record: (
+                -diamond_plan_rally_step_count(record["plan"]),
+                diamond_plan_finish_strength(record["plan"]),
+                diamond_kx_response_choice_key(record, room),
+            ),
+        )
+        return diamond_commit_kx_response(
+            cpu,
+            room,
+            chosen,
+            reason=(
+                "kx-free-retained-certain"
+                if chosen["kx_spent"] == 0
+                else "retained-certain"
+            ),
+        )
+
+    if recoveries:
+        chosen = max(
+            recoveries,
+            key=lambda record: diamond_kx_response_choice_key(record, room),
+        )
+        return diamond_commit_kx_response(
+            cpu,
+            room,
+            chosen,
+            reason="full-recovery",
+        )
+
+    preserved = preserved_fallback
+    if not diamond_retained_certain_closeout_plan_is_valid(
+        preserved_fallback,
+        cpu,
+        room_without_field(room),
+        max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+    ):
+        preserved = diamond_retained_certain_closeout_plan(
+            cpu,
+            room_without_field(room),
+            validator,
+            max_rally_steps=DIAMOND_POST_ALL_OUT_MAX_RALLY_STEPS,
+            max_prefix_steps=1,
+        )
+    if preserved is not None:
+        clear_gold_active_plan(cpu)
+        cpu.diamond_preserved_closeout_plan = preserved
+        cpu.diamond_last_route_kind = "post-all-out-kx-preserve-pass"
+        cpu.diamond_last_certainty = "certain"
+        diamond_set_kx_policy_trace(
+            cpu,
+            before_kx=before_kx,
+            after_kx=before_kx,
+            reason="preserve-pass",
+            retained_certain=diamond_plan_trump_candidate(preserved),
+            pass_reason="zero-or-one-prefix-certain-finish",
+        )
+        return CpuAction("pass")
+
+    cpu.diamond_preserved_closeout_plan = None
+    clear_gold_active_plan(cpu)
+    if (
+        not getattr(room, "has_drawn", False)
+        and bool(getattr(room, "deck", []) or [])
+    ):
+        cpu.diamond_last_route_kind = "post-all-out-kx-single-draw"
+        cpu.diamond_last_certainty = "unclassified"
+        diamond_set_kx_policy_trace(
+            cpu,
+            before_kx=before_kx,
+            after_kx=before_kx,
+            reason="single-draw",
+            pass_reason="no-approved-response-or-preserved-closeout",
+        )
+        return CpuAction("draw")
+
+    cpu.diamond_last_route_kind = "post-all-out-kx-preserve-pass"
+    cpu.diamond_last_certainty = "unclassified"
+    diamond_set_kx_policy_trace(
+        cpu,
+        before_kx=before_kx,
+        after_kx=before_kx,
+        reason="preserve-pass",
+        pass_reason="draw-used-no-approved-response",
+    )
+    return CpuAction("pass")
 
 
 def choose_diamond_context_action(
@@ -4983,6 +6095,62 @@ def diamond_opening_auso_trump_score(candidate: dict) -> Optional[float]:
     if value >= platinum_token_value("kjtk"):
         return 97.0
     return DIAMOND_OPENING_AUSO_BASE_SCORE
+
+
+def diamond_opening_auso_converts_to_initial_all_out(
+    plan: dict,
+    cpu: CpuPlayer,
+) -> bool:
+    """Replace only reviewed first-seat non-dual Auso shapes with all-out.
+
+    KQK/KKJ and KJQJ retain their opening routes. A fixed or generalized
+    dual-wield plan also remains preferred because its pass branch is the
+    tactical proof that the ordinary Auso route lacks.
+    """
+    if (
+        getattr(cpu, "cpu_key", "") != "diamond_planner"
+        or getattr(cpu, "diamond_opening_was_second", None) is not False
+        or not getattr(cpu, "platinum_opening_phase", True)
+        or not plan.get("diamond_opening_auso")
+        or plan.get("dual_wield")
+    ):
+        return False
+    trump = diamond_plan_trump_candidate(plan)
+    return (
+        trump is not None
+        and platinum_candidate_token(trump)
+        in DIAMOND_OPENING_AUSO_ALL_OUT_TRUMP_TOKENS
+    )
+
+
+def diamond_pending_initial_all_out_action(
+    cpu: CpuPlayer,
+    room,
+) -> Optional[CpuAction]:
+    """Complete the reviewed draw -> all-out replacement on the same turn."""
+    if not getattr(cpu, "diamond_pending_initial_all_out", False):
+        return None
+    if getattr(room, "field", []) or []:
+        cpu.diamond_pending_initial_all_out = False
+        return None
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        cpu.diamond_last_route_kind = "opening-auso-policy-all-out-draw"
+        cpu.diamond_last_certainty = "unclassified"
+        return CpuAction("draw")
+
+    payload = build_gold_all_out_payload(
+        cpu.hand,
+        force_random=True,
+        rng=cpu.rng,
+    )
+    cpu.diamond_pending_initial_all_out = False
+    if payload is None:
+        return None
+    clear_gold_active_plan(cpu)
+    cpu.platinum_all_out_attempts += 1
+    cpu.diamond_last_route_kind = "opening-auso-policy-all-out"
+    cpu.diamond_last_certainty = "unclassified"
+    return platinum_commit_play(cpu, CpuAction("play_prime", payload))
 
 
 def diamond_opening_tactical_plan_sort_key(
@@ -7985,11 +9153,16 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
     temp.diamond_last_context = cpu.diamond_last_context
     temp.diamond_last_plan_tier = cpu.diamond_last_plan_tier
     temp.diamond_last_finish_strength = cpu.diamond_last_finish_strength
+    temp.diamond_opening_was_second = cpu.diamond_opening_was_second
+    temp.diamond_opponent_ever_13_plus = cpu.diamond_opponent_ever_13_plus
     temp.diamond_seen_cards = dict(cpu.diamond_seen_cards)
     temp.diamond_public_response_signature_cache = (
         cpu.diamond_public_response_signature_cache
     )
     temp.diamond_last_conditional_limit = cpu.diamond_last_conditional_limit
+    temp.diamond_pending_full_recovery = cpu.diamond_pending_full_recovery
+    temp.diamond_preserved_closeout_plan = cpu.diamond_preserved_closeout_plan
+    temp.diamond_last_kx_policy = dict(cpu.diamond_last_kx_policy)
     temp.rng = cpu.rng
     temp.decision_time_budget_ms = cpu.decision_time_budget_ms
     temp.decision_deadline = cpu.decision_deadline

@@ -456,6 +456,7 @@ class Room:
         self.last_number = None     # “場に出ている”最後の数値を保持
         self.last_play_player_id = None
         self.last_play_hand_before = None
+        self.last_play_kind = None
         self.current_turn_id = None
         self.first_player_id = None
         self.has_drawn = False
@@ -2785,6 +2786,7 @@ def flow_field(room: Room) -> None:
     room.last_number = None
     room.last_play_player_id = None
     room.last_play_hand_before = None
+    room.last_play_kind = None
     if room.reserve:
         ensure_public_deck_tracker(room)
         room.public_known_deck_bottom.extend(room.reserve)
@@ -2800,10 +2802,17 @@ def return_cards_to_deck_bottom(room, cards: List[dict]) -> None:
     room.deck.extend(cards)
 
 
-def record_field_play(room: Room, player, hand_before: int) -> None:
+def record_field_play(
+    room: Room,
+    player,
+    hand_before: int,
+    *,
+    play_kind: str,
+) -> None:
     """Remember the public hand count from immediately before the current play."""
     room.last_play_player_id = player.id
     room.last_play_hand_before = int(hand_before)
+    room.last_play_kind = play_kind
 
 def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card_count: int) -> int:
     """
@@ -5593,7 +5602,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # フラグをトグル
         room.reverse_order = not room.reverse_order
         # カードを場に出す
-        record_field_play(room, player, len(player.hand))
+        record_field_play(room, player, len(player.hand), play_kind="prime")
         push_to_reserve(room, played_cards)
         for c in played_cards:
             player.remove_card(c)
@@ -5694,7 +5703,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # 素数なら場に出し、対局中に出したプレイヤーごとの最大素数も記録する。
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
     remember_largest_prime_play(room, player, number, play_text)
-    record_field_play(room, player, len(player.hand))
+    record_field_play(room, player, len(player.hand), play_kind="prime")
     push_to_reserve(room, played_cards)
     for c in played_cards:
         player.remove_card(c)
@@ -6097,7 +6106,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             return
 
         room.reverse_order = not room.reverse_order
-        record_field_play(room, player, hand_before)
+        record_field_play(room, player, hand_before, play_kind="composite")
         room.field = sel_cards
         room.last_number = sel_number
         await room.update_game_state()
@@ -6117,7 +6126,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 
     # 7) すべてOK → 札を「出した順」でreserveに積む → 手札から除去
     #    出した順は UI から渡す順序（selected→consume）で良ければそのまま。必要なら tokens から順序を決める。
-    record_field_play(room, player, len(player.hand))
+    record_field_play(room, player, len(player.hand), play_kind="composite")
     push_to_reserve(room, sel_cards)
 
     # selected と重複するカードは deck に戻さない
@@ -6249,6 +6258,7 @@ async def start_game(room):
     room.last_number = None
     room.last_play_player_id = None
     room.last_play_hand_before = None
+    room.last_play_kind = None
     room.score_log = []
     for player in waiting_players:
         player.sort_hand()
