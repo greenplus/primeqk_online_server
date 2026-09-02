@@ -78,6 +78,7 @@ RECRUITMENT_DISCORD_WINDOW_SECONDS = int_env(
     minimum=1,
 )
 TURN_TIME_LIMIT_SECONDS = int_env("TURN_TIME_LIMIT_SECONDS", 60, minimum=10)
+START_GAME_APPROVAL_SECONDS = 60
 PLUS_CLIENT_URL = os.getenv("PLUS_CLIENT_URL", "https://greenplus.github.io/qkplus/")
 NEO_CLIENT_URL = os.getenv("NEO_CLIENT_URL", "https://greenplus.github.io/qkneo/")
 LEGACY_CLIENT_URL = os.getenv("LEGACY_CLIENT_URL", "https://greenplus.github.io/primeqk_online/")
@@ -476,6 +477,11 @@ class Room:
         self.turn_timeout_seconds: Optional[int] = None
         self.turn_timeout_task: Optional[asyncio.Task] = None
         self.turn_action_lock = asyncio.Lock()
+        self.pending_start_request: Optional[dict] = None
+        self.pending_start_request_task: Optional[asyncio.Task] = None
+        self.start_in_progress = False
+        self.alternating_participant_ids: Optional[Tuple[str, ...]] = None
+        self.last_alternating_first_player_id: Optional[str] = None
 
     async def broadcast(self, message: dict):
         disconnected = []
@@ -492,6 +498,11 @@ class Room:
             if getattr(p, "room_resume_token_hash", None):
                 await mark_player_disconnected(p)
             else:
+                if getattr(p, "status", None) == "waiting":
+                    await invalidate_turn_alternation(
+                        self,
+                        "対戦メンバーが変わったため、開始申請を取り消しました。",
+                    )
                 removed_immediately.append(p)
                 if p in self.players:
                     self.players.remove(p)
@@ -1146,6 +1157,13 @@ async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] 
     player.ws = None
     if first_notice:
         player.disconnected_at = now or utc_now()
+        request = room.pending_start_request
+        if request is not None and player.id in request.get("participant_ids", ()):
+            await resolve_pending_start_request(
+                room,
+                "invalidated",
+                "対戦参加者の通信が切れたため、開始申請を取り消しました。",
+            )
         grace_seconds = room_disconnect_grace_seconds(room, player)
         await room.log_chat(
             f"{player.name}の通信が一時的に切れました。{grace_seconds}秒間、復帰を待ちます。"
@@ -2393,6 +2411,143 @@ def check_win_condition(room):
 
 def get_active_players(room) -> List["Player"]:
     return [p for p in room.players if p.status == "waiting"]
+
+
+def turn_alternation_participant_ids(players: List["Player"]) -> Tuple[str, ...]:
+    return tuple(sorted(player.id for player in players))
+
+
+def reset_turn_alternation(room: Room) -> None:
+    room.alternating_participant_ids = None
+    room.last_alternating_first_player_id = None
+
+
+def turn_alternation_continues(room: Room, players: List["Player"]) -> bool:
+    participant_ids = turn_alternation_participant_ids(players)
+    return bool(
+        len(participant_ids) == 2
+        and room.alternating_participant_ids == participant_ids
+        and room.last_alternating_first_player_id in participant_ids
+    )
+
+
+def normalize_turn_order_request(player: "Player", data: dict) -> Tuple[bool, str]:
+    if getattr(player, "client_surface", "legacy") not in {"neo", "plus"}:
+        return False, "random"
+    raw = data.get("turn_order")
+    if not isinstance(raw, dict) or raw.get("alternate") is not True:
+        return False, "random"
+    first_mode = raw.get("first", "random")
+    if first_mode not in {"random", "requester", "opponent"}:
+        first_mode = "random"
+    return True, first_mode
+
+
+def requested_first_player_id(
+    room: Room,
+    players: List["Player"],
+    requester: "Player",
+    first_mode: str,
+) -> Optional[str]:
+    if len(players) != 2:
+        return players[0].id if len(players) == 1 else None
+    if turn_alternation_continues(room, players):
+        return next(
+            player.id
+            for player in players
+            if player.id != room.last_alternating_first_player_id
+        )
+    if first_mode == "requester":
+        return requester.id
+    if first_mode == "opponent":
+        opponent = next((player for player in players if player.id != requester.id), None)
+        return opponent.id if opponent else None
+    return None
+
+
+def start_request_public_payload(request: dict) -> dict:
+    return {
+        "request_id": request["request_id"],
+        "requester_id": request["requester_id"],
+        "requester_name": request["requester_name"],
+        "opponent_id": request["opponent_id"],
+        "opponent_name": request["opponent_name"],
+        "first": request["first"],
+        "continuation": request["continuation"],
+        "effective_first_player_id": request.get("effective_first_player_id"),
+        "effective_first_player_name": request.get("effective_first_player_name"),
+        "expires_at": request["expires_at"],
+    }
+
+
+def clear_pending_start_request(room: Room) -> Optional[dict]:
+    request = room.pending_start_request
+    room.pending_start_request = None
+    task = room.pending_start_request_task
+    room.pending_start_request_task = None
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+    return request
+
+
+async def send_start_request_resolution(
+    room: Room,
+    request: dict,
+    status: str,
+    message: str,
+) -> None:
+    payload = {
+        "type": "start_game_request_resolved",
+        **start_request_public_payload(request),
+        "status": status,
+        "message": message,
+        "server_now": utc_now().isoformat(),
+    }
+    participant_ids = set(request["participant_ids"])
+    for participant in list(room.players):
+        if (
+            participant.id not in participant_ids
+            or is_cpu_player(participant)
+            or getattr(participant, "ws", None) is None
+        ):
+            continue
+        try:
+            await participant.send_json(payload)
+        except Exception:
+            pass
+
+
+async def resolve_pending_start_request(
+    room: Room,
+    status: str,
+    message: str,
+) -> Optional[dict]:
+    request = clear_pending_start_request(room)
+    if request is None:
+        return None
+    await send_start_request_resolution(room, request, status, message)
+    return request
+
+
+async def expire_pending_start_request(room: Room, request_id: str) -> None:
+    try:
+        await asyncio.sleep(START_GAME_APPROVAL_SECONDS)
+    except asyncio.CancelledError:
+        return
+    request = room.pending_start_request
+    if request is None or request.get("request_id") != request_id:
+        return
+    await resolve_pending_start_request(
+        room,
+        "expired",
+        "開始申請は60秒以内に承認されなかったため失効しました。",
+    )
+
+
+async def invalidate_turn_alternation(room: Room, message: str) -> None:
+    reset_turn_alternation(room)
+    if room.pending_start_request is not None:
+        await resolve_pending_start_request(room, "invalidated", message)
 
 
 def prepare_campaign_game(
@@ -4626,6 +4781,10 @@ async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None =
     cpu.room = room
     cpu.status = "waiting"
     apply_cpu_knowledge(cpu, room, profile)
+    await invalidate_turn_alternation(
+        room,
+        "対戦メンバーが変わったため、開始申請を取り消しました。",
+    )
     room.players.append(cpu)
     await room.log_chat(f"{cpu.name}が入室しました")
     await log_talkative_fish_join(room, cpu)
@@ -4670,6 +4829,10 @@ async def remove_cpu_from_room(room: Room) -> bool:
     cpu = next((p for p in room.players if is_cpu_player(p)), None)
     if cpu is None:
         return False
+    await invalidate_turn_alternation(
+        room,
+        "対戦メンバーが変わったため、開始申請を取り消しました。",
+    )
     room.players.remove(cpu)
     await log_talkative_fish_leave(room, cpu)
     cpu.room = None
@@ -4772,6 +4935,241 @@ async def pass_turn_for_player(player, room: Room, *, timed_out: bool = False) -
     notation = "%%" if timed_out else "%"
     record_score_play_line(room, player, f"{score_state_prefix(room)}{notation}")
     await next_turn(room)
+
+
+async def send_start_game_error(player: "Player", code: str, message: str) -> None:
+    await player.send_json({"type": "error", "code": code, "message": message})
+
+
+async def validate_start_game_players(
+    player: "Player",
+    room: Room,
+) -> Optional[List["Player"]]:
+    if room.start_in_progress:
+        await send_start_game_error(player, "game_start_in_progress", "対戦を開始しています。")
+        return None
+    if room.state == "playing":
+        await send_start_game_error(player, "game_already_started", "対戦はすでに始まっています。")
+        return None
+    waiting_players = get_active_players(room)
+    if player not in waiting_players:
+        await send_start_game_error(player, "not_game_participant", "対戦に参加してから開始してください。")
+        return None
+    if len(waiting_players) not in (1, 2):
+        await send_start_game_error(player, "invalid_waiting_count", "対戦待ちは1人または2人必要です。")
+        return None
+    disconnected_waiting = [
+        item
+        for item in waiting_players
+        if not is_cpu_player(item) and getattr(item, "ws", None) is None
+    ]
+    if disconnected_waiting:
+        await send_start_game_error(
+            player,
+            "disconnected_game_participant",
+            "切断中の対戦待ちプレイヤーがいます。復帰するか待機猶予が終わるまでお待ちください。",
+        )
+        return None
+    missing_registered = missing_registered_prime_players(room)
+    if missing_registered:
+        names = ", ".join(item.name for item in missing_registered)
+        await send_start_game_error(
+            player,
+            "registered_numbers_required",
+            f"登録素数が未設定のプレイヤーがいます: {names}",
+        )
+        return None
+    return waiting_players
+
+
+async def create_start_game_approval_request(
+    room: Room,
+    requester: "Player",
+    players: List["Player"],
+    first_mode: str,
+) -> None:
+    opponent = next(item for item in players if item.id != requester.id)
+    continuation = turn_alternation_continues(room, players)
+    effective_first_player_id = requested_first_player_id(room, players, requester, first_mode)
+    effective_first_player = next(
+        (item for item in players if item.id == effective_first_player_id),
+        None,
+    )
+    expires_at = utc_now() + timedelta(seconds=START_GAME_APPROVAL_SECONDS)
+    request = {
+        "request_id": str(uuid.uuid4()),
+        "requester_id": requester.id,
+        "requester_name": requester.name,
+        "opponent_id": opponent.id,
+        "opponent_name": opponent.name,
+        "participant_ids": turn_alternation_participant_ids(players),
+        "first": first_mode,
+        "continuation": continuation,
+        "effective_first_player_id": effective_first_player_id,
+        "effective_first_player_name": effective_first_player.name if effective_first_player else None,
+        "expires_at": expires_at.isoformat(),
+        "expires_at_datetime": expires_at,
+    }
+    room.pending_start_request = request
+    room.pending_start_request_task = asyncio.create_task(
+        expire_pending_start_request(room, request["request_id"])
+    )
+    common_payload = {
+        **start_request_public_payload(request),
+        "server_now": utc_now().isoformat(),
+    }
+    try:
+        await requester.send_json({
+            "type": "start_game_request_pending",
+            **common_payload,
+        })
+        await opponent.send_json({
+            "type": "start_game_approval_required",
+            **common_payload,
+        })
+    except Exception:
+        await resolve_pending_start_request(
+            room,
+            "invalidated",
+            "相手へ開始申請を送れなかったため、申請を取り消しました。",
+        )
+
+
+async def handle_start_game_request(player: "Player", data: dict) -> None:
+    room = player.room
+    if room is None:
+        return
+    if is_tournament_managed_room(room):
+        await send_start_game_error(
+            player,
+            "tournament_managed_start",
+            "大会の対戦はシステムが自動で開始します。",
+        )
+        return
+    if room.pending_start_request is not None:
+        await send_start_game_error(
+            player,
+            "start_game_request_pending",
+            "別の開始申請が承認待ちです。回答または取り消しをお待ちください。",
+        )
+        return
+    waiting_players = await validate_start_game_players(player, room)
+    if waiting_players is None:
+        return
+
+    alternate, first_mode = normalize_turn_order_request(player, data)
+    alternate = alternate and len(waiting_players) == 2
+    human_players_in_game = [item for item in waiting_players if not is_cpu_player(item)]
+    if alternate and len(human_players_in_game) == 2:
+        await create_start_game_approval_request(room, player, waiting_players, first_mode)
+        return
+    room.start_in_progress = True
+    try:
+        await start_game_with_turn_order(
+            room,
+            requester=player,
+            alternate=alternate,
+            first_mode=first_mode,
+        )
+    finally:
+        room.start_in_progress = False
+
+
+async def handle_start_game_response(player: "Player", data: dict) -> None:
+    room = player.room
+    request = room.pending_start_request if room is not None else None
+    if room is None or request is None:
+        await send_start_game_error(player, "start_game_request_missing", "承認待ちの開始申請はありません。")
+        return
+    if data.get("request_id") != request["request_id"]:
+        await send_start_game_error(player, "start_game_request_stale", "この開始申請はすでに更新されています。")
+        return
+    if player.id != request["opponent_id"]:
+        await send_start_game_error(player, "start_game_response_forbidden", "この開始申請には回答できません。")
+        return
+    if data.get("approved") is not True:
+        await resolve_pending_start_request(room, "rejected", f"{player.name}が開始申請を拒否しました。")
+        return
+    if utc_now() >= request["expires_at_datetime"]:
+        await resolve_pending_start_request(
+            room,
+            "expired",
+            "開始申請は60秒以内に承認されなかったため失効しました。",
+        )
+        return
+
+    waiting_players = get_active_players(room)
+    current_participant_ids = turn_alternation_participant_ids(waiting_players)
+    if room.state != "waiting" or current_participant_ids != request["participant_ids"]:
+        await invalidate_turn_alternation(
+            room,
+            "対戦メンバーが変わったため、開始申請を取り消しました。",
+        )
+        return
+    if any(
+        not is_cpu_player(item) and getattr(item, "ws", None) is None
+        for item in waiting_players
+    ):
+        await resolve_pending_start_request(
+            room,
+            "invalidated",
+            "切断中のプレイヤーがいるため、開始申請を取り消しました。",
+        )
+        return
+    missing_registered = missing_registered_prime_players(room)
+    if missing_registered:
+        names = ", ".join(item.name for item in missing_registered)
+        await resolve_pending_start_request(
+            room,
+            "invalidated",
+            f"登録素数が未設定のプレイヤーがいます: {names}",
+        )
+        return
+
+    requester = next(
+        (item for item in waiting_players if item.id == request["requester_id"]),
+        None,
+    )
+    if requester is None:
+        await invalidate_turn_alternation(
+            room,
+            "開始を申請したプレイヤーがいないため、申請を取り消しました。",
+        )
+        return
+    first_mode = request["first"]
+    accepted_request = clear_pending_start_request(room)
+    room.start_in_progress = True
+    try:
+        await start_game_with_turn_order(
+            room,
+            requester=requester,
+            alternate=True,
+            first_mode=first_mode,
+        )
+    finally:
+        room.start_in_progress = False
+    if accepted_request is not None:
+        await send_start_request_resolution(
+            room,
+            accepted_request,
+            "accepted",
+            f"{player.name}が開始申請を承認しました。",
+        )
+
+
+async def handle_start_game_cancel(player: "Player", data: dict) -> None:
+    room = player.room
+    request = room.pending_start_request if room is not None else None
+    if room is None or request is None:
+        await send_start_game_error(player, "start_game_request_missing", "承認待ちの開始申請はありません。")
+        return
+    if data.get("request_id") != request["request_id"]:
+        await send_start_game_error(player, "start_game_request_stale", "この開始申請はすでに更新されています。")
+        return
+    if player.id != request["requester_id"]:
+        await send_start_game_error(player, "start_game_cancel_forbidden", "この開始申請は取り消せません。")
+        return
+    await resolve_pending_start_request(room, "cancelled", f"{player.name}が開始申請を取り消しました。")
 
 ################################################
 # WebSocket処理
@@ -5233,7 +5631,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
                 new_status = data["status"]
+                old_status = player.status
                 player.status = new_status
+                if old_status != new_status and "waiting" in {old_status, new_status}:
+                    await invalidate_turn_alternation(
+                        room,
+                        "対戦メンバーが変わったため、開始申請を取り消しました。",
+                    )
                 if new_status != "waiting":
                     player.clear_hand()
                     await player.send_hand_update()
@@ -5276,40 +5680,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
             elif msg_type == "start_game":
-                if not player.room:
-                    continue
-                room = player.room
-                if is_tournament_managed_room(room):
-                    await player.send_json({"type": "error", "message": "大会の対戦はシステムが自動で開始します。"})
-                    continue
+                await handle_start_game_request(player, data)
 
-                # 対戦待ちプレイヤー確認
-                waiting_players = get_active_players(room)
-                if len(waiting_players) not in (1, 2):
-                    await websocket.send_json({"type": "error", "message": "対戦待ちは1人または2人必要です。"})
-                    continue
-                disconnected_waiting = [
-                    item
-                    for item in waiting_players
-                    if not is_cpu_player(item) and getattr(item, "ws", None) is None
-                ]
-                if disconnected_waiting:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "切断中の対戦待ちプレイヤーがいます。復帰するか待機猶予が終わるまでお待ちください。",
-                    })
-                    continue
-                missing_registered = missing_registered_prime_players(room)
-                if missing_registered:
-                    names = ", ".join(p.name for p in missing_registered)
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": f"登録素数が未設定のプレイヤーがいます: {names}",
-                    })
-                    continue
+            elif msg_type == "respond_start_game_request":
+                await handle_start_game_response(player, data)
 
-                await start_game(room)
-                await maybe_schedule_cpu_turn(room)
+            elif msg_type == "cancel_start_game_request":
+                await handle_start_game_cancel(player, data)
 
             elif msg_type == "get_prime_assist":
                 if not player.room:
@@ -6198,6 +6575,11 @@ async def leave_room(player, notify_client: bool = True):
 
     if player in room.players:
         departed_player_id = player.id
+        if player.status == "waiting":
+            await invalidate_turn_alternation(
+                room,
+                "対戦メンバーが変わったため、開始申請を取り消しました。",
+            )
         room.players.remove(player)
         player.room = None
 
@@ -6227,7 +6609,32 @@ async def leave_room(player, notify_client: bool = True):
 ################################################
 # ゲーム開始処理
 ################################################
-async def start_game(room):
+async def start_game_with_turn_order(
+    room: Room,
+    *,
+    requester: "Player",
+    alternate: bool,
+    first_mode: str,
+) -> None:
+    waiting_players = get_active_players(room)
+    first_player_id = (
+        requested_first_player_id(room, waiting_players, requester, first_mode)
+        if alternate and len(waiting_players) == 2
+        else None
+    )
+    await start_game(
+        room,
+        first_player_id=first_player_id,
+        turn_alternation=alternate and len(waiting_players) == 2,
+    )
+
+
+async def start_game(
+    room: Room,
+    *,
+    first_player_id: Optional[str] = None,
+    turn_alternation: bool = False,
+):
     stop_turn_clock(room)
     room.reverse_order = room.rule.start_revolution     # 革命はルールごとの開始時コンディションに戻す
     room.has_drawn = False         # ドロー済みフラグもクリア
@@ -6236,6 +6643,7 @@ async def start_game(room):
     waiting_players = get_active_players(room)
     if len(waiting_players) not in (1, 2):
         return
+    room.state = "playing"
     prepare_campaign_game(room, waiting_players)
     for p in room.players:
         if p not in waiting_players:
@@ -6263,11 +6671,19 @@ async def start_game(room):
     for player in waiting_players:
         player.sort_hand()
         record_score_line(room, f"{player.name}:({score_cards_text(player.hand, sort_cards=True)})")
-    room.state = "playing"
-
-    # ランダムに先攻プレイヤー決定
-    room.current_turn_id = random.choice([p.id for p in waiting_players])
+    # 指定がなければ従来どおりランダムに先攻プレイヤーを決定
+    waiting_player_ids = [p.id for p in waiting_players]
+    room.current_turn_id = (
+        first_player_id
+        if first_player_id in waiting_player_ids
+        else random.choice(waiting_player_ids)
+    )
     room.first_player_id = room.current_turn_id
+    if turn_alternation and len(waiting_players) == 2:
+        room.alternating_participant_ids = turn_alternation_participant_ids(waiting_players)
+        room.last_alternating_first_player_id = room.first_player_id
+    else:
+        reset_turn_alternation(room)
     room.turn_timeout_seconds = game_turn_time_limit_seconds(room, waiting_players)
     start_turn_clock(room)
 
