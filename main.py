@@ -482,6 +482,9 @@ class Room:
         self.start_in_progress = False
         self.alternating_participant_ids: Optional[Tuple[str, ...]] = None
         self.last_alternating_first_player_id: Optional[str] = None
+        self.alternating_series: Optional[dict] = None
+        self.current_game_uses_turn_alternation = False
+        self.end_alternating_series_after_game = False
 
     async def broadcast(self, message: dict):
         disconnected = []
@@ -547,7 +550,8 @@ class Room:
                 }
                 for p in self.players
             ],
-            "waiting_count": len([p for p in self.players if p.status == "waiting"])
+            "waiting_count": len([p for p in self.players if p.status == "waiting"]),
+            "turn_alternation_series": turn_alternation_series_status(self),
         }
         if is_tournament_managed_room(self):
             run = tournament_run_for_room(self)
@@ -660,7 +664,11 @@ class Room:
             await self.log_chat(f"{winner}が勝利しました")
             await send_neo_largest_prime_share_chats(self)
             await maybe_log_talkative_fish_game_over(self)
-            await publish_score_log(self, winner)
+            await publish_score_log(
+                self,
+                winner,
+                winner_player_id=winner_player.id if winner_player is not None else None,
+            )
             if campaign_result is not None and winner_player is not None:
                 await winner_player.send_json(campaign_result)
             return True
@@ -1254,6 +1262,7 @@ def room_initialization_payload(room: "Room", player: "Player") -> dict:
         "cpu_profiles": available_cpu_profile_payloads(room.rule),
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
+        "turn_alternation_series": turn_alternation_series_status(room),
         **turn_clock_payload(room),
         "tournament": tournament_public_payload(
             tournament_run_for_room(room),
@@ -1914,6 +1923,11 @@ async def expire_disconnected_room_sessions(now: Optional[datetime] = None) -> N
         entry[1].append(player)
 
     for room, expired_players in expired_by_room.values():
+        if any(player.status == "waiting" for player in expired_players):
+            await invalidate_turn_alternation(
+                room,
+                "対戦メンバーが変わったため、開始申請を取り消しました。",
+            )
         departed_ids = []
         for player in expired_players:
             departed_ids.append(player.id)
@@ -2422,6 +2436,185 @@ def reset_turn_alternation(room: Room) -> None:
     room.last_alternating_first_player_id = None
 
 
+def turn_alternation_series_status(room: Room) -> Optional[dict]:
+    series = room.alternating_series
+    if series is None:
+        return None
+    refresh_alternating_series_names(room)
+    participants = alternating_series_participant_results(series)
+    return {
+        "series_id": series["series_id"],
+        "participant_ids": list(series["participant_ids"]),
+        "participants": participants,
+        "game_count": len(series["games"]),
+    }
+
+
+def alternating_series_participant_results(series: dict) -> List[dict]:
+    games = list(series.get("games") or [])
+    results = []
+    for participant in series.get("participants") or []:
+        participant_id = participant["id"]
+        wins = sum(1 for game in games if game.get("winner_id") == participant_id)
+        losses = sum(
+            1
+            for game in games
+            if game.get("winner_id") is not None
+            and game.get("winner_id") != participant_id
+        )
+        results.append({
+            "id": participant_id,
+            "name": participant["name"],
+            "wins": wins,
+            "losses": losses,
+        })
+    return results
+
+
+def refresh_alternating_series_names(room: Room) -> None:
+    series = room.alternating_series
+    if series is None:
+        return
+    current_names = {player.id: player.name for player in room.players}
+    for participant in series["participants"]:
+        if participant["id"] in current_names:
+            participant["name"] = current_names[participant["id"]]
+
+
+def begin_turn_alternation_series(room: Room, players: List["Player"]) -> dict:
+    participant_ids = turn_alternation_participant_ids(players)
+    series = {
+        "series_id": str(uuid.uuid4()),
+        "participant_ids": participant_ids,
+        "participants": [
+            {"id": player.id, "name": player.name}
+            for player in players
+        ],
+        "rule_key": room.rule.key,
+        "rule_label": room.rule.label,
+        "started_at": utc_now().isoformat(),
+        "games": [],
+    }
+    room.alternating_series = series
+    room.end_alternating_series_after_game = False
+    return series
+
+
+def ensure_turn_alternation_series(room: Room, players: List["Player"]) -> dict:
+    participant_ids = turn_alternation_participant_ids(players)
+    series = room.alternating_series
+    if series is None or tuple(series.get("participant_ids") or ()) != participant_ids:
+        series = begin_turn_alternation_series(room, players)
+    else:
+        refresh_alternating_series_names(room)
+    return series
+
+
+def alternating_series_player_name(series: dict, player_id: Optional[str]) -> Optional[str]:
+    if player_id is None:
+        return None
+    participant = next(
+        (item for item in series.get("participants") or [] if item.get("id") == player_id),
+        None,
+    )
+    return participant.get("name") if participant is not None else None
+
+
+def record_turn_alternation_game(
+    room: Room,
+    *,
+    winner_id: Optional[str],
+    winner_name: Optional[str],
+    lines: List[str],
+) -> None:
+    if not room.current_game_uses_turn_alternation:
+        return
+    room.current_game_uses_turn_alternation = False
+    series = room.alternating_series
+    if series is None:
+        return
+    refresh_alternating_series_names(room)
+    game_number = len(series["games"]) + 1
+    first_player_id = room.first_player_id
+    series["games"].append({
+        "game_number": game_number,
+        "game_id": room.game_id,
+        "first_player_id": first_player_id,
+        "first_player_name": alternating_series_player_name(series, first_player_id),
+        "winner_id": winner_id,
+        "winner_name": winner_name,
+        "lines": list(lines),
+    })
+
+
+def turn_alternation_series_summary(series: dict) -> str:
+    participants = alternating_series_participant_results(series)
+    result_text = " / ".join(
+        f"{participant['name']} {participant['wins']}勝{participant['losses']}敗"
+        for participant in participants
+    )
+    decided_games = sum(participant["wins"] for participant in participants)
+    no_result_games = max(0, len(series.get("games") or []) - decided_games)
+    suffix = f"・勝敗なし{no_result_games}局" if no_result_games else ""
+    return f"手番交互対戦終了：{result_text}（全{len(series.get('games') or [])}局{suffix}）"
+
+
+def turn_alternation_series_text(series: dict) -> str:
+    participants = alternating_series_participant_results(series)
+    result_text = " / ".join(
+        f"{participant['name']} {participant['wins']}勝{participant['losses']}敗"
+        for participant in participants
+    )
+    player_text = " vs ".join(participant["name"] for participant in participants)
+    lines = [
+        "手番交互対戦まとめ",
+        f"ルール: {series.get('rule_label') or series.get('rule_key') or '不明'}",
+        f"対戦者: {player_text}",
+        f"結果: {result_text}",
+        f"対局数: {len(series.get('games') or [])}",
+    ]
+    for game in series.get("games") or []:
+        lines.extend([
+            "",
+            f"=== 第{game['game_number']}局 ===",
+            f"先手: {game.get('first_player_name') or '不明'}",
+            f"勝者: {game.get('winner_name') or '勝敗なし'}",
+            *(game.get("lines") or []),
+        ])
+    return "\n".join(lines)
+
+
+async def finalize_turn_alternation_series(room: Room, reason: str) -> Optional[dict]:
+    series = room.alternating_series
+    room.alternating_series = None
+    room.current_game_uses_turn_alternation = False
+    room.end_alternating_series_after_game = False
+    reset_turn_alternation(room)
+    if series is None or not series.get("games"):
+        return None
+
+    refresh_names = {player.id: player.name for player in room.players}
+    for participant in series["participants"]:
+        if participant["id"] in refresh_names:
+            participant["name"] = refresh_names[participant["id"]]
+    summary = turn_alternation_series_summary(series)
+    payload = {
+        "type": "turn_alternation_series_record",
+        "sender": "system",
+        "series_id": series["series_id"],
+        "reason": reason,
+        "summary": summary,
+        "participants": alternating_series_participant_results(series),
+        "game_count": len(series["games"]),
+        "games": series["games"],
+        "text": turn_alternation_series_text(series),
+        "filename": f"turn-alternation-{series['series_id']}.txt",
+    }
+    await room.log_chat(summary)
+    await room.broadcast(payload)
+    return payload
+
+
 def turn_alternation_continues(room: Room, players: List["Player"]) -> bool:
     participant_ids = turn_alternation_participant_ids(players)
     return bool(
@@ -2544,10 +2737,21 @@ async def expire_pending_start_request(room: Room, request_id: str) -> None:
     )
 
 
-async def invalidate_turn_alternation(room: Room, message: str) -> None:
+async def invalidate_turn_alternation(
+    room: Room,
+    message: str,
+    *,
+    series_end_reason: str = "member_changed",
+) -> None:
     reset_turn_alternation(room)
     if room.pending_start_request is not None:
         await resolve_pending_start_request(room, "invalidated", message)
+    if room.alternating_series is None:
+        return
+    if room.state == "playing" and room.current_game_uses_turn_alternation:
+        room.end_alternating_series_after_game = True
+        return
+    await finalize_turn_alternation_series(room, series_end_reason)
 
 
 def prepare_campaign_game(
@@ -2810,15 +3014,21 @@ def record_score_event(room: Room, player: "Player", notation: str, result: str)
         "line": line,
     })
 
-async def publish_score_log(room: Room, winner: Optional[str]) -> None:
+async def publish_score_log(
+    room: Room,
+    winner: Optional[str],
+    *,
+    winner_player_id: Optional[str] = None,
+) -> None:
     if not room.score_log:
         return
+    lines = [record.get("line", "") for record in room.score_log if record.get("line")]
     payload = {
         "type": "score_record",
         "sender": "system",
         "winner": winner,
         "records": room.score_log,
-        "lines": [record.get("line", "") for record in room.score_log if record.get("line")],
+        "lines": lines,
     }
     if room.tournament_match_id:
         payload.update({
@@ -2826,6 +3036,14 @@ async def publish_score_log(room: Room, winner: Optional[str]) -> None:
             "match_id": room.tournament_match_id,
         })
     await room.broadcast(payload)
+    record_turn_alternation_game(
+        room,
+        winner_id=winner_player_id,
+        winner_name=winner,
+        lines=lines,
+    )
+    if room.end_alternating_series_after_game:
+        await finalize_turn_alternation_series(room, "member_changed")
     if room.tournament_match_id:
         run = tournament_run_for_room(room)
         if run is not None:
@@ -4749,7 +4967,11 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             await room.log_chat(f"{winner_name}が勝利しました")
             await send_neo_largest_prime_share_chats(room)
             await maybe_log_talkative_fish_game_over(room)
-            await publish_score_log(room, winner_name)
+            await publish_score_log(
+                room,
+                winner_name,
+                winner_player_id=active_players[0].id,
+            )
         elif len(active_players) == 0:
             room.state = "waiting"
             room.current_turn_id = None
@@ -4757,7 +4979,7 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
             await room.log_chat("対戦者がいなくなったためゲームを終了しました")
             await maybe_log_talkative_fish_game_over(room)
-            await publish_score_log(room, None)
+            await publish_score_log(room, None, winner_player_id=None)
         elif departed_player_id is not None and room.current_turn_id == departed_player_id:
             await next_turn(room)
 
@@ -5170,6 +5392,50 @@ async def handle_start_game_cancel(player: "Player", data: dict) -> None:
         await send_start_game_error(player, "start_game_cancel_forbidden", "この開始申請は取り消せません。")
         return
     await resolve_pending_start_request(room, "cancelled", f"{player.name}が開始申請を取り消しました。")
+
+
+async def handle_end_turn_alternation_series(player: "Player") -> None:
+    room = player.room
+    if room is None:
+        return
+    if getattr(player, "client_surface", "legacy") not in {"neo", "plus"}:
+        await send_start_game_error(
+            player,
+            "turn_alternation_series_unavailable",
+            "このクライアントでは手番交互対戦を終了できません。",
+        )
+        return
+    if room.state != "waiting" or room.start_in_progress:
+        await send_start_game_error(
+            player,
+            "turn_alternation_series_playing",
+            "対局中は手番交互対戦を終了できません。",
+        )
+        return
+    if room.pending_start_request is not None:
+        await send_start_game_error(
+            player,
+            "start_game_request_pending",
+            "開始申請へ回答するか、申請を取り消してから終了してください。",
+        )
+        return
+    series = room.alternating_series
+    if series is None or not series.get("games"):
+        await send_start_game_error(
+            player,
+            "turn_alternation_series_missing",
+            "終了できる手番交互対戦はありません。",
+        )
+        return
+    if player.id not in series.get("participant_ids", ()):
+        await send_start_game_error(
+            player,
+            "turn_alternation_series_forbidden",
+            "この手番交互対戦は終了できません。",
+        )
+        return
+    await finalize_turn_alternation_series(room, "ended_by_player")
+    await room.update_room_status()
 
 ################################################
 # WebSocket処理
@@ -5688,6 +5954,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "cancel_start_game_request":
                 await handle_start_game_cancel(player, data)
 
+            elif msg_type == "end_turn_alternation_series":
+                await handle_end_turn_alternation_series(player)
+
             elif msg_type == "get_prime_assist":
                 if not player.room:
                     continue
@@ -6071,7 +6340,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         record_score_play_line(
             room,
             player,
-            f"{score_prefix}{play_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
+            f"{score_prefix}{play_text},P({score_cards_text(drawn_penalties)})"
         )
 
         await next_turn(room)
@@ -6444,7 +6713,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         record_score_play_line(
             room,
             player,
-            f"{score_prefix}{score_composite_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
+            f"{score_prefix}{score_composite_text},P({score_cards_text(drawn_penalties)})"
         )
         await next_turn(room)
         return
@@ -6643,8 +6912,22 @@ async def start_game(
     waiting_players = get_active_players(room)
     if len(waiting_players) not in (1, 2):
         return
+    uses_turn_alternation = turn_alternation and len(waiting_players) == 2
+    if uses_turn_alternation:
+        participant_ids = turn_alternation_participant_ids(waiting_players)
+        active_series_ids = tuple(
+            (room.alternating_series or {}).get("participant_ids") or ()
+        )
+        if room.alternating_series is not None and active_series_ids != participant_ids:
+            await finalize_turn_alternation_series(room, "member_changed")
+    elif room.alternating_series is not None:
+        await finalize_turn_alternation_series(room, "alternation_disabled")
     room.state = "playing"
     prepare_campaign_game(room, waiting_players)
+    room.current_game_uses_turn_alternation = uses_turn_alternation
+    room.end_alternating_series_after_game = False
+    if uses_turn_alternation:
+        ensure_turn_alternation_series(room, waiting_players)
     for p in room.players:
         if p not in waiting_players:
             p.clear_hand()
@@ -6679,7 +6962,7 @@ async def start_game(
         else random.choice(waiting_player_ids)
     )
     room.first_player_id = room.current_turn_id
-    if turn_alternation and len(waiting_players) == 2:
+    if uses_turn_alternation:
         room.alternating_participant_ids = turn_alternation_participant_ids(waiting_players)
         room.last_alternating_first_player_id = room.first_player_id
     else:
