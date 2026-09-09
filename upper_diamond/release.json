@@ -1,0 +1,56 @@
+{
+  "version": "master-combined-2026-09-09-budget8",
+  "cpu_key": "upper_diamond_planner",
+  "source": "prime-daifugo-cpu-league/league",
+  "knowledge_sample": "diamond_prime_table",
+  "adaptation": "opening_master.py loads bundled evaluation tables; other search modules unchanged",
+  "files": {
+    "after_all_out_planner.py": {
+      "source_sha256": "ff5d99c806aeef92ba3f384912e86bc9fe0bc7aa5dabde016d8917f6e483e47e",
+      "packaged_sha256": "ff5d99c806aeef92ba3f384912e86bc9fe0bc7aa5dabde016d8917f6e483e47e"
+    },
+    "double_ceiling.py": {
+      "source_sha256": "5c501f0cb12123095dcfa2202a4063976a53e4caace80c53b8d1f55d1249763f",
+      "packaged_sha256": "5c501f0cb12123095dcfa2202a4063976a53e4caace80c53b8d1f55d1249763f"
+    },
+    "master_budget.py": {
+      "source_sha256": "a1fe2aa0686335d154ed7e7bde27af70f2e383520abac88ebbfec4dfb287b611",
+      "packaged_sha256": "a1fe2aa0686335d154ed7e7bde27af70f2e383520abac88ebbfec4dfb287b611"
+    },
+    "master_combined.py": {
+      "source_sha256": "c74a6034f6ea9da71932b35ed05fe5978c97293258f661080bb38758b024ccf5",
+      "packaged_sha256": "c74a6034f6ea9da71932b35ed05fe5978c97293258f661080bb38758b024ccf5"
+    },
+    "opening_master.py": {
+      "source_sha256": "85e5dca3c0778c62876b6537d3b06d1564170263c39a07f9d53596ca7bdc64eb",
+      "packaged_sha256": "283203a43dc118370dcd91afbd2016d19de53978e0ee37b9e2df39a5e40f0cff"
+    },
+    "post_all_out_master.py": {
+      "source_sha256": "6d9042339cc6eecb0330dd2c8604c01224f9a3d50605b71dd75f53b15968d56f",
+      "packaged_sha256": "6d9042339cc6eecb0330dd2c8604c01224f9a3d50605b71dd75f53b15968d56f"
+    },
+    "second_opening_master.py": {
+      "source_sha256": "5d1c8b8d7b7aaf07ca9cc8ece43b145ade0f3985472b56f15ca13e15dd7bb349",
+      "packaged_sha256": "5d1c8b8d7b7aaf07ca9cc8ece43b145ade0f3985472b56f15ca13e15dd7bb349"
+    },
+    "three_step.py": {
+      "source_sha256": "011f77e6ea443295110e65ce0634cb024bab6b0c7c806e8b6ffdeafcd095f05a",
+      "packaged_sha256": "011f77e6ea443295110e65ce0634cb024bab6b0c7c806e8b6ffdeafcd095f05a"
+    },
+    "data/pure_trump_response_details.csv": {
+      "sha256": "d8bcd5b020a518934a8298213d0a4e8c22f285d8780a4ba69d0d6d594dd1546a"
+    },
+    "data/pure_trump_return_probabilities.csv": {
+      "sha256": "7bc312f78b72f9cd1410de981d49e575389001369fb44f6e87a9d28c27c8f10b"
+    },
+    "data/response_details.csv": {
+      "sha256": "adb06861f87974b2c49c50e1c5fda8aca0f59e5df43660ada17e5d329e95a1ea"
+    },
+    "data/return_probabilities.csv": {
+      "sha256": "2e4c722e8a649a7944df6c99710f082af72db8d278cc6ca3e0b0d9c72ad3074b"
+    },
+    "post_all_out_ceiling.json": {
+      "sha256": "863cc9b72b0a72d1fc147293d106c66ee346351eeb2c4b8fba78515b8c63cbc8"
+    }
+  }
+}
