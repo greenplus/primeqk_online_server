@@ -92,7 +92,8 @@ DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "hand-advantage-lead",
     "hand-advantage-interference",
 })
-ADVANCED_PLANNING_CPU_KEYS = frozenset({"platinum_planner", "diamond_planner"})
+DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner", "upper_diamond_planner"})
+ADVANCED_PLANNING_CPU_KEYS = DIAMOND_PLANNING_CPU_KEYS | {"platinum_planner"}
 PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS = 9
 PLATINUM_COMPRESSION_MIN_HAND_SIZE = 18
 PLATINUM_FORCED_COMPRESSION_HAND_SIZE = 26
@@ -159,7 +160,7 @@ PLATINUM_SMALL_TRUMP_TOKENS = frozenset({
 
 def gold_branch_candidate_cap(cpu: "CpuPlayer") -> int:
     cpu_key = getattr(cpu, "cpu_key", "")
-    if cpu_key == "diamond_planner":
+    if cpu_key in DIAMOND_PLANNING_CPU_KEYS:
         return 8
     if cpu_key in ADVANCED_PLANNING_CPU_KEYS:
         return 12
@@ -168,7 +169,7 @@ def gold_branch_candidate_cap(cpu: "CpuPlayer") -> int:
 
 def gold_last_candidate_cap(cpu: "CpuPlayer") -> int:
     cpu_key = getattr(cpu, "cpu_key", "")
-    if cpu_key == "diamond_planner":
+    if cpu_key in DIAMOND_PLANNING_CPU_KEYS:
         return 12
     if cpu_key in ADVANCED_PLANNING_CPU_KEYS:
         return 16
@@ -176,7 +177,7 @@ def gold_last_candidate_cap(cpu: "CpuPlayer") -> int:
 
 
 def cpu_max_knowledge_cards(cpu: "CpuPlayer") -> int:
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         return DIAMOND_MAX_KNOWLEDGE_CARDS
     return PLATINUM_MAX_KNOWLEDGE_CARDS
 COMPOSITE_PRACTICE_RANK_WEIGHTS = {
@@ -209,6 +210,11 @@ class CpuAction:
 
 
 class CpuSearchDeadline(RuntimeError):
+    pass
+
+
+class CpuDecisionDeadline(RuntimeError):
+    """Optional caller deadline, including the normal timeout fallback."""
     pass
 
 
@@ -389,6 +395,11 @@ def is_cpu_player(player) -> bool:
 
 def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None) -> None:
     """Reset per-game planner state while preserving the CPU's learned knowledge."""
+    # Master evaluators and committed branches contain the previous game's hand
+    # and public context. Keep configuration, but never reuse them in a rematch.
+    for name in tuple(vars(cpu)):
+        if name.startswith(("opening_master_", "second_opening_master_", "post_all_out_", "master_")) and not name.endswith("_config"):
+            delattr(cpu, name)
     cpu.gold_active_plan = None
     cpu.gold_plan_step_index = 0
     cpu.silver_active_plan = None
@@ -465,6 +476,13 @@ def choose_profile_cpu_action(
     validator: Optional[NumberValidator] = None,
 ) -> CpuAction:
     profile = get_cpu_profile(getattr(cpu, "cpu_key", "basic"))
+    if profile and profile.key == "upper_diamond_planner":
+        return profile.action_selector(cpu, room, validator)
+    return _choose_profile_cpu_action(cpu, room, validator, profile)
+
+
+def _choose_profile_cpu_action(cpu, room, validator, profile):
+    """Run a specific base profile, including its normal timeout recovery."""
     budget_ms = max(1, int(getattr(
         cpu,
         "decision_time_budget_ms",
@@ -475,6 +493,12 @@ def choose_profile_cpu_action(
     if profile and profile.key == "diamond_planner":
         budget_ms = max(budget_ms, DIAMOND_DECISION_BUDGET_MS)
     cpu.decision_deadline = time.perf_counter() + budget_ms / 1000
+    soft_deadline = getattr(cpu, 'decision_soft_deadline', None)
+    if soft_deadline is not None:
+        cpu.decision_deadline = min(cpu.decision_deadline, soft_deadline)
+    hard_deadline = getattr(cpu, 'decision_hard_deadline', None)
+    if hard_deadline is not None:
+        cpu.decision_deadline = min(cpu.decision_deadline, hard_deadline)
     cpu.last_decision_timed_out = False
     try:
         if profile and profile.action_selector:
@@ -498,6 +522,9 @@ def choose_profile_cpu_action(
 
 
 def check_cpu_search_deadline(cpu: CpuPlayer) -> None:
+    hard_deadline = getattr(cpu, 'decision_hard_deadline', None)
+    if hard_deadline is not None and time.perf_counter() >= hard_deadline:
+        raise CpuDecisionDeadline
     deadline = getattr(cpu, "decision_deadline", None)
     if deadline is not None and time.perf_counter() >= deadline:
         raise CpuSearchDeadline
@@ -1196,6 +1223,25 @@ def choose_diamond_planning_cpu_action(
     diamond_update_opening_position_history(cpu, room)
     previous_context = getattr(cpu, "diamond_last_context", "opening-lead")
     current_context = diamond_tactical_context(cpu, room)
+    active = getattr(cpu, "gold_active_plan", None)
+    if (
+        active
+        and active.get("opening_master_variant") == "dual_wield_certified"
+        and active.get("continuation_authorized")
+        and int(getattr(cpu, "gold_plan_step_index", 0)) == 1
+        and not (getattr(room, "field", []) or [])
+        and bool(getattr(room, "reverse_order", False))
+        == active.get("opening_master_reverse_order", False)
+    ):
+        pass_tail = active.get("dual_wield_pass_tail") or []
+        expected = [str(c["card_id"]) for step in pass_tail for c in candidate_consumed_cards(step)]
+        if pass_tail and sorted(expected) == sorted(str(c["card_id"]) for c in cpu.hand):
+            action = platinum_dual_wield_pass_action(cpu, room, validator)
+            if action is not None:
+                cpu.diamond_last_context = current_context
+                return diamond_record_action(
+                    cpu, action, room, "opening-master-certified-pass", pass_tail[0],
+                )
     resume_opening_auso = diamond_should_resume_opening_auso_after_failed_kamatoto(
         cpu,
         room,
@@ -1863,7 +1909,7 @@ def diamond_has_promising_normal_tactic(
     return diamond_has_current_certain_trump(cpu, room)
 
 
-def choose_platinum_lead_action(
+def platinum_dual_wield_pass_action(
     cpu: CpuPlayer,
     room,
     validator: NumberValidator,
@@ -1888,10 +1934,26 @@ def choose_platinum_lead_action(
             )
             if is_executable_gold_plan(pass_plan, cpu):
                 pass_plan["dual_wield_pass_branch"] = True
+                if active.get('opening_master_type'):
+                    for key in ('master_value', 'continuation_authorized', 'opening_master_reverse_order',
+                                'opening_master_type', 'opening_master_variant'):
+                        if key in active:
+                            pass_plan[key] = active[key]
                 set_gold_active_plan(cpu, pass_plan)
                 action = play_next_gold_plan_step(cpu, room, validator)
                 if action is not None:
                     return platinum_commit_play(cpu, action)
+    return None
+
+
+def choose_platinum_lead_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    action = platinum_dual_wield_pass_action(cpu, room, validator)
+    if action is not None:
+        return action
 
     action = play_next_gold_plan_step(cpu, room, validator)
     if action is not None:
@@ -1937,7 +1999,10 @@ def choose_platinum_response_action(
 ) -> Optional[CpuAction]:
     field_count = len(getattr(room, "field", []) or [])
     active = getattr(cpu, "gold_active_plan", None)
-    if active and platinum_plan_score(active) >= platinum_required_trump_strength(cpu):
+    if active and (
+        opening_master_continuation_allowed(cpu, room)
+        or platinum_plan_score(active) >= platinum_required_trump_strength(cpu)
+    ):
         if active_gold_plan_matches_field(cpu, field_count):
             action = play_next_gold_plan_step(cpu, room, validator)
             if action is not None:
@@ -2145,7 +2210,7 @@ def choose_platinum_interference_action(
         else [item for item in scored if item[0] >= PLATINUM_INTERFERENCE_BORDER]
     )
     held_trumps = platinum_available_trump_candidates(cpu, room, validator)
-    if force and getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if force and getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         empty_room = room_without_field(room)
         held_certain = [
             candidate for candidate in held_trumps
@@ -2305,7 +2370,7 @@ def platinum_mark_successful_interference(cpu: CpuPlayer, room) -> None:
         return
     cpu.platinum_relaxed_opponent_min_hand_count = count
     inferred_diamond_plan = (
-        getattr(cpu, "cpu_key", "") == "diamond_planner"
+        getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
         and getattr(cpu, "diamond_opponent_rally_threat", "none")
         == "certain-likely"
     )
@@ -2641,7 +2706,7 @@ def choose_platinum_strong_plan(
     validator: NumberValidator,
 ) -> Optional[dict]:
     candidates = []
-    diamond = getattr(cpu, "cpu_key", "") == "diamond_planner"
+    diamond = getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
     opening_plans = []
     fixed_dual_found = False
     if getattr(cpu, "platinum_opening_phase", True) and len(cpu.hand) == 11:
@@ -2751,7 +2816,7 @@ def build_platinum_plans(
             strong.sort(
                 key=(
                     (lambda plan: diamond_plan_sort_key(plan, cpu, room))
-                    if getattr(cpu, "cpu_key", "") == "diamond_planner"
+                    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
                     else platinum_plan_sort_key
                 ),
                 reverse=True,
@@ -2761,7 +2826,7 @@ def build_platinum_plans(
     plans.sort(
         key=(
             (lambda plan: diamond_plan_sort_key(plan, cpu, room))
-            if getattr(cpu, "cpu_key", "") == "diamond_planner"
+            if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
             else platinum_plan_sort_key
         ),
         reverse=True,
@@ -2778,7 +2843,7 @@ def platinum_rally_count_order(cpu: CpuPlayer, non_joker_count: int) -> tuple[in
             *range(upper, 4, -1),
             *range(min(4, upper), 0, -1),
         )
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         return diamond_rally_count_order(cpu, non_joker_count)
     return base_order
 
@@ -5910,7 +5975,7 @@ def platinum_opening_multi_play_is_sound(cpu: CpuPlayer, plan: dict) -> bool:
 
     if len(steps) == 1:
         return True
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         trump_index = gold_plan_trump_step_index(plan)
         trump = (
             steps[trump_index]
@@ -5933,7 +5998,7 @@ def platinum_opening_multi_play_is_sound(cpu: CpuPlayer, plan: dict) -> bool:
 
     tail_start = len(steps) - 1
     if (
-        getattr(cpu, "cpu_key", "") == "diamond_planner"
+        getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
         and len(steps) >= 3
         and steps[-2].get("role") == "cut"
         and steps[-2].get("number") in {"X", 57}
@@ -5968,8 +6033,35 @@ def platinum_plan_score(plan: Optional[dict]) -> float:
     return float(plan.get("dual_wield_score", plan.get("evaluation", {}).get("score", 0.0)))
 
 
+def opening_master_continuation_allowed(cpu: CpuPlayer, room) -> bool:
+    """Authorize only an intact, currently playable tail of an accepted Master plan.
+
+    This is execution state, independent of Master's 0..1 strategic value.
+    Diamond's context transitions, opponent-finish guards and replanning paths
+    still apply. Ordinary Diamond plans never enter this exception.
+    """
+    plan = getattr(cpu, "gold_active_plan", None)
+    if not plan or not plan.get("opening_master_type") or not plan.get("continuation_authorized"):
+        return False
+    index = int(getattr(cpu, "gold_plan_step_index", 0))
+    tail = plan.get("steps", [])[index:]
+    expected = [str(c["card_id"]) for step in tail for c in candidate_consumed_cards(step)]
+    actual = [str(c["card_id"]) for c in cpu.hand]
+    valid = (
+        bool(tail)
+        and bool(getattr(room, "reverse_order", False)) == plan.get("opening_master_reverse_order", False)
+        and sorted(expected) == sorted(actual)
+        and candidate_is_playable(tail[0], cpu, room)
+    )
+    if not valid:
+        plan["continuation_authorized"] = False
+    return valid
+
+
 def platinum_plan_is_strong(plan: dict, cpu: CpuPlayer, room) -> bool:
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if plan is getattr(cpu, "gold_active_plan", None) and opening_master_continuation_allowed(cpu, room):
+        return True
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         context = diamond_tactical_context(cpu, room)
         if context in DIAMOND_POST_ALL_OUT_CONTEXTS:
             tier = diamond_post_all_out_plan_tier(plan, cpu, room)
@@ -6012,7 +6104,7 @@ def platinum_plan_has_absolute_trump(plan: dict, cpu: CpuPlayer) -> bool:
 
 def platinum_candidate_is_absolute(candidate: dict, cpu: CpuPlayer) -> bool:
     token = platinum_candidate_token(candidate)
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         if token == "kkkq":
             return True
         try:
@@ -6108,7 +6200,7 @@ def diamond_opening_auso_converts_to_initial_all_out(
     tactical proof that the ordinary Auso route lacks.
     """
     if (
-        getattr(cpu, "cpu_key", "") != "diamond_planner"
+        getattr(cpu, "cpu_key", "") not in DIAMOND_PLANNING_CPU_KEYS
         or getattr(cpu, "diamond_opening_was_second", None) is not False
         or not getattr(cpu, "platinum_opening_phase", True)
         or not plan.get("diamond_opening_auso")
@@ -6538,7 +6630,7 @@ def platinum_deck_has_expected_trump_contribution(cpu: CpuPlayer, room) -> bool:
 def platinum_interference_danger_active(cpu: CpuPlayer, room) -> bool:
     """Whether the opponent's finish risk calls for interference over all-out."""
     if (
-        getattr(cpu, "cpu_key", "") == "diamond_planner"
+        getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
         and getattr(cpu, "diamond_opponent_rally_threat", "none")
         == "certain-likely"
     ):
@@ -6561,7 +6653,7 @@ def platinum_failed_composite_all_out_allowed(
     if allow_opening and getattr(cpu, "platinum_opening_phase", True):
         return True
     if int(getattr(cpu, "platinum_all_out_attempts", 0)) > 0:
-        if getattr(cpu, "cpu_key", "") == "diamond_planner":
+        if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
             return (
                 bool(getattr(room, "deck", []))
                 and not platinum_interference_danger_active(cpu, room)
@@ -6581,7 +6673,7 @@ def platinum_should_all_out(cpu: CpuPlayer, room) -> bool:
     attempts = int(getattr(cpu, "platinum_all_out_attempts", 0))
     if attempts == 0:
         return True
-    if getattr(cpu, "cpu_key", "") == "diamond_planner":
+    if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS:
         return (
             bool(getattr(room, "deck", []))
             and not platinum_interference_danger_active(cpu, room)
@@ -7842,7 +7934,7 @@ def search_same_count_gold_plans(
     results.sort(
         key=(
             (lambda plan: diamond_plan_sort_key(plan, cpu, room))
-            if getattr(cpu, "cpu_key", "") == "diamond_planner"
+            if getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
             else gold_plan_score
         ),
         reverse=True,
@@ -9424,6 +9516,24 @@ def is_semiprime(n: int) -> bool:
     return False
 
 
+def choose_upper_diamond_cpu_action(cpu, room, validator=None):
+    from copy import copy
+    from upper_diamond.master_combined import choose_combined
+
+    # Virtual draws need an explicit public opponent count; live Room objects
+    # normally derive it from players, unlike the league's public state objects.
+    state = copy(room)
+    state.opponent_hand_count = platinum_opponent_hand_count(cpu, room)
+
+    def fallback(player, state):
+        return _choose_profile_cpu_action(
+            player, state, validator, CPU_PROFILES["diamond_planner"],
+        )
+
+    cpu.last_decision_timed_out = False
+    return choose_combined(cpu, state, fallback)
+
+
 CPU_PROFILES = {
     "basic": CpuProfile(
         key="basic",
@@ -9482,6 +9592,23 @@ CPU_PROFILES = {
             sample_key="diamond_prime_table",
         ),
         action_selector=choose_diamond_planning_cpu_action,
+    ),
+    "upper_diamond_planner": CpuProfile(
+        key="upper_diamond_planner",
+        label="上ダイヤCPU",
+        description="ダイヤCPUと同じ素数表を使い、初手と全出し後の判断を改善したCPUです。思考時間は最大8秒を目標にしています。",
+        rule_keys=(
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="diamond_prime_table",
+        ),
+        action_selector=choose_upper_diamond_cpu_action,
     ),
     "silver_planner": CpuProfile(
         key="silver_planner",

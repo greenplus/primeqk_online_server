@@ -460,6 +460,8 @@ class Room:
         self.last_play_kind = None
         self.current_turn_id = None
         self.first_player_id = None
+        self.completed_turns = 0
+        self.opening_all_out_failed = False
         self.has_drawn = False
         self.reverse_order = False
         self.score_log = []
@@ -3187,6 +3189,17 @@ def record_field_play(
     room.last_play_hand_before = int(hand_before)
     room.last_play_kind = play_kind
 
+def record_failed_cpu_plan(player, room, consumed_cards) -> None:
+    """Record adjudicated, public failures before adding penalty cards."""
+    if getattr(room, "completed_turns", 0) == 0 and player.id == getattr(room, "first_player_id", None):
+        room.opening_all_out_failed = (
+            {card["card_id"] for card in consumed_cards}
+            == {card["card_id"] for card in player.hand}
+        )
+    if getattr(player, "cpu_key", None) == "upper_diamond_planner":
+        player.post_all_out_master_active = None
+
+
 def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card_count: int) -> int:
     """
     ペナルティ枚数を返す。
@@ -5077,6 +5090,52 @@ async def maybe_schedule_cpu_turn(room: Room) -> None:
     asyncio.create_task(run_cpu_turn(room, current))
 
 
+async def choose_room_cpu_action(room: Room, cpu: CpuPlayer):
+    if cpu.cpu_key != "upper_diamond_planner":
+        return choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+
+    from copy import copy, deepcopy
+    from types import SimpleNamespace
+    from cpu_player import platinum_opponent_hand_count
+    from upper_diamond.master_combined import decision_snapshot
+
+    def position_key():
+        return (
+            room.game_id, room.completed_turns, room.current_turn_id, room.has_drawn,
+            tuple(card["card_id"] for card in cpu.hand),
+            tuple(player.id for player in get_active_players(room)),
+        )
+
+    position = position_key()
+    worker = copy(cpu)
+    worker.__dict__ = decision_snapshot(cpu)[0]
+    worker.ws, worker.room = worker, None
+    public = SimpleNamespace(
+        rule=room.rule, players=[], deck=[None] * len(room.deck),
+        opponent_hand_count=platinum_opponent_hand_count(cpu, room),
+        field=deepcopy(room.field), reserve=deepcopy(room.reserve),
+        public_known_deck_bottom=deepcopy(room.public_known_deck_bottom),
+        public_unknown_deck_count=room.public_unknown_deck_count,
+        first_player_id=room.first_player_id, has_drawn=room.has_drawn,
+        last_number=room.last_number, reverse_order=room.reverse_order,
+        last_play_hand_before=room.last_play_hand_before,
+        last_play_kind=room.last_play_kind, last_play_player_id=room.last_play_player_id,
+        opening_all_out_failed=room.opening_all_out_failed,
+    )
+    action = await asyncio.to_thread(
+        choose_profile_cpu_action, worker, public, is_valid_prime_for_player,
+    )
+    # A disconnect, restart or member change during search invalidates the result.
+    if room.state != "playing" or cpu not in room.players or position_key() != position:
+        return None
+    preserved = {key: getattr(cpu, key) for key in (
+        "ws", "room", "hand", "id", "name", "status", "cpu_key", "rng",
+    )}
+    cpu.__dict__.update(worker.__dict__)
+    cpu.__dict__.update(preserved)
+    return action
+
+
 async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
     try:
         await asyncio.sleep(0.8)
@@ -5084,10 +5143,14 @@ async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
             return
 
         await maybe_log_talkative_fish_turn_start(room, cpu)
-        action = choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+        action = await choose_room_cpu_action(room, cpu)
+        if action is None:
+            return
         await execute_cpu_action(room, cpu, action)
         if action.kind == "draw":
-            followup = choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+            followup = await choose_room_cpu_action(room, cpu)
+            if followup is None:
+                return
             if followup.kind in ("play_prime", "play_composite") and room.current_turn_id == cpu.id:
                 await asyncio.sleep(0.4)
                 await execute_cpu_action(room, cpu, followup)
@@ -6217,6 +6280,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
 
     # グロタンカット
     if number == 57 and not room.rule.special_numbers_composite_only:
+        room.completed_turns = getattr(room, "completed_turns", 0) + 1
         # 出した順そのまま予備軍に
         push_to_reserve(room, played_cards)
         for c in played_cards:
@@ -6295,6 +6359,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # 素数判定
     is_valid_play = is_prime(number) if hnp_challenge else is_valid_prime_for_player(number, player, room.rule)
     if not is_valid_play:
+        record_failed_cpu_plan(player, room, played_cards)
         # ペナルティ
         # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
         penalty_cards = get_penalty_card_count(
@@ -6688,6 +6753,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         await player.ws.send_json({"type":"error","message":e.msg})
         return
     except CompositeMathError as e:
+        record_failed_cpu_plan(player, room, all_consume)
         penalty_cards = get_penalty_card_count(
             room.rule.penalty_rule,
             field_card_count=len(sel_cards),
@@ -6731,6 +6797,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 
         await player.send_hand_update()
         if sel_number == 57:
+            room.completed_turns = getattr(room, "completed_turns", 0) + 1
             flow_field(room)
             room.has_drawn = False
             await room.update_game_state()
@@ -6962,6 +7029,8 @@ async def start_game(
         else random.choice(waiting_player_ids)
     )
     room.first_player_id = room.current_turn_id
+    room.completed_turns = 0
+    room.opening_all_out_failed = False
     if uses_turn_alternation:
         room.alternating_participant_ids = turn_alternation_participant_ids(waiting_players)
         room.last_alternating_first_player_id = room.first_player_id
@@ -7008,6 +7077,7 @@ async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer
         await broadcast_tournament_match_state(room)
 
 async def next_turn(room):
+    room.completed_turns = getattr(room, "completed_turns", 0) + 1
     # ターンが変わるので、ドロー済みフラグをリセットする
     room.has_drawn = False
 
