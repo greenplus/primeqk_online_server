@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import Counter
-from functools import lru_cache
+from functools import lru_cache, wraps
 from itertools import combinations, permutations, product
 import json
 from math import comb
@@ -40,6 +40,7 @@ SILVER_RALLY_COUNTS = (1, 2, 3, 4)
 SILVER_EVEN_RANKS = {2, 4, 6, 8, 10, 12}
 SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE = 0.0
 CPU_PLANNER_DEFAULT_BUDGET_MS = 250
+GOLD_DECISION_BUDGET_MS = 500
 COMPOSITE_PRACTICE_MAX_PLAN_STEPS = 5
 COMPOSITE_PRACTICE_BRANCH_CAP = 48
 COMPOSITE_PRACTICE_ALL_OUT_ATTEMPTS = 96
@@ -269,7 +270,10 @@ class CpuPlayer:
         self.gold_plan_step_index = 0
         self.silver_active_plan: Optional[dict] = None
         self.silver_plan_step_index = 0
-        self.decision_time_budget_ms = CPU_PLANNER_DEFAULT_BUDGET_MS
+        self.decision_time_budget_ms = (
+            GOLD_DECISION_BUDGET_MS if cpu_key == "gold_planner"
+            else CPU_PLANNER_DEFAULT_BUDGET_MS
+        )
         self.decision_deadline: Optional[float] = None
         self.last_decision_timed_out = False
         self.small_finish_index = registered_prime_template_index((), max_cards=3)
@@ -500,12 +504,21 @@ def _choose_profile_cpu_action(cpu, room, validator, profile):
     if hard_deadline is not None:
         cpu.decision_deadline = min(cpu.decision_deadline, hard_deadline)
     cpu.last_decision_timed_out = False
+    gold_search = profile is not None and profile.key == "gold_planner"
+    if gold_search:
+        cpu.gold_search_context = {
+            "root": cpu, "room": room,
+            "hand": tuple(card.get("card_id") for card in cpu.hand),
+            "cache": {}, "best_plan": None,
+        }
     try:
         if profile and profile.action_selector:
             return profile.action_selector(cpu, room, validator)
         return choose_cpu_action(cpu, room, validator=validator)
     except CpuSearchDeadline:
         cpu.last_decision_timed_out = True
+        if gold_search:
+            return choose_gold_timeout_action(cpu, room)
         clear_gold_active_plan(cpu)
         clear_silver_active_plan(cpu)
         if profile and profile.key == "composite_practice":
@@ -519,6 +532,153 @@ def _choose_profile_cpu_action(cpu, room, validator, profile):
         return choose_cpu_action(cpu, room, validator=validator, max_cards=3)
     finally:
         cpu.decision_deadline = None
+        if gold_search:
+            del cpu.gold_search_context
+            cpu.__dict__.pop("_gold_rank_hand", None)
+
+
+def gold_cached_search(function):
+    """Reuse complete results only within a Gold decision and exact public state.
+
+    These helpers take only a validator and/or an integer count after room.
+    Candidate dictionaries are copied because callers attach planning roles.
+    Physical card order is retained so equal-rank cards keep the same IDs.
+    """
+    @wraps(function)
+    def cached(cpu, room, *args, **kwargs):
+        context = getattr(cpu, "gold_search_context", None)
+        if context is None:
+            return function(cpu, room, *args, **kwargs)
+        check_cpu_search_deadline(cpu)
+        key = (
+            function.__name__, tuple(card.get("card_id") for card in cpu.hand),
+            id(getattr(room, "rule", None)), len(getattr(room, "field", []) or []),
+            getattr(room, "last_number", None), getattr(room, "reverse_order", False),
+            args, tuple(sorted(kwargs.items())),
+        )
+        cache = context["cache"]
+        if key not in cache:
+            result = function(cpu, room, *args, **kwargs)
+            # A timeout never installs a partial result. Bound memory without
+            # pruning any search branches when the per-decision cache fills.
+            if len(cache) >= 2048:
+                return result
+            cache[key] = result
+        result = cache[key]
+        if isinstance(result, list):
+            return [dict(candidate) for candidate in result]
+        return dict(result) if result is not None else None
+    return cached
+
+
+def remember_gold_timeout_plan(cpu, plan):
+    context = getattr(cpu, "gold_search_context", None)
+    if context is None or tuple(card.get("card_id") for card in cpu.hand) != context["hand"]:
+        return
+    root, room = context["root"], context["room"]
+    if not is_executable_gold_plan(plan, root):
+        return
+    if not candidate_is_playable(plan["steps"][0], root, room):
+        return
+    # Only completed plans for the actual hand can become a timeout move;
+    # a plan found for a hypothetical remainder is not an executable decision.
+    best = context["best_plan"]
+    if best is None or gold_plan_score(plan) > gold_plan_score(best):
+        context["best_plan"] = plan
+
+
+@lru_cache(maxsize=8192)
+def gold_rank_requirements(ranks):
+    return tuple(Counter(ranks).items())
+
+
+def gold_rank_realization(cpu, ranks, allow_jokers):
+    """Match a template using rank buckets, preserving the existing greedy IDs."""
+    memo = getattr(cpu, "_gold_rank_hand", None)
+    if memo is not None and memo[0] is cpu.hand:
+        _, buckets, jokers = memo
+    else:
+        # Search replaces a virtual hand list when consuming cards; it does
+        # not mutate that list in place. Avoid rebuilding its ID tuple for
+        # every template while sharing equal hands across search branches.
+        context = cpu.gold_search_context
+        key = tuple(card.get("card_id") for card in cpu.hand)
+        hands = context.setdefault("rank_hands", {})
+        if key not in hands:
+            buckets, jokers = {}, []
+            for card in cpu.hand:
+                if is_joker(card):
+                    jokers.append(card)
+                else:
+                    buckets.setdefault(card.get("rank"), []).append(card)
+            if len(hands) < 2048:
+                hands[key] = (buckets, jokers)
+        else:
+            buckets, jokers = hands[key]
+        cpu._gold_rank_hand = (cpu.hand, buckets, jokers)
+    missing, available = 0, len(jokers) if allow_jokers else 0
+    for rank, count in gold_rank_requirements(ranks):
+        missing += max(0, count - len(buckets.get(rank, ())))
+        if missing > available:
+            return None
+    used, selected, assigned = {}, [], []
+    for rank in ranks:
+        offset = used.get(rank, 0)
+        bucket = buckets.get(rank, ())
+        if offset < len(bucket):
+            selected.append(bucket[offset])
+            used[rank] = offset + 1
+        else:
+            selected.append(jokers[len(assigned)])
+            assigned.append(str(rank))
+    return {"cards": selected, "assigned_numbers": assigned}
+
+
+def gold_indexed_joker_candidates(cpu, room, count, validator, *, finish=False):
+    # The index retains the original number/encoding order. Skipping other
+    # card counts removes work, not candidates, including both physical Xs.
+    index = registered_prime_template_index(tuple(sorted(cpu.registered_primes)), max_cards=9)
+    candidates, seen = [], set()
+    hand_ids = {card.get("card_id") for card in cpu.hand}
+    for offset, (number, ranks) in enumerate(index.templates_by_card_count.get(count, ())):
+        if offset % 32 == 0:
+            check_cpu_search_deadline(cpu)
+        if number in seen or not validator(number, cpu, getattr(room, "rule", None)):
+            continue
+        realization = gold_rank_realization(cpu, ranks, True)
+        if realization is None:
+            continue
+        if finish:
+            if {card.get("card_id") for card in realization["cards"]} != hand_ids:
+                continue
+        elif not realization["assigned_numbers"]:
+            continue
+        if not beats_field(number, count, room):
+            continue
+        candidates.append({"kind": "prime", "number": number,
+                           **realization, "ranks": ranks})
+        seen.add(number)
+    return candidates
+
+
+def choose_gold_timeout_action(cpu, room):
+    """Use the best completed plan already found, or pass without new search."""
+    context = getattr(cpu, "gold_search_context", None)
+    plan = context["best_plan"] if context is not None else None
+    clear_gold_active_plan(cpu)
+    if plan is None or not is_executable_gold_plan(plan, cpu):
+        return CpuAction("pass")
+    first = plan["steps"][0]
+    if not candidate_is_playable(first, cpu, room):
+        return CpuAction("pass")
+    if first.get("kind") == "composite":
+        if not getattr(room.rule, "allow_composite", False) or int(first["number"]) not in cpu.registered_composites:
+            return CpuAction("pass")
+    elif first.get("number") not in ("X", 57):
+        if not gold_knowledge_number_validator(int(first["number"]), cpu, room.rule):
+            return CpuAction("pass")
+    set_gold_active_plan(cpu, plan)
+    return play_next_gold_plan_step(cpu, room, gold_knowledge_number_validator) or CpuAction("pass")
 
 
 def check_cpu_search_deadline(cpu: CpuPlayer) -> None:
@@ -8212,6 +8372,7 @@ def gold_last_rally_candidates(
     )[:gold_last_candidate_cap(cpu)]
 
 
+@gold_cached_search
 def choose_gold_finish_candidate(
     cpu: CpuPlayer,
     room,
@@ -8491,6 +8652,7 @@ def gold_finish_tails_for_consumed_count(
     return unique_tails
 
 
+@gold_cached_search
 def gold_finish_candidates(
     cpu: CpuPlayer,
     room,
@@ -8518,6 +8680,7 @@ def gold_finish_candidates(
     return dedupe_candidates(candidates)
 
 
+@gold_cached_search
 def joker_prime_finish_candidates(
     cpu: CpuPlayer,
     room,
@@ -8527,6 +8690,8 @@ def joker_prime_finish_candidates(
         return []
     if len(cpu.hand) > 9:
         return []
+    if getattr(cpu, "gold_search_context", None) is not None:
+        return gold_indexed_joker_candidates(cpu, room, len(cpu.hand), validator, finish=True)
 
     candidates = []
     for number in sorted(cpu.registered_primes):
@@ -8554,6 +8719,7 @@ def joker_prime_finish_candidates(
     return candidates
 
 
+@gold_cached_search
 def joker_prime_candidates_for_count(
     cpu: CpuPlayer,
     room,
@@ -8564,6 +8730,8 @@ def joker_prime_candidates_for_count(
         return []
     if count < 1 or count > 9:
         return []
+    if getattr(cpu, "gold_search_context", None) is not None:
+        return gold_indexed_joker_candidates(cpu, room, count, validator)
 
     candidates = []
     for number in sorted(cpu.registered_primes):
@@ -8672,6 +8840,7 @@ def finalize_gold_plan(
         "last_rally_strength": gold_plan_last_rally_strength(steps, room),
     }
     plan["evaluation"] = evaluate_gold_plan(plan)
+    remember_gold_timeout_plan(cpu, plan)
     return plan
 
 
@@ -8876,7 +9045,11 @@ def knowledge_prime_candidates(
                 check_cpu_search_deadline(cpu)
             if not validator(number, cpu, getattr(room, "rule", None)):
                 continue
-            cards = cards_for_ranks(cpu.hand, ranks)
+            if getattr(cpu, "gold_search_context", None) is not None:
+                realization = gold_rank_realization(cpu, ranks, False)
+                cards = realization["cards"] if realization is not None else None
+            else:
+                cards = cards_for_ranks(cpu.hand, ranks)
             if cards is None:
                 continue
             if not beats_field(number, len(cards), room):
@@ -9258,6 +9431,8 @@ def temporary_cpu_with_hand(cpu: CpuPlayer, hand: List[Card]) -> CpuPlayer:
     temp.rng = cpu.rng
     temp.decision_time_budget_ms = cpu.decision_time_budget_ms
     temp.decision_deadline = cpu.decision_deadline
+    if hasattr(cpu, "gold_search_context"):
+        temp.gold_search_context = cpu.gold_search_context
     return temp
 
 

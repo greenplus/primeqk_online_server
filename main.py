@@ -489,19 +489,25 @@ class Room:
         self.end_alternating_series_after_game = False
 
     async def broadcast(self, message: dict):
+        failed = []
         disconnected = []
         removed_immediately = []
         for p in list(self.players):
             if hasattr(p, "ws") and p.ws is None and not is_cpu_player(p):
                 continue
+            sending_ws = getattr(p, "ws", None)
             try:
                 await p.send_json(message)
             except Exception as exc:
                 print(f"broadcast failed in {self.room_id}: {exc}")
-                disconnected.append(p)
-        for p in disconnected:
+                failed.append((p, sending_ws))
+        for p, sending_ws in failed:
+            # A send on the old socket can finish after the player has resumed.
+            if getattr(p, "ws", None) is not sending_ws:
+                continue
             if getattr(p, "room_resume_token_hash", None):
-                await mark_player_disconnected(p)
+                if not await mark_player_disconnected(p, expected_ws=sending_ws, source="broadcast"):
+                    continue
             else:
                 if getattr(p, "status", None) == "waiting":
                     await invalidate_turn_alternation(
@@ -515,6 +521,7 @@ class Room:
                     p.room = None
                     p.status = "watching"
                     p.clear_hand()
+            disconnected.append(p)
         if disconnected:
             if self.state == "playing":
                 for p in disconnected:
@@ -560,6 +567,7 @@ class Room:
             for room_player in list(self.players):
                 if room_player.ws is None:
                     continue
+                sending_ws = room_player.ws
                 try:
                     await room_player.send_json({
                         **message,
@@ -569,7 +577,7 @@ class Room:
                         ),
                     })
                 except Exception:
-                    await mark_player_disconnected(room_player)
+                    await mark_player_disconnected(room_player, expected_ws=sending_ws, source="room_status")
             if self.tournament_match_id:
                 await broadcast_tournament_match_state(self)
             return
@@ -635,6 +643,7 @@ class Room:
             for room_player in list(self.players):
                 if room_player.ws is None:
                     continue
+                sending_ws = room_player.ws
                 try:
                     await room_player.send_json({
                         **state_msg,
@@ -644,7 +653,7 @@ class Room:
                         ),
                     })
                 except Exception:
-                    await mark_player_disconnected(room_player)
+                    await mark_player_disconnected(room_player, expected_ws=sending_ws, source="game_state")
             if self.tournament_match_id:
                 await broadcast_tournament_match_state(self)
             return
@@ -1058,10 +1067,11 @@ def tournament_lobby_recipients(run: TournamentRun) -> list["Player"]:
 async def broadcast_tournament_lobby(run: TournamentRun, payload: dict) -> None:
     message = {**payload, "scope": "tournament_lobby", "run_id": run.run_id}
     for recipient in tournament_lobby_recipients(run):
+        sending_ws = recipient.ws
         try:
             await recipient.send_json(message)
         except Exception:
-            await mark_player_disconnected(recipient)
+            await mark_player_disconnected(recipient, expected_ws=sending_ws, source="tournament_lobby")
 
 
 def clear_tournament_match_view(player: "Player") -> None:
@@ -1159,14 +1169,34 @@ def room_disconnect_grace_seconds(room: "Room", player: "Player") -> int:
     return waiting_disconnect_grace_seconds()
 
 
-async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] = None) -> None:
+def log_connection_event(event: str, player: "Player", websocket=None, **details) -> None:
+    """Log transport metadata only; never include tokens, names or game payloads."""
+    scope = getattr(websocket, "scope", {}) or {}
+    print("connection_event " + json.dumps({
+        "event": event,
+        "at": utc_now().isoformat(),
+        "pid": os.getpid(),
+        "connection_id": scope.get("primeqk_connection_id"),
+        "player_id": player.id,
+        **details,
+    }, ensure_ascii=True), flush=True)
+
+
+async def mark_player_disconnected(
+    player: "Player", *, now: Optional[datetime] = None,
+    expected_ws=None, source: str = "disconnect",
+) -> bool:
+    if expected_ws is not None and player.ws is not expected_ws:
+        return False
     if player.room is None:
-        return
+        return False
     first_notice = getattr(player, "disconnected_at", None) is None
     room = player.room
+    previous_ws = player.ws
     player.ws = None
     if first_notice:
         player.disconnected_at = now or utc_now()
+        log_connection_event("disconnected", player, previous_ws, source=source)
         request = room.pending_start_request
         if request is not None and player.id in request.get("participant_ids", ()):
             await resolve_pending_start_request(
@@ -1178,6 +1208,7 @@ async def mark_player_disconnected(player: "Player", *, now: Optional[datetime] 
         await room.log_chat(
             f"{player.name}の通信が一時的に切れました。{grace_seconds}秒間、復帰を待ちます。"
         )
+    return first_notice
 
 
 def room_resume_session(
@@ -1221,6 +1252,7 @@ async def bind_room_resume_session(
     })
     if session.room is not None:
         await session.room.log_chat(f"{session.name}が通信切断から復帰しました。")
+    log_connection_event("resumed", session, session.ws, replaced_existing=previous_ws is not None)
     return session
 
 
@@ -5513,6 +5545,8 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     player = Player(websocket)  # 辞書ではなくPlayerクラスのインスタンスを生成
     player.client_surface = client_surface
+    websocket.scope["primeqk_connection_id"] = secrets.token_hex(6)
+    log_connection_event("opened", player, websocket, surface=client_surface)
 
     try:
         # 自分のIDを通知
@@ -6126,22 +6160,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                 await room.broadcast(payload)
 
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as exc:
+        log_connection_event(
+            "closed", player, websocket,
+            code=getattr(exc, "code", None), reason=str(getattr(exc, "reason", ""))[:160],
+        )
         if player.ws is websocket and player.room is not None:
             room = player.room
             if player.room_resume_token_hash:
-                await mark_player_disconnected(player)
+                await mark_player_disconnected(player, expected_ws=websocket, source="receive")
                 if room.state == "playing" and player.status == "waiting":
                     record_score_play_line(room, player, "切断")
                 await room.update_room_status()
             else:
                 await leave_room(player, notify_client=False)
-    except Exception:
+    except Exception as exc:
+        log_connection_event("handler_error", player, websocket, error_type=type(exc).__name__)
         traceback.print_exc()
         if player.ws is websocket and player.room is not None:
             room = player.room
             if player.room_resume_token_hash:
-                await mark_player_disconnected(player)
+                await mark_player_disconnected(player, expected_ws=websocket, source="handler_error")
                 if room.state == "playing" and player.status == "waiting":
                     record_score_play_line(room, player, "切断")
                 await room.update_room_status()
