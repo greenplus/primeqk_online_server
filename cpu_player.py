@@ -402,7 +402,7 @@ def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None
     # Master evaluators and committed branches contain the previous game's hand
     # and public context. Keep configuration, but never reuse them in a rematch.
     for name in tuple(vars(cpu)):
-        if name.startswith(("opening_master_", "second_opening_master_", "post_all_out_", "master_")) and not name.endswith("_config"):
+        if name.startswith(("opening_master_", "second_opening_master_", "post_all_out_", "master_", "revolution_master_")) and not name.endswith("_config"):
             delattr(cpu, name)
     cpu.gold_active_plan = None
     cpu.gold_plan_step_index = 0
@@ -823,7 +823,7 @@ def build_composite_practice_all_out_payload(
     penalty are the intended hand-reshaping fallback.
     """
     hand = list(cpu.hand)
-    if len(hand) < 2:
+    if len(hand) < 3:
         return None
 
     field = getattr(room, "field", []) or []
@@ -833,7 +833,7 @@ def build_composite_practice_all_out_payload(
         visible_counts = tuple(range(1, min(9, len(hand) - 1) + 1))
     visible_counts = tuple(
         count for count in visible_counts
-        if 1 <= count < len(hand)
+        if 1 <= count <= len(hand) - 2
     )
     if not visible_counts:
         return None
@@ -862,10 +862,7 @@ def build_composite_practice_all_out_payload(
         chunks = random_composite_factor_chunks(material_cards, rng)
         factor_values = [composite_practice_cards_number(chunk, assigned_by_id) for chunk in chunks]
         if any(value is None or value < 2 for value in factor_values):
-            # One concatenated chunk avoids a syntax-only failure where possible.
-            chunks = [material_cards]
-            factor_values = [composite_practice_cards_number(material_cards, assigned_by_id)]
-        if any(value is None or value < 2 for value in factor_values):
+            # A single chunk has no operator and cannot be a composite attempt.
             continue
         product = 1
         for value in factor_values:

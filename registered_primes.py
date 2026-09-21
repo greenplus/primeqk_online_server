@@ -553,6 +553,11 @@ def parse_registered_composite_expression(expression: str) -> tuple[RegisteredCo
         if previous == token.kind:
             raise ValueError("invalid expression order")
         previous = token.kind
+    if not any(token.kind == "op" for token in tokens):
+        raise ValueError("expression requires multiplication or a power")
+    for token in tokens:
+        if token.kind == "cards" and registered_number_pattern_value(token.text) < 2:
+            raise ValueError("bases and exponents must be at least two")
     return tuple(tokens)
 
 

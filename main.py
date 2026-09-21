@@ -3189,6 +3189,8 @@ def record_public_deck_draw(room: Room, drawn: dict) -> None:
 
 def flow_field(room: Room) -> None:
     """場が流れたときの共通処理：場を空にし、予備軍を山札の“下”に戻す（順序保持）"""
+    from upper_diamond.revolution_context import note_field_flow
+    note_field_flow(room)
     room.field = []
     room.last_number = None
     room.last_play_player_id = None
@@ -5153,6 +5155,7 @@ async def choose_room_cpu_action(room: Room, cpu: CpuPlayer):
         last_play_hand_before=room.last_play_hand_before,
         last_play_kind=room.last_play_kind, last_play_player_id=room.last_play_player_id,
         opening_all_out_failed=room.opening_all_out_failed,
+        revolution_recovery_context=deepcopy(getattr(room, 'revolution_recovery_context', None)),
     )
     action = await asyncio.to_thread(
         choose_profile_cpu_action, worker, public, is_valid_prime_for_player,
@@ -5374,10 +5377,11 @@ async def handle_start_game_request(player: "Player", data: dict) -> None:
     if waiting_players is None:
         return
 
-    alternate, first_mode = normalize_turn_order_request(player, data)
-    alternate = alternate and len(waiting_players) == 2
+    requested_alternate, first_mode = normalize_turn_order_request(player, data)
+    continuation = turn_alternation_continues(room, waiting_players)
+    alternate = (requested_alternate or continuation) and len(waiting_players) == 2
     human_players_in_game = [item for item in waiting_players if not is_cpu_player(item)]
-    if alternate and len(human_players_in_game) == 2:
+    if alternate and len(human_players_in_game) == 2 and not continuation:
         await create_start_game_approval_request(room, player, waiting_players, first_mode)
         return
     room.start_in_progress = True
@@ -6350,6 +6354,8 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     if number == 1729 and not room.rule.special_numbers_composite_only:
         # フラグをトグル
         room.reverse_order = not room.reverse_order
+        from upper_diamond.revolution_context import note_revolution
+        note_revolution(room, played_cards)
         # カードを場に出す
         record_field_play(room, player, len(player.hand), play_kind="prime")
         push_to_reserve(room, played_cards)
@@ -6551,16 +6557,17 @@ def parse_and_eval_composite(
     return: (value, used_card_ids)
 
     許可する構文:
-      card+ ( (×|^) card+ )*
+      card+ ( (×|^) card+ )+
     つまり
       - カードは連続して整数を作ってよい
       - 演算子は連続不可
       - 先頭末尾はカード
+      - 明示した指数は途中も含めて2以上
     """
     if not tokens:
         raise CompositeSyntaxError("合成数の式が空です。")
 
-    if tokens[0]["kind"] != "card" or tokens[-1]["kind"] != "card":
+    if tokens[0].get("kind") != "card" or tokens[-1].get("kind") != "card":
         raise CompositeSyntaxError("式の先頭と末尾はカードである必要があります。")
 
     # 1) 演算子の基本構文チェック
@@ -6586,6 +6593,12 @@ def parse_and_eval_composite(
 
         prev_kind = kind
 
+    if not any(t["kind"] == "op" for t in tokens):
+        raise CompositeSyntaxError("素因数分解には積または指数が最低1つ必要です。")
+    card_ids = [t.get("card_id") for t in tokens if t["kind"] == "card"]
+    if len(set(card_ids)) != len(card_ids):
+        raise CompositeSyntaxError("同じカードを式の中で複数回使うことはできません。")
+
     # 2) “×” で分割
     chunks: List[List[dict]] = []
     cur: List[dict] = []
@@ -6603,6 +6616,7 @@ def parse_and_eval_composite(
 
     used_card_ids: List[str] = []
     total_value = 1
+    factors = []
 
     # 3) 各 chunk を「card+ (^ card+)*」として解釈
     for ch in chunks:
@@ -6614,7 +6628,7 @@ def parse_and_eval_composite(
 
         for t in ch:
             if t["kind"] == "card":
-                cid = t["card_id"]
+                cid = t.get("card_id")
                 if cid not in token_card_ranks:
                     raise CompositeSyntaxError("未知のカードが指定されました。")
                 cur_cards.append(token_card_ranks[cid])
@@ -6638,12 +6652,23 @@ def parse_and_eval_composite(
         temp_cards.extend(cur_ids)
 
         # 4) 各 card 列を整数化
-        ints = [build_int_from_cards(s) for s in seqs]
+        try:
+            ints = [build_int_from_cards(s) for s in seqs]
+        except CompositeError as e:
+            raise CompositeSyntaxError(e.msg) from e
 
         # 5) 底の条件
         base = ints[0]
         if base < 2:
             raise CompositeSyntaxError("底が0または1は不可です。")
+        if any(exponent < 2 for exponent in ints[1:]):
+            raise CompositeSyntaxError("指数は途中も含めてすべて2以上にしてください。")
+        factors.append(ints)
+        used_card_ids.extend(temp_cards)
+
+    # 式全体の構文を確認してから計算する。後続の構文違反もペナルティにしない。
+    for ints in factors:
+        base = ints[0]
         if not is_valid_prime_by_rule(base, rule):
             kind = rule_display_name(rule.prime_rule)
             raise CompositeMathError(f"底 {base} が{kind}ではありません。")
@@ -6665,7 +6690,6 @@ def parse_and_eval_composite(
 
         value = pow(base, exp)
         total_value *= value
-        used_card_ids.extend(temp_cards)
 
     return total_value, used_card_ids
 
@@ -6689,7 +6713,11 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 
     # composite.tokens から材料札を再構成（見せ札と材料札は常に別）
     token_card_ids = [t.get("card_id") for t in comp_tokens if t.get("kind") == "card"]
-    token_card_ids = [cid for cid in token_card_ids if cid is not None]
+    selected_ids = [c.get("card_id") for c in sel_cards]
+    physical_ids = selected_ids + token_card_ids
+    if None in physical_ids or len(set(physical_ids)) != len(physical_ids):
+        await player.ws.send_json({"type": "error", "message": "見せ札と材料札には、それぞれ別のカードを1回ずつ使ってください。"})
+        return
     if token_card_ids:
         hand_by_id = {c["card_id"]: c for c in player.hand}
         con_cards = [hand_by_id[cid] for cid in token_card_ids if cid in hand_by_id]
@@ -6858,6 +6886,8 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             return
 
         room.reverse_order = not room.reverse_order
+        from upper_diamond.revolution_context import note_revolution
+        note_revolution(room, sel_cards)
         record_field_play(room, player, hand_before, play_kind="composite")
         room.field = sel_cards
         room.last_number = sel_number
@@ -7012,6 +7042,8 @@ async def start_game(
 ):
     stop_turn_clock(room)
     room.reverse_order = room.rule.start_revolution     # 革命はルールごとの開始時コンディションに戻す
+    room.revolution_recovery_context = None
+    room.revolution_serial = 0
     room.has_drawn = False         # ドロー済みフラグもクリア
 
     # 1) 待機中のプレイヤーを確定（1人練習または2人対戦）
