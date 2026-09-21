@@ -660,19 +660,32 @@ class Room:
         await self.broadcast(state_msg)
 
     async def try_end_game(self) -> bool:
-        """勝者がいれば game_over を投げて True、なければ False を返す"""
+        """手札0枚の勝利、または手札上限でのバースト敗北を確定する。"""
+        if self.state != "playing":
+            return False
+        active_players = get_active_players(self)
+        burst_player = next((p for p in active_players if hand_is_burst(p, self.rule)), None)
         winner = check_win_condition(self)
-        if winner is not None:
-            winner_player = next(
-                (p for p in get_active_players(self) if p.id == self.current_turn_id),
-                None,
-            )
+        winner_player = next((p for p in active_players if p.id == self.current_turn_id), None)
+        if burst_player is not None:
+            winner_player = next((p for p in active_players if p is not burst_player), None)
+            winner = winner_player.name if winner_player is not None else None
+        if winner is not None or burst_player is not None:
             campaign_result = await maybe_record_campaign_win(self, winner_player)
             await record_tournament_game_result(self, winner_player)
             self.state = "waiting"
             stop_turn_clock(self)
-            await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
-            await self.log_chat(f"{winner}が勝利しました")
+            result = {"type": "game_over", "winner": winner, "state": self.state}
+            if burst_player is not None:
+                result.update({"reason": "burst", "loser": burst_player.name, "loser_id": burst_player.id})
+            await self.broadcast(result)
+            if burst_player is not None:
+                await self.log_chat(
+                    f"{burst_player.name}の手札が{len(burst_player.hand)}枚になり、"
+                    f"{self.rule.burst_hand_size}枚バーストで敗北しました。"
+                )
+            if winner is not None:
+                await self.log_chat(f"{winner}が勝利しました")
             await send_neo_largest_prime_share_chats(self)
             await maybe_log_talkative_fish_game_over(self)
             await publish_score_log(
@@ -691,6 +704,7 @@ NEO_BEGINNER_ROOM_IDS = ("room_16", "room_17", "room_18")
 NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
 CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6")
 PLUS_ROOM_IDS = ("room_7", "room_8", "room_9")
+HYAKKI_YAGYO_ROOM_IDS = ("hyakki_yagyo_1", "hyakki_yagyo_2", "hyakki_yagyo_3")
 
 ROOM_CONFIG = [
     ("room_1", PRESETS["std-5-1"], "Classic"),
@@ -703,6 +717,7 @@ ROOM_CONFIG = [
     ("room_8", PRESETS["tetrad-11-n-c"], "Plus"),
     ("room_9", PRESETS["semiprime-11-n-c"], "Plus"),
     (TOURNAMENT_ROOM_ID, PRESETS["std-11-n-c"], "Plus"),
+    *((room_id, PRESETS["hyakki-yagyo-11-n-c-b32"], "Plus") for room_id in HYAKKI_YAGYO_ROOM_IDS),
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
@@ -720,6 +735,11 @@ ROOM_CATEGORY_DESCRIPTIONS = {
     "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。今までの記録はこちら。",
 }
 ROOM_DESCRIPTIONS = {
+    **{room_id: (
+        "素数大富豪百鬼夜行の手動進行・練習用。A～Kはランクnごとにn枚、"
+        "ジョーカー2枚の計93枚。初期手札11枚、通常ペナルティ、合成数あり。"
+        "ドロー・ペナルティで手札が32枚に達すると、その時点でバースト負けです。"
+    ) for room_id in HYAKKI_YAGYO_ROOM_IDS},
     "event_1": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
     "event_2": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
     "event_3": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
@@ -873,6 +893,7 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
             "山札の偶数カード半減＋コックさん12枚",
             False,
         ),
+        DeckRule.RANK_MULTIPLICITY: ("rank_multiplicity", "nがn枚（A～K・X2枚・計93枚）", False),
     }
     penalty_rules = {
         PenaltyRule.NORMAL: ("normal", "ペナルティ通常", True),
@@ -900,6 +921,8 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
         summary_parts.append(penalty_label)
     if not preset.allow_composite:
         summary_parts.append("合成数なし")
+    if preset.burst_hand_size is not None:
+        summary_parts.append(f"{preset.burst_hand_size}枚バースト")
     return {
         "key": preset.key,
         "label": preset.label,
@@ -914,6 +937,7 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
         "prime_rule": {"key": prime_key, "label": prime_label, "default": prime_default},
         "allow_composite": preset.allow_composite,
         "start_revolution": preset.start_revolution,
+        "burst_hand_size": preset.burst_hand_size,
     }
 
 
@@ -2332,6 +2356,12 @@ def global_chat_room_meta(room: Optional[Room]) -> dict:
             "room_badge": "Plus・大会",
             "room_tone": "plus",
         }
+    if room.room_id in HYAKKI_YAGYO_ROOM_IDS:
+        return {
+            "room_id": room.room_id,
+            "room_badge": f"百鬼夜行・ルーム{HYAKKI_YAGYO_ROOM_IDS.index(room.room_id) + 1}",
+            "room_tone": "plus",
+        }
     return {
         "room_id": room.room_id,
         "room_badge": room.room_id,
@@ -2439,6 +2469,10 @@ async def handle_global_chat_message(player: Player, data: dict) -> bool:
 ################################################
 # 勝敗判定ロジック
 ################################################
+
+def hand_is_burst(player, rule: RulePreset) -> bool:
+    return rule.burst_hand_size is not None and len(player.hand) >= rule.burst_hand_size
+
 
 def check_win_condition(room):
     active_players = get_active_players(room)
@@ -3120,6 +3154,19 @@ def generate_deck() -> List[dict]:
     return deck
 
 def build_deck(rule: RulePreset) -> List[dict]:
+    if rule.deck_rule is DeckRule.RANK_MULTIPLICITY:
+        deck = [
+            {"card_id": str(uuid.uuid4()), "suit": ("S", "H", "D", "C")[index % 4],
+             "rank": rank, "is_joker": False}
+            for rank in range(1, 14)
+            for index in range(rank)
+        ]
+        deck.extend(
+            {"card_id": str(uuid.uuid4()), "suit": "X", "rank": 0, "is_joker": True}
+            for _ in range(2)
+        )
+        random.shuffle(deck)
+        return deck
     deck = generate_deck()
     if rule.deck_rule in (DeckRule.EVEN_HALVED, DeckRule.EVEN_HALVED_WITH_CHEFS):
         kept = []
@@ -5182,7 +5229,7 @@ async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
         if action is None:
             return
         await execute_cpu_action(room, cpu, action)
-        if action.kind == "draw":
+        if action.kind == "draw" and room.state == "playing":
             followup = await choose_room_cpu_action(room, cpu)
             if followup is None:
                 return
@@ -5229,6 +5276,8 @@ async def draw_card_for_player(player, room: Room) -> bool:
     await player.send_hand_update()
     await room.update_game_state()
     room.has_drawn = True
+    if hand_is_burst(player, room.rule) and await room.try_end_game():
+        await room.update_room_status()
     return True
 
 
@@ -6420,6 +6469,9 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
                 player.add_card(drawn)
                 drawn_penalties.append(drawn)
 
+                if hand_is_burst(player, room.rule):
+                    break
+
         # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
         flow_field(room)
 
@@ -6833,6 +6885,8 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
                 record_public_deck_draw(room, drawn)
                 player.add_card(drawn)
                 drawn_penalties.append(drawn)
+                if hand_is_burst(player, room.rule):
+                    break
         flow_field(room)
         await player.send_hand_update()
         await room.update_game_state()

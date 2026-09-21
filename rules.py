@@ -8,6 +8,7 @@ class DeckRule(Enum):
     DEFAULT = auto()       # 通常の54枚デッキ
     EVEN_HALVED = auto()   # 偶数カードを半分に間引く
     EVEN_HALVED_WITH_CHEFS = auto()
+    RANK_MULTIPLICITY = auto()  # A～Kはランクnごとにn枚、ジョーカー2枚の93枚
 
 class PenaltyRule(Enum):
     ALWAYS_1 = auto()      # 必ず1枚
@@ -42,8 +43,18 @@ class RulePreset:
     normal_finish_max_hand_size: int = 0
     special_numbers_composite_only: bool = False
     cpu_profile_keys: tuple[str, ...] = ()
+    burst_hand_size: int | None = None
 
 PRESETS: Dict[str, RulePreset] = {
+    "hyakki-yagyo-11-n-c-b32": RulePreset(
+        key="hyakki-yagyo-11-n-c-b32",
+        label="素数大富豪百鬼夜行: 11枚 / nがn枚 / 32枚バースト",
+        deck_rule=DeckRule.RANK_MULTIPLICITY,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=True,
+        burst_hand_size=32,
+    ),
     "std-5-1": RulePreset(
         key="std-5-1",
         label="5枚 / ペナ1",
