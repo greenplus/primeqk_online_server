@@ -2,6 +2,7 @@
 from .opening_master import Config as OpeningConfig, choose_opening
 from .post_all_out_master import Config as MateConfig, choose_post_all_out
 from .second_opening_master import choose_second_opening
+from .revolution_master import choose_revolution
 from .master_budget import Budget, CURRENT, MasterDeadline, TimingConfig
 import time
 from copy import deepcopy
@@ -22,8 +23,10 @@ def _choose_combined(cpu, room, diamond_choice):
 
     # choose_opening already restricts initial searches to the first player.
     # Its committed plans continue through the original Diamond executor.
-    return choose_opening(cpu, room, after_opening,
-                          getattr(cpu, 'opening_master_config', OpeningConfig()))
+    def normal(player, state):
+        return choose_opening(player, state, after_opening,
+                              getattr(player, 'opening_master_config', OpeningConfig()))
+    return choose_revolution(cpu, room, normal)
 
 
 def clear_interrupted_plan(cpu):
@@ -31,6 +34,8 @@ def clear_interrupted_plan(cpu):
     diamond.clear_silver_active_plan(cpu)
     cpu.post_all_out_master_active = None
     cpu.post_all_out_draw_phase = None
+    cpu.revolution_master_active = None
+    cpu.revolution_master_recovery = None
     # An interrupted evaluator may have partial diagnostic state, but is never
     # allowed to publish it as a complete cached decision on the next turn.
     cpu.opening_master_evaluator = None
@@ -106,7 +111,8 @@ def choose_combined(cpu, room, diamond_choice):
     except diamond.CpuDecisionDeadline:
         emergency = True
         traces = {name: getattr(cpu,name,None) for name in
-                  ('post_all_out_master_trace','opening_master_trace','second_opening_master_trace')}
+                  ('post_all_out_master_trace','opening_master_trace','second_opening_master_trace',
+                   'revolution_master_trace')}
         cpu.__dict__.clear()
         cpu.__dict__.update(saved)
         cpu.__dict__.update(traces)
@@ -123,6 +129,9 @@ def choose_combined(cpu, room, diamond_choice):
         second = getattr(cpu, 'second_opening_master_trace', None)
         if second is not None:
             second.update(label='deadline_pass', best=None)
+        revolution = getattr(cpu, 'revolution_master_trace', None)
+        if revolution is not None:
+            revolution.update(best=None, deadline_discarded=True)
         # Passing is legal on both free and occupied fields. Do not introduce
         # an unproved draw after a known draw/57 path was rejected.
         cpu.diamond_last_route_kind = 'master-deadline-pass'
