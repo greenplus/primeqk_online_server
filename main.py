@@ -1133,6 +1133,25 @@ async def watch_tournament_match(player: "Player", match_id: str) -> None:
     })
 
 
+async def send_tournament_match_chat(player: "Player", data: dict) -> None:
+    room = player.room
+    if (
+        room is None or room.state != "playing" or not room.tournament_match_id
+        or data.get("match_id") != room.tournament_match_id
+        or player not in get_active_players(room)
+    ):
+        await player.send_json({"type": "error", "code": "tournament_match_chat",
+                                "message": "この対戦は終了しています。対戦チャットは履歴のみ閲覧できます。"})
+        return
+    message = normalize_chat_message(data.get("message"))
+    if message is None:
+        await player.send_json({"type": "error", "code": "tournament_match_chat",
+                                "message": f"メッセージは1〜{MAX_CHAT_MESSAGE_LENGTH}文字で入力してください。"})
+        return
+    await room.broadcast({"type": "chat", "scope": "tournament_match",
+                          "match_id": room.tournament_match_id, "sender": player.name, "message": message})
+
+
 async def broadcast_tournament_match_state(room: "Room") -> None:
     run = tournament_run_for_room(room)
     match_id = room.tournament_match_id
@@ -5714,7 +5733,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 except ValueError as exc:
                     await player.send_json({"type": "error", "code": "tournament_watch_match", "message": str(exc)})
                 continue
+            elif msg_type == "tournament_unwatch_match":
+                clear_tournament_match_view(player)
+                continue
+            elif msg_type == "tournament_match_chat":
+                await send_tournament_match_chat(player, data)
+                continue
             elif msg_type == "tournament_lobby_chat":
+                # The lobby remains subscribed while a player is in a match room.
                 run = tournament_for_player(player) or TOURNAMENT_RUNS_BY_ROOM.get(TOURNAMENT_ROOM_ID)
                 if run is None or not is_tournament_managed_room(player.room):
                     await player.send_json({"type": "error", "code": "tournament_lobby_chat", "message": "大会ロビーへ入室してください。"})
@@ -6183,6 +6209,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "chat":
                 if not player.room:
                     continue
+                room = player.room
                 message = normalize_chat_message(data.get("message"))
                 if message is None:
                     await player.send_json({
