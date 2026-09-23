@@ -40,7 +40,7 @@ from composite_practice_stats_store import (
     ACTOR_OWNER,
     CompositePracticeStatsStore,
 )
-from tournament import TournamentRun, hash_resume_token, issue_resume_token, parse_datetime
+from tournament import RETIREMENT_GRACE_SECONDS, TournamentRun, hash_resume_token, issue_resume_token, parse_datetime
 from tournament_store import TournamentStore
 from recruitment_store import (
     MAX_ACTIVE_RECRUITMENTS,
@@ -868,10 +868,11 @@ def tournament_public_payload(
         }
     payload = {
         **run.public_payload(viewer_participant_id=viewer_participant_id),
+        "server_now": utc_now().isoformat(),
         "rule": tournament_rule_payload(PRESETS[run.rule_key]),
         "available_rules": tournament_rule_catalog(),
         "persistent": TOURNAMENT_STORE.persistent,
-        "match_ready_seconds": tournament_match_ready_seconds(),
+        "match_ready_seconds": 60 if run.flexible else tournament_match_ready_seconds(),
         "disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
@@ -962,7 +963,8 @@ def playing_disconnect_grace_seconds() -> int:
 
 
 def waiting_disconnect_grace_seconds() -> int:
-    return int_env("WAITING_DISCONNECT_GRACE_SECONDS", 180, minimum=10)
+    # All waiting seats expire after one minute, independently of tournament eligibility.
+    return 60
 
 
 def is_tournament_managed_room(room: Optional["Room"]) -> bool:
@@ -1025,6 +1027,7 @@ def tournament_match_live_summary(run: TournamentRun, match_id: str) -> dict:
     return {
         "match_id": match.match_id,
         "round_no": match.round_no,
+        "sequence_no": match.sequence_no,
         "table_no": table_no,
         "player1_id": match.player1_id,
         "player2_id": match.player2_id,
@@ -1239,6 +1242,10 @@ async def mark_player_disconnected(
     player.ws = None
     if first_notice:
         player.disconnected_at = now or utc_now()
+        run = tournament_run_for_room(room)
+        if run and run.flexible and run.status == "running" and player.tournament_participant_id in run.participants:
+            run.pause_participant(player.tournament_participant_id, "disconnected", now=player.disconnected_at)
+            await TOURNAMENT_STORE.save_run(run)
         log_connection_event("disconnected", player, previous_ws, source=source)
         request = room.pending_start_request
         if request is not None and player.id in request.get("participant_ids", ()):
@@ -1420,6 +1427,8 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         registration_opens_at=parse_datetime(data.get("registration_opens_at")),
         starts_at=parse_datetime(data.get("starts_at")),
         max_participants=int(data.get("max_participants", 10)),
+        pairing_mode=str(data.get("pairing_mode", "rounds")),
+        registration_closes_at=parse_datetime(data["registration_closes_at"]) if data.get("registration_closes_at") else None,
     )
     TOURNAMENT_RUNS_BY_ROOM[room_id] = run
     room = rooms[room_id]
@@ -1432,6 +1441,8 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         "rule_key": run.rule_key,
         "registration_opens_at": run.registration_opens_at.isoformat(),
         "starts_at": run.starts_at.isoformat(),
+        "pairing_mode": run.pairing_mode,
+        "registration_closes_at": run.registration_closes_at.isoformat(),
     })
     await room.log_chat(f"大会「{run.title}」の日程が設定されました。")
     await notify_tournament_discord(run, "scheduled")
@@ -1527,6 +1538,8 @@ async def register_or_resume_tournament_player(
     )
     issued_token = None
     resumed = participant is not None
+    if run.flexible and run.status == "running":
+        await expire_flexible_participants(run, utc_now())
     if participant is not None:
         existing = TOURNAMENT_SESSIONS.get(participant.participant_id)
         if (
@@ -1573,6 +1586,8 @@ async def register_or_resume_tournament_player(
         await bound.send_hand_update()
         if bound.room.state == "playing":
             await bound.room.update_game_state()
+    if run.flexible:
+        await publish_tournament_state(run)
     return bound
 
 
@@ -1667,7 +1682,7 @@ def tournament_discord_notification_content(
         if standings:
             result_lines = [
                 f"{row['rank']}位 {discord_safe_text(row['display_name'])}: "
-                f"{row['wins']}勝{row['losses']}敗 / {row['points']}点"
+                f"{row['wins']}勝{row['losses']}敗"
                 for row in standings
             ]
             lines.append("📊 最終順位\n" + "\n".join(result_lines))
@@ -1716,6 +1731,10 @@ async def mark_tournament_match_ready(player: "Player", match_id: str) -> None:
     match = run.current_match_for_participant(participant_id)
     if match is None or match.match_id != match_id:
         raise ValueError("この対戦の参加確認は終了しています。")
+    if run.flexible and (match.ready_deadline_at and utc_now() >= match.ready_deadline_at):
+        raise ValueError("参加確認の期限を過ぎています。対戦受付を再開してください。")
+    if run.flexible and any(run.participants[pid].retired_at or run.participants[pid].unavailable_since for pid in (match.player1_id, match.player2_id)):
+        raise ValueError("この対戦は相手の不在により取り消されました。")
     run.mark_match_ready(participant_id, match_id)
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(
@@ -1753,7 +1772,7 @@ async def prepare_tournament_match(
             match.ready_deadline_at is not None
             and current >= match.ready_deadline_at
         )
-        if not tournament_match_both_ready(match) and not deadline_elapsed:
+        if not tournament_match_both_ready(match) and (run.flexible or not deadline_elapsed):
             return
     run.begin_match(match.match_id, now=current)
     await TOURNAMENT_STORE.save_run(run)
@@ -1784,10 +1803,11 @@ async def prepare_tournament_match(
             "type": "tournament_match_started",
             "match_id": match.match_id,
             "round_no": match.round_no,
+            "sequence_no": match.sequence_no,
             "tournament": tournament_public_payload(run, match_player.tournament_participant_id),
         })
     await rooms[run.room_id].log_chat(
-        f"第{match.round_no}ラウンド: {player1.name} vs {player2.name} を開始します。"
+        f"{'対戦 #' + str(match.sequence_no) if run.flexible else '第' + str(match.round_no) + 'ラウンド'}: {player1.name} vs {player2.name} を開始します。"
     )
     await rooms[run.room_id].update_room_status()
     await room.update_room_status()
@@ -1795,6 +1815,9 @@ async def prepare_tournament_match(
 
 
 async def start_or_prepare_next_tournament_match(run: TournamentRun) -> None:
+    if run.flexible:
+        await call_flexible_matches(run, utc_now())
+        return
     lobby = rooms[run.room_id]
     existing_matches = run.current_matches
     matches = existing_matches or run.start_next_round(
@@ -1905,6 +1928,122 @@ async def close_tournament_match_room(
                 ),
             })
     await lobby.update_room_status()
+
+
+async def publish_tournament_state(run: TournamentRun) -> None:
+    for recipient in tournament_lobby_recipients(run):
+        try:
+            await recipient.send_json({"type": "tournament_update", "tournament": tournament_public_payload(run, recipient.tournament_participant_id)})
+        except Exception:
+            await mark_player_disconnected(recipient, source="tournament_update")
+
+
+async def cancel_flexible_call(run: TournamentRun, match) -> None:
+    if match.status != "called":
+        return
+    run.cancel_call(match)
+    # Keep observers on the selected board, displaying the cancellation.
+    await finish_tournament_match_view(run, None, match.match_id, None)
+    await rooms[run.room_id].log_chat(f"{run.participants[match.player1_id].display_name} vs {run.participants[match.player2_id].display_name} の呼び出しを解除しました。対戦は未消化のまま残ります。")
+
+
+async def retire_flexible_participants(run: TournamentRun, participant_ids: list[str], now: datetime) -> None:
+    ids = [pid for pid in participant_ids if not run.participants[pid].retired_at]
+    if not ids:
+        return
+    was_finished = run.status == "finished"
+    resolved = run.retire_participants(ids, now=now)
+    for match in resolved:
+        await close_tournament_match_room(run, match.match_id, winner_id=match.winner_id)
+    for pid in ids:
+        await TOURNAMENT_STORE.audit(run.run_id, actor="system", action="participant_retired", details={"participant_id": pid, "grace_seconds": RETIREMENT_GRACE_SECONDS})
+        await rooms[run.room_id].log_chat(f"{run.participants[pid].display_name}の棄権が確定しました。残りの対戦は不戦敗となり、この開催回は観戦のみ可能です。")
+    await TOURNAMENT_STORE.save_run(run)
+    await publish_tournament_state(run)
+    if not was_finished and run.status == "finished":
+        await announce_tournament_finished(run)
+
+
+async def expire_flexible_participants(run: TournamentRun, now: datetime) -> None:
+    expired = [p.participant_id for p in run.active_participants if not p.retired_at and p.unavailable_since and (now - p.unavailable_since).total_seconds() >= RETIREMENT_GRACE_SECONDS]
+    await retire_flexible_participants(run, expired, now)
+
+
+async def call_flexible_matches(run: TournamentRun, now: datetime) -> None:
+    if run.status != "running":
+        return
+    # A completed game may still be sending its result; wait until its room is closed.
+    available = {pid for pid, session in TOURNAMENT_SESSIONS.items() if pid in run.participants and tournament_session_online(pid) and session.room is rooms[run.room_id]}
+    called = run.call_available_matches(available, now=now, ready_wait_seconds=60)
+    if called:
+        await TOURNAMENT_STORE.save_run(run)
+        for match in called:
+            await notify_tournament_match_call(run, match)
+        await publish_tournament_state(run)
+
+
+async def set_flexible_participant_availability(player: "Player", *, retire: bool = False) -> None:
+    run = tournament_for_player(player)
+    pid = player.tournament_participant_id
+    if not run or not run.flexible or run.status != "running" or pid not in run.participants:
+        raise ValueError("進行中の随時対戦大会へ参加してから操作してください。")
+    now = utc_now()
+    await expire_flexible_participants(run, now)
+    if retire:
+        await retire_flexible_participants(run, [pid], now)
+    else:
+        run.resume_participant(pid, now=now)
+        await TOURNAMENT_STORE.save_run(run)
+        await publish_tournament_state(run)
+        await call_flexible_matches(run, now)
+
+
+async def flexible_tournament_tick(run: TournamentRun, now: datetime) -> None:
+    before = run.to_dict()
+    for participant in run.active_participants:
+        if not participant.retired_at and not tournament_session_online(participant.participant_id):
+            session = TOURNAMENT_SESSIONS.get(participant.participant_id)
+            since = getattr(session, "disconnected_at", None) or now
+            run.pause_participant(participant.participant_id, "disconnected", now=max(since, run.starts_at))
+    for match in list(run.current_matches):
+        ids = (match.player1_id, match.player2_id)
+        if match.status == "called":
+            timed_out = match.ready_deadline_at is not None and now >= match.ready_deadline_at
+            unavailable = any(run.participants[pid].unavailable_since or run.participants[pid].retired_at for pid in ids)
+            if timed_out or unavailable:
+                if timed_out:
+                    for pid in ids:
+                        if pid not in match.ready_player_ids:
+                            run.pause_participant(pid, "no_confirmation", now=match.ready_deadline_at)
+                await cancel_flexible_call(run, match)
+            elif tournament_match_both_ready(match):
+                await prepare_tournament_match(run, match, now=now)
+            continue
+        match_room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
+        if match_room is None:
+            # A restart cannot reconstruct private hands. Re-call this uncompleted pair.
+            match.status = "called"
+            match.started_at = None
+            match.ready_player_ids = []
+            match.called_at = now
+            match.ready_deadline_at = now + timedelta(seconds=60)
+            await notify_tournament_match_call(run, match)
+            continue
+        online = [tournament_session_online(pid, match_room) for pid in ids]
+        expired = [tournament_participant_disconnect_expired(TOURNAMENT_SESSIONS.get(pid), connected, now, playing_disconnect_grace_seconds(), match.started_at) for pid, connected in zip(ids, online)]
+        if expired[0] and online[1] or expired[1] and online[0] or all(expired):
+            winner = ids[1] if expired[0] and online[1] else ids[0] if expired[1] and online[0] else None
+            await resolve_tournament_match(run, match.match_id, winner, resolution="forfeit" if winner else "auto_skip", actor="system", advance=False)
+    await expire_flexible_participants(run, now)
+    if run.status == "running" and run.finish_if_complete(now=now):
+        if run.status == "finished":
+            await announce_tournament_finished(run)
+        else:
+            await rooms[run.room_id].log_chat("途中参加の受付期限を過ぎ、参加者が2人未満のため大会を中止しました。")
+    await call_flexible_matches(run, now)
+    if run.to_dict() != before:
+        await TOURNAMENT_STORE.save_run(run)
+        await publish_tournament_state(run)
 
 
 async def announce_tournament_finished(run: TournamentRun) -> None:
@@ -2051,10 +2190,13 @@ async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
                     await room.log_chat(reason)
                     await notify_tournament_discord(run, "cancelled", reason=reason)
                 elif run.status == "running":
-                    await room.log_chat("参加登録を締め切り、対戦の割り振りを確定しました。")
+                    await room.log_chat("随時対戦を開始しました。途中参加の受付期限まで登録できます。" if run.flexible else "参加登録を締め切り、対戦の割り振りを確定しました。")
                     await notify_tournament_discord(run, "running")
                 await room.update_room_status()
             if run.status != "running":
+                continue
+            if run.flexible:
+                await flexible_tournament_tick(run, current)
                 continue
             if not run.current_matches:
                 await start_or_prepare_next_tournament_match(run)
@@ -5703,7 +5845,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     await player.send_json({"type": "error", "message": "plus大会ルームへ入室してから登録してください。"})
                     continue
                 try:
-                    player = await register_or_resume_tournament_player(player, data)
+                    async with TOURNAMENT_LOCK:
+                        player = await register_or_resume_tournament_player(player, data)
                 except TournamentSessionConflict as exc:
                     await player.send_json({
                         "type": "tournament_session_conflict",
@@ -5723,9 +5866,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             elif msg_type == "tournament_match_ready":
                 try:
-                    await mark_tournament_match_ready(player, str(data.get("match_id", "")))
+                    async with TOURNAMENT_LOCK:
+                        await mark_tournament_match_ready(player, str(data.get("match_id", "")))
                 except ValueError as exc:
                     await player.send_json({"type": "error", "code": "tournament_match_ready", "message": str(exc)})
+                continue
+            elif msg_type in {"tournament_resume_accepting", "tournament_retire"}:
+                try:
+                    async with TOURNAMENT_LOCK:
+                        await set_flexible_participant_availability(player, retire=msg_type == "tournament_retire")
+                except ValueError as exc:
+                    await player.send_json({"type": "error", "code": "tournament_availability", "message": str(exc)})
                 continue
             elif msg_type == "tournament_watch_match":
                 try:
@@ -7043,7 +7194,12 @@ async def leave_room(player, notify_client: bool = True):
         if run is not None and player.tournament_participant_id
         else None
     )
-    if tournament_match is not None and tournament_match.status in {"called", "playing"}:
+    if run is not None and run.flexible and run.status == "running" and player.tournament_participant_id in run.participants:
+        run.pause_participant(player.tournament_participant_id, "left_room", now=utc_now())
+        if tournament_match is not None and tournament_match.status == "called":
+            await cancel_flexible_call(run, tournament_match)
+        await TOURNAMENT_STORE.save_run(run)
+    if tournament_match is not None and (tournament_match.status == "playing" or (tournament_match.status == "called" and not run.flexible)):
         opponent_id = (
             tournament_match.player2_id
             if tournament_match.player1_id == player.tournament_participant_id
