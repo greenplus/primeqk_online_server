@@ -1279,6 +1279,26 @@ def room_resume_session(
     return session
 
 
+async def resume_disconnected_tournament_participant(player: "Player") -> None:
+    participant_id = getattr(player, "tournament_participant_id", None)
+    if not participant_id or player.ws is None:
+        return
+    run = tournament_for_player(player)
+    if run is None or not run.flexible or run.status != "running":
+        return
+    participant = run.participants.get(participant_id)
+    if (participant is None or participant.retired_at or participant.withdrawn
+            or participant.unavailable_reason != "disconnected"
+            or participant.unavailable_since is None):
+        return
+    now = utc_now()
+    if (now - participant.unavailable_since).total_seconds() >= RETIREMENT_GRACE_SECONDS:
+        return
+    run.resume_participant(participant_id, now=now)
+    await TOURNAMENT_STORE.save_run(run)
+    await publish_tournament_state(run)
+
+
 async def bind_room_resume_session(
     incoming: "Player",
     session: "Player",
@@ -1303,6 +1323,7 @@ async def bind_room_resume_session(
     if session.room is not None:
         await session.room.log_chat(f"{session.name}が通信切断から復帰しました。")
     log_connection_event("resumed", session, session.ws, replaced_existing=previous_ws is not None)
+    await resume_disconnected_tournament_participant(session)
     return session
 
 
@@ -1520,6 +1541,7 @@ async def bind_tournament_participant(
     bound.tournament_participant_id = participant_id
     TOURNAMENT_SESSIONS[participant_id] = bound
     await bound.send_json({"type": "your_id", "id": bound.id, "name": bound.name})
+    await resume_disconnected_tournament_participant(bound)
     return bound
 
 
