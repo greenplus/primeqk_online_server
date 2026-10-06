@@ -23,6 +23,7 @@ class TournamentStore:
         self.last_error: Optional[str] = None
         self._memory_runs: dict[str, TournamentRun] = {}
         self._memory_audit: list[dict[str, Any]] = []
+        self._room_rules: dict[str, str] = {}
 
     @property
     def persistent(self) -> bool:
@@ -91,8 +92,30 @@ class TournamentStore:
             );
             CREATE INDEX IF NOT EXISTS tournament_audit_run_idx
                 ON tournament_audit_log (run_id, created_at);
+            CREATE TABLE IF NOT EXISTS special_room_rules (
+                room_id TEXT PRIMARY KEY,
+                rule_key TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
+
+    async def load_room_rules(self) -> dict[str, str]:
+        if self.pool is not None:
+            rows = await self.pool.fetch("SELECT room_id, rule_key FROM special_room_rules")
+            self._room_rules = {row["room_id"]: row["rule_key"] for row in rows}
+        return dict(self._room_rules)
+
+    async def save_room_rules(self, choices: dict[str, str]) -> None:
+        if self.pool is not None:
+            async with self.pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.executemany(
+                        "INSERT INTO special_room_rules (room_id, rule_key) VALUES ($1, $2) "
+                        "ON CONFLICT (room_id) DO UPDATE SET rule_key=EXCLUDED.rule_key, updated_at=NOW()",
+                        list(choices.items()),
+                    )
+        self._room_rules.update(choices)
 
     async def save_run(self, run: TournamentRun) -> None:
         self._memory_runs[run.run_id] = run

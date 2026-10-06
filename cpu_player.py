@@ -239,6 +239,8 @@ class CpuProfile:
     action_selector: Optional[CpuActionSelector] = None
 
     def supports_rule(self, rule) -> bool:
+        if getattr(rule, "cpu_profile_keys", ()) and self.key not in rule.cpu_profile_keys:
+            return False
         if self.rule_keys and getattr(rule, "key", None) not in self.rule_keys:
             return False
         if self.prime_rules and getattr(rule, "prime_rule", None) not in self.prime_rules:
@@ -696,6 +698,16 @@ def choose_cpu_action(
     validator: Optional[NumberValidator] = None,
     max_cards: int = 3,
 ) -> CpuAction:
+    if getattr(getattr(room, "rule", None), "kjqj_conversion", False) and len(cpu.hand) <= 12:
+        opponent_count = getattr(room, "opponent_hand_count", None)
+        if opponent_count is None:
+            opponents = [p for p in getattr(room, "players", []) if p.id != cpu.id and p.status == "waiting"]
+            opponent_count = len(opponents[0].hand) if len(opponents) == 1 else 0
+        if opponent_count >= 13 and beats_field(13111211, 4, room):
+            # 元の数が素数である候補だけを変換する。通常の場の値との比較は不要。
+            for cards in prime_play_candidates(cpu.hand, room_without_field(room), max_cards=4):
+                if len(cards) == 4 and (validator or default_number_validator)(cards_number(cards), cpu, room.rule):
+                    return CpuAction("play_prime", {"cards": cards, "assigned_numbers": [], "convert_kjqj": True})
     candidate = choose_prime_play(cpu, room, validator=validator, max_cards=max_cards)
     if candidate is not None:
         return CpuAction("play_prime", candidate)
@@ -9500,7 +9512,10 @@ def choose_prime_play(
 
     joker = single_joker(cpu.hand)
     field_count = len(getattr(room, "field", []) or [])
-    if joker is not None and field_count <= 1:
+    infinity_allowed = (not getattr(room, "field", []) or
+                        (len(str(room.last_number)) == 1 if getattr(room.rule, "match_digits", False)
+                         else field_count <= 1))
+    if joker is not None and infinity_allowed:
         return {"cards": [joker], "assigned_numbers": []}
 
     return None
@@ -9509,7 +9524,7 @@ def choose_prime_play(
 def prime_play_candidates(hand: List[Card], room, max_cards: int = 3) -> Iterable[List[Card]]:
     non_jokers = [card for card in hand if not is_joker(card)]
     required_count = len(getattr(room, "field", []) or [])
-    if required_count:
+    if required_count and not getattr(getattr(room, "rule", None), "match_digits", False):
         counts = [required_count]
     else:
         counts = range(1, min(max_cards, len(non_jokers)) + 1)
@@ -9543,7 +9558,10 @@ def beats_field(number: int, card_count: int, room) -> bool:
     field = getattr(room, "field", []) or []
     if not field:
         return True
-    if card_count != len(field):
+    match_digits = getattr(getattr(room, "rule", None), "match_digits", False)
+    if match_digits and len(str(number)) != len(str(getattr(room, "last_number", None))):
+        return False
+    if not match_digits and card_count != len(field):
         return False
 
     field_number = getattr(room, "last_number", None)

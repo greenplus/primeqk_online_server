@@ -145,6 +145,9 @@ async def lifespan(_app):
     if CAMPAIGN_SETTINGS.enabled:
         await CAMPAIGN_STORE.connect()
     await TOURNAMENT_STORE.connect()
+    for room_id, rule_key in (await TOURNAMENT_STORE.load_room_rules()).items():
+        if room_id in HYAKKI_YAGYO_ROOM_IDS and rule_key in HYAKKI_RULE_KEYS:
+            rooms[room_id].rule = PRESETS[rule_key]
     await RECRUITMENT_STORE.connect()
     await COMPOSITE_PRACTICE_STATS_STORE.connect()
     for run in await TOURNAMENT_STORE.load_active_runs():
@@ -537,6 +540,7 @@ class Room:
             "type": "update_room_status",
             "room_id": public_room_id(self),
             "rule": self.rule.label,
+            **special_room_payload(self),
             "category": self.category,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
@@ -703,7 +707,9 @@ class Room:
 NEO_BEGINNER_ROOM_IDS = ("room_16", "room_17", "room_18")
 NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
 CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6")
-PLUS_ROOM_IDS = ("room_7", "room_8", "room_9")
+PLUS_ROOM_IDS = ("room_7", "room_8", "room_9", "hyakki_archive_1")
+HYAKKI_RULE_KEYS = tuple(key for key, rule in PRESETS.items() if rule.hyakki)
+HYAKKI_DEFAULT_RULE_KEY = "hyakki-second-x"
 HYAKKI_YAGYO_ROOM_IDS = ("hyakki_yagyo_1", "hyakki_yagyo_2", "hyakki_yagyo_3")
 
 ROOM_CONFIG = [
@@ -717,7 +723,8 @@ ROOM_CONFIG = [
     ("room_8", PRESETS["tetrad-11-n-c"], "Plus"),
     ("room_9", PRESETS["semiprime-11-n-c"], "Plus"),
     (TOURNAMENT_ROOM_ID, PRESETS["std-11-n-c"], "Plus"),
-    *((room_id, PRESETS["hyakki-yagyo-11-n-c-b32"], "Plus") for room_id in HYAKKI_YAGYO_ROOM_IDS),
+    *((room_id, PRESETS[HYAKKI_DEFAULT_RULE_KEY], "Plus") for room_id in HYAKKI_YAGYO_ROOM_IDS),
+    ("hyakki_archive_1", PRESETS["hyakki-yagyo-11-n-c-b32"], "Plus"),
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
@@ -735,11 +742,6 @@ ROOM_CATEGORY_DESCRIPTIONS = {
     "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。今までの記録はこちら。",
 }
 ROOM_DESCRIPTIONS = {
-    **{room_id: (
-        "素数大富豪百鬼夜行の手動進行・練習用。A～Kはランクnごとにn枚、"
-        "ジョーカー2枚の計93枚。初期手札11枚、通常ペナルティ、合成数あり。"
-        "ドロー・ペナルティで手札が32枚に達すると、その時点でバースト負けです。"
-    ) for room_id in HYAKKI_YAGYO_ROOM_IDS},
     "event_1": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
     "event_2": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
     "event_3": "偶数の半分がコックさんに。偶数カードを半減し、減った12枚分だけランク593・スート🧑‍🍳のカードを追加します。Xは593に割り当てできません。ペナルティは1枚です。",
@@ -802,6 +804,7 @@ def room_counts_payload(
         "client_surface": client_surface,
         "counts": {room_id: len(room.players) for room_id, room in visible_rooms.items()},
         "rules": {rid: room.rule.label for rid, room in visible_rooms.items()},
+        "rule_details": {rid: tournament_rule_payload(room.rule) for rid, room in visible_rooms.items()},
         "room_categories": {rid: room.category for rid, room in visible_rooms.items()},
         "room_category_descriptions": ROOM_CATEGORY_DESCRIPTIONS,
         "allow_composite": {rid: room.rule.allow_composite for rid, room in visible_rooms.items()},
@@ -894,6 +897,7 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
             "山札の偶数カード半減＋コックさん12枚",
             False,
         ),
+        DeckRule.REVERSE_RANK_MULTIPLICITY: ("reverse_rank_multiplicity", "nが(14-n)枚ある（A～K・X2枚・計93枚）", False),
         DeckRule.RANK_MULTIPLICITY: ("rank_multiplicity", "nがn枚（A～K・X2枚・計93枚）", False),
     }
     penalty_rules = {
@@ -911,6 +915,8 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
     penalty_key, penalty_label, penalty_default = penalty_rules[preset.penalty_rule]
     prime_key, prime_label, prime_default = prime_rules[preset.prime_rule]
     summary_parts = []
+    if preset.second_joker_guarantee or preset.match_digits or preset.kjqj_conversion:
+        summary_parts.append(preset.label)
     if preset.start_revolution:
         summary_parts.append("初期革命")
     if not prime_default:
@@ -925,6 +931,10 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
     if preset.burst_hand_size is not None:
         summary_parts.append(f"{preset.burst_hand_size}枚バースト")
     return {
+        "match_digits": preset.match_digits,
+        "description": preset.description,
+        "kjqj_conversion": preset.kjqj_conversion,
+        "second_joker_guarantee": preset.second_joker_guarantee,
         "key": preset.key,
         "label": preset.label,
         "summary": " / ".join(summary_parts),
@@ -948,6 +958,60 @@ def tournament_rule_catalog() -> list[dict]:
         for key, preset in PRESETS.items()
         if key in PLUS_TOURNAMENT_RULE_KEYS
     ]
+
+
+def special_room_payload(room):
+    selectable = room.room_id == "hyakki_archive_1"
+    return {
+        "rule_details": tournament_rule_payload(room.rule),
+        "available_room_rules": [tournament_rule_payload(PRESETS[key]) for key in HYAKKI_RULE_KEYS] if selectable else [],
+        "rule_owner_id": next((p.id for p in room.players if not is_cpu_player(p)), None) if selectable else None,
+        "rule_change_allowed": room.state == "waiting" and not room.pending_start_request and not room.start_in_progress and not room.alternating_series,
+    }
+
+
+async def change_special_room_rule(player, data, *, admin=False):
+    key = data.get("rule_key")
+    if admin:
+        if not tournament_admin_authorized(data.get("admin_token")):
+            raise ValueError("管理トークンが正しくありません。")
+        targets = [rooms[rid] for rid in HYAKKI_YAGYO_ROOM_IDS]
+    else:
+        room = player.room
+        if room is None or room.room_id != "hyakki_archive_1":
+            raise ValueError("ルール選択式の部屋へ入室してください。")
+        if special_room_payload(room)["rule_owner_id"] != player.id:
+            raise ValueError("ルールは最初の入室者が選択できます。")
+        targets = [room]
+    if not isinstance(key, str) or key not in HYAKKI_RULE_KEYS:
+        raise ValueError("百鬼夜行のルールを選択してください。")
+    if any(not special_room_payload(room)["rule_change_allowed"] for room in targets):
+        raise ValueError("対戦中・開始確認中・手番交互対戦中は変更できません。終了後に変更してください。")
+    if any(is_cpu_player(p) and not get_cpu_profile(p.cpu_key).supports_rule(PRESETS[key])
+           for room in targets for p in room.players):
+        raise ValueError("選んだルールに対応しないCPUを先に退室させてください。")
+    for room in targets:
+        room.start_in_progress = True
+    try:
+        if admin:
+            await TOURNAMENT_STORE.save_room_rules({room.room_id: key for room in targets})
+        for room in targets:
+            room.rule = PRESETS[key]
+    finally:
+        for room in targets:
+            room.start_in_progress = False
+    for room in targets:
+        await room.update_room_status()
+        await room.log_chat(f"ルールを「{room.rule.label}」に変更しました。")
+    await player.send_json({"type": "hyakki_room_rules", **hyakki_room_settings()})
+
+
+def hyakki_room_settings():
+    return {
+        "available_rules": [tournament_rule_payload(PRESETS[key]) for key in HYAKKI_RULE_KEYS],
+        "room_rules": {rid: rooms[rid].rule.key for rid in HYAKKI_YAGYO_ROOM_IDS},
+        "persistent": TOURNAMENT_STORE.persistent,
+    }
 
 
 def tournament_match_ready_seconds() -> int:
@@ -1190,6 +1254,7 @@ async def finish_tournament_match_view(
         for record in (room.score_log if room is not None else [])
         if record.get("line")
     ]
+    summary["conversion_notes"] = score_conversion_notes(room) if room is not None else []
     viewers = list(TOURNAMENT_MATCH_VIEWERS.pop(match_id, set()))
     for viewer in viewers:
         viewer.tournament_view_match_id = None
@@ -1355,6 +1420,7 @@ def forget_room_resume_session(player: "Player") -> None:
 def room_initialization_payload(room: "Room", player: "Player") -> dict:
     return {
         "type": "room_state_initialization",
+        **special_room_payload(room),
         "room_id": public_room_id(room),
         "room_state": room.state,
         "category": room.category,
@@ -2795,6 +2861,8 @@ def record_turn_alternation_game(
         "winner_id": winner_id,
         "winner_name": winner_name,
         "lines": list(lines),
+        "conversion_notes": score_conversion_notes(room),
+        "records": copy.deepcopy(room.score_log),
     })
 
 
@@ -3265,6 +3333,10 @@ def record_score_event(room: Room, player: "Player", notation: str, result: str)
         "line": line,
     })
 
+def score_conversion_notes(room):
+    return [f"数譜{record['turn']}行目: 元の4枚をKJQJとして出札" for record in room.score_log if record.get("conversion")]
+
+
 async def publish_score_log(
     room: Room,
     winner: Optional[str],
@@ -3279,6 +3351,7 @@ async def publish_score_log(
         "sender": "system",
         "winner": winner,
         "records": room.score_log,
+        "conversion_notes": score_conversion_notes(room),
         "lines": lines,
     }
     if room.tournament_match_id:
@@ -3310,6 +3383,8 @@ async def publish_score_log(
                 "player2_name": run.participants[match.player2_id].display_name if match is not None else None,
                 "winner": winner,
                 "lines": payload["lines"],
+                "conversion_notes": payload["conversion_notes"],
+                "records": payload["records"],
             })
 
 ################################################
@@ -3337,12 +3412,12 @@ def generate_deck() -> List[dict]:
     return deck
 
 def build_deck(rule: RulePreset) -> List[dict]:
-    if rule.deck_rule is DeckRule.RANK_MULTIPLICITY:
+    if rule.deck_rule in (DeckRule.RANK_MULTIPLICITY, DeckRule.REVERSE_RANK_MULTIPLICITY):
         deck = [
             {"card_id": str(uuid.uuid4()), "suit": ("S", "H", "D", "C")[index % 4],
              "rank": rank, "is_joker": False}
             for rank in range(1, 14)
-            for index in range(rank)
+            for index in range(14 - rank if rule.deck_rule is DeckRule.REVERSE_RANK_MULTIPLICITY else rank)
         ]
         deck.extend(
             {"card_id": str(uuid.uuid4()), "suit": "X", "rank": 0, "is_joker": True}
@@ -3398,6 +3473,36 @@ def shuffle_and_deal(deck: List[dict], hand_n: int, num_players: int = 2
         for i in range(num_players):
             hands[i].append(deck.pop(0))
     return hands, deck
+
+def deal_for_rule(deck, rule, num_players, first_index):
+    if not rule.second_joker_guarantee or num_players != 2:
+        return shuffle_and_deal(deck, rule.hand_size, num_players)
+    remaining = list(deck)
+    random.shuffle(remaining)
+    second = [remaining.pop(0) for _ in range(10)]
+    extra_index = 0 if any(c["is_joker"] for c in second) else next(
+        i for i, c in enumerate(remaining) if c["is_joker"]
+    )
+    second.append(remaining.pop(extra_index))
+    first = [remaining.pop(0) for _ in range(11)]
+    hands = [None, None]
+    hands[first_index], hands[1 - first_index] = first, second
+    return hands, remaining
+
+
+def field_count_matches(room, number, count):
+    if not room.field:
+        return True
+    if room.rule.match_digits:
+        return len(str(number)) == len(str(room.last_number))
+    return count == len(room.field)
+
+
+def can_convert_kjqj(player, room, count):
+    opponents = [p for p in get_active_players(room) if p.id != player.id]
+    return (room.rule.kjqj_conversion and count == 4 and len(player.hand) <= 12
+            and len(opponents) == 1 and len(opponents[0].hand) >= 13)
+
 
 def push_to_reserve(room: Room, cards: List[dict]) -> None:
     """出した札を、出した順番のまま予備軍へ積む（重複登録は呼び出し側で避ける）"""
@@ -3791,7 +3896,7 @@ def load_sample_registered_prime_payload(
     }
 
 def field_allows_number(room: Room, number: int, card_count: int) -> bool:
-    if room.field and card_count != len(room.field):
+    if not field_count_matches(room, number, card_count):
         return False
     return field_allows_number_value(room, number)
 
@@ -5266,6 +5371,8 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
 
 
 async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None = None) -> CpuPlayer:
+    if room.start_in_progress:
+        raise ValueError("対戦開始・ルール変更の処理中です。")
     profile = get_cpu_profile(cpu_key)
     if profile is None:
         raise ValueError("unknown cpu profile")
@@ -5284,6 +5391,8 @@ async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None =
         room,
         "対戦メンバーが変わったため、開始申請を取り消しました。",
     )
+    if room.start_in_progress or not profile.supports_rule(room.rule):
+        raise ValueError("ルール変更の処理中です。変更後にCPUを選び直してください。")
     room.players.append(cpu)
     await room.log_chat(f"{cpu.name}が入室しました")
     await log_talkative_fish_join(room, cpu)
@@ -5932,6 +6041,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     "message": message,
                 })
                 continue
+            elif msg_type == "get_hyakki_room_rules":
+                await player.send_json({"type": "hyakki_room_rules", **hyakki_room_settings()})
+                continue
+            elif msg_type in {"set_special_room_rule", "tournament_admin_hyakki_rule"}:
+                try:
+                    await change_special_room_rule(player, data, admin=msg_type == "tournament_admin_hyakki_rule")
+                except ValueError as exc:
+                    await player.send_json({"type": "error", "message": str(exc)})
+                except Exception:
+                    await player.send_json({"type": "error", "message": "ルール設定を保存できませんでした。変更は適用していません。"})
+                continue
             elif msg_type == "tournament_admin_schedule":
                 if not tournament_admin_authorized(data.get("admin_token")):
                     await player.send_json({"type": "error", "code": "tournament_admin", "message": "管理トークンが正しくありません。"})
@@ -6467,14 +6587,18 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         })
         return
 
+    convert_kjqj = data.get("convert_kjqj") is True
+    if convert_kjqj and not can_convert_kjqj(player, room, len(played_cards)):
+        await player.send_json({"type": "error", "message": "KJQJ変換は自分12枚以下・相手13枚以上で、4枚の素数出しに使えます。"})
+        return
     # ジョーカー絡みの処理
     assigned_numbers = data.get("assigned_numbers", [])  # [ "inf" か 0〜13, ... ]
     # ―――――――――――――――――――
     # １）ジョーカーだけを単独で出す (グロタンカット相当)
     jokers = [c for c in played_cards if c["suit"] == "X"]
     if len(jokers) == 1 and len(played_cards) == 1:
-        if room.field and len(room.field) != 1:
-            await player.ws.send_json({"type": "error", "message": "ジョーカー1枚出しは、場が空か1枚のときだけ出せます。"})
+        if room.field and not field_count_matches(room, 1, 1):
+            await player.ws.send_json({"type": "error", "message": ("ジョーカー1枚出しは、場が空か1桁のときだけ出せます。" if room.rule.match_digits else "ジョーカー1枚出しは、場が空か1枚のときだけ出せます。")})
             return
         push_to_reserve(room, played_cards)
         # ジョーカー1枚だけ → 場を流す
@@ -6550,11 +6674,13 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         except ValueError:
             number = -1
 
+    original_number = number
+    comparison_number = 13111211 if convert_kjqj else number
     # もしフィールドに既にカードが出ているなら、枚数と数の検証を行う
     if room.field:
         # ① 枚数チェック
-        if len(played_cards) != len(room.field):
-            await player.ws.send_json({"type": "error", "message": "枚数が違います。"})
+        if not field_count_matches(room, comparison_number, len(played_cards)):
+            await player.ws.send_json({"type": "error", "message": "桁数が違います。" if room.rule.match_digits else "枚数が違います。"})
             return
 
         # ② 数値チェック：フィールドのカードと比較
@@ -6562,16 +6688,16 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
 
         # 通常は「>」が必要、反転中は「<」を要求
         if not room.reverse_order:
-            if number <= field_number:
+            if comparison_number <= field_number:
                 await player.ws.send_json({"type": "error", "message": "場より大きい数字を出してください。"})
                 return
         else:
-            if number >= field_number:
+            if comparison_number >= field_number:
                 await player.ws.send_json({"type": "error", "message": "場より小さい数字を出してください。(ラマヌジャン革命中)"})
                 return
 
     # グロタンカット
-    if number == 57 and not room.rule.special_numbers_composite_only:
+    if number == 57 and not convert_kjqj and not room.rule.special_numbers_composite_only:
         room.completed_turns = getattr(room, "completed_turns", 0) + 1
         # 出した順そのまま予備軍に
         push_to_reserve(room, played_cards)
@@ -6600,7 +6726,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
             return
         await broadcast_turn_update(room, player.name)
         return  # 次の処理（素数判定～next_turn）をすべてスキップ
-    if number == 1729 and not room.rule.special_numbers_composite_only:
+    if number == 1729 and not convert_kjqj and not room.rule.special_numbers_composite_only:
         # フラグをトグル
         room.reverse_order = not room.reverse_order
         from upper_diamond.revolution_context import note_revolution
@@ -6708,14 +6834,18 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await next_turn(room)
         return
 
+    if convert_kjqj:
+        number = comparison_number
     # 素数なら場に出し、対局中に出したプレイヤーごとの最大素数も記録する。
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
-    remember_largest_prime_play(room, player, number, play_text)
+    remember_largest_prime_play(room, player, original_number if convert_kjqj else number, play_text)
     record_field_play(room, player, len(player.hand), play_kind="prime")
     push_to_reserve(room, played_cards)
     for c in played_cards:
         player.remove_card(c)
-    room.field = played_cards
+    room.field = ([{**c, "rank": rank, "suit": "変", "is_joker": False,
+                    "original_card": dict(c)} for c, rank in zip(played_cards, (13, 11, 12, 11))]
+                  if convert_kjqj else played_cards)
     room.last_number = number
 
     await player.send_hand_update()
@@ -6727,6 +6857,8 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         "player_id": player.id,
         "played_cards": played_cards,
         "number": number,
+        "converted_kjqj": convert_kjqj,
+        "original_number": original_number,
     }
     if hnp_challenge:
         action_payload.update({
@@ -6737,11 +6869,13 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     await room.broadcast(action_payload)
 
     # チャットに「素数を出した」ログを流す
-    await room.log_chat(f"{player.name}が{number}を出しました")
+    await room.log_chat(f"{player.name}が{original_number}をKJQJに変換しました" if convert_kjqj else f"{player.name}が{number}を出しました")
     if hnp_challenge:
         await room.log_chat("HNP！")
     await maybe_log_talkative_fish_sashimi(room, number)
     record_score_play_line(room, player, f"{score_prefix}{play_text}{score_win_suffix(player)}")
+    if convert_kjqj:
+        room.score_log[-1]["conversion"] = {"original_number": str(original_number), "effective_number": "13111211", "cards": played_cards}
     await next_turn(room)
 
 # 現行ルールでは指数が122を超える合法手が存在しないため、
@@ -6946,6 +7080,9 @@ def parse_and_eval_composite(
     return total_value, used_card_ids
 
 async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
+    if data.get("convert_kjqj"):
+        await player.send_json({"type": "error", "message": "合成数出しはKJQJに変換できません。"})
+        return
     # 0) 手番 & 手札 所有チェック（共通）
     selected = data.get("selected", {}) or {}
     consume  = data.get("consume", {}) or {}
@@ -7030,7 +7167,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
     # 4) 早期チェック：枚数・大小は selected のみで判定（合成数のパース前）
     # 4-1) 枚数（場があるときは selected の枚数と一致必須）
     if room.field:
-        if len(sel_cards) != len(room.field):
+        if not room.rule.match_digits and len(sel_cards) != len(room.field):
             await player.ws.send_json({"type":"error","message":"枚数が違います。"})
             return
 
@@ -7047,6 +7184,9 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         await player.ws.send_json({"type":"error","message":"最上位桁が0の数字は出せません。"})
         return
     sel_number = int(sel_str) if sel_str else -1
+    if not field_count_matches(room, sel_number, len(sel_cards)):
+        await player.send_json({"type": "error", "message": "桁数が違います。"})
+        return
 
     if room.field:
         field_number = room.last_number if room.last_number is not None else -1
@@ -7330,9 +7470,12 @@ async def start_game(
             p.clear_hand()
             await p.send_hand_update()
 
+    # 先後を配札前に確定する。保証する相手を席順と混同しない。
+    waiting_player_ids = [p.id for p in waiting_players]
+    first_player_id = first_player_id if first_player_id in waiting_player_ids else random.choice(waiting_player_ids)
     # 2) デッキ生成→配布（プリセット準拠）
     deck = build_deck(room.rule)
-    hands, remaining = shuffle_and_deal(deck, room.rule.hand_size, num_players=len(waiting_players))
+    hands, remaining = deal_for_rule(deck, room.rule, len(waiting_players), waiting_player_ids.index(first_player_id))
     for player, hand in zip(waiting_players, hands):
         player.hand = hand
         if is_cpu_player(player):
