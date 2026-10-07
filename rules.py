@@ -153,7 +153,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "half-7-1-c": RulePreset(
         key="half-7-1-c",
-        label="7枚 / 偶数半減 / ペナ1",
+        label="初級: 7枚 / 偶数半減 / ペナ1",
         deck_rule=DeckRule.EVEN_HALVED,
         hand_size=7,
         penalty_rule=PenaltyRule.ALWAYS_1,

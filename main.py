@@ -713,8 +713,8 @@ HYAKKI_DEFAULT_RULE_KEY = "hyakki-second-x"
 HYAKKI_YAGYO_ROOM_IDS = ("hyakki_yagyo_1", "hyakki_yagyo_2", "hyakki_yagyo_3")
 
 ROOM_CONFIG = [
-    ("room_1", PRESETS["std-5-1"], "Classic"),
-    ("room_2", PRESETS["half-7-1-c"], "Classic"),
+    ("room_1", PRESETS["half-7-1-c"], "Classic"),
+    ("room_2", PRESETS["std-5-1"], "Classic"),
     ("room_3", PRESETS["std-11-f-c"], "Classic"),
     ("room_4", PRESETS["std-11-n-c"], "Classic"),
     ("room_5", PRESETS["std-11-n-c"], "Classic"),
@@ -7491,7 +7491,8 @@ async def start_game(
     room.last_play_hand_before = None
     room.last_play_kind = None
     room.score_log = []
-    for player in waiting_players:
+    score_players = sorted(waiting_players, key=lambda player: player.id != first_player_id)
+    for player in score_players:
         player.sort_hand()
         record_score_line(room, f"{player.name}:({score_cards_text(player.hand, sort_cards=True)})")
     # 指定がなければ従来どおりランダムに先攻プレイヤーを決定
