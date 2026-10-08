@@ -1,6 +1,6 @@
 # rules.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Dict
 
@@ -50,6 +50,20 @@ class RulePreset:
     kjqj_conversion: bool = False
     hyakki: bool = False
     description: str = ""
+    multiplayer_enabled: bool = False
+
+    @property
+    def max_players(self) -> int:
+        if not self.multiplayer_enabled:
+            return 2
+        deck_size = {
+            DeckRule.DEFAULT: 54,
+            DeckRule.EVEN_HALVED: 42,
+            DeckRule.EVEN_HALVED_WITH_CHEFS: 54,
+            DeckRule.RANK_MULTIPLICITY: 93,
+            DeckRule.REVERSE_RANK_MULTIPLICITY: 93,
+        }[self.deck_rule]
+        return deck_size // self.hand_size
 
 PRESETS: Dict[str, RulePreset] = {
     "hyakki-second-x": RulePreset(
@@ -274,3 +288,13 @@ PRESETS: Dict[str, RulePreset] = {
         cpu_profile_keys=("composite_practice",),
     ),
 }
+
+# Existing presets stay two-player; multiplayer is an explicit rule setting.
+for key, base_key, label in (
+    ("multi-half-7-1-c", "half-7-1-c", "多人数・初級: 7枚 / 偶数半減 / ペナ1"),
+    ("multi-std-11-n-c", "std-11-n-c", "多人数・通常: 11枚 / 通常"),
+):
+    PRESETS[key] = replace(
+        PRESETS[base_key], key=key, label=label,
+        multiplayer_enabled=True, cpu_profile_keys=("basic",),
+    )

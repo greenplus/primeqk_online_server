@@ -119,6 +119,7 @@ PLUS_TOURNAMENT_RULE_KEYS = frozenset(
     and not preset.registration_enabled
     and not preset.hnp_challenge_enabled
     and preset.move_policy == MovePolicy.STANDARD
+    and not preset.multiplayer_enabled
 )
 TOURNAMENT_RUNS_BY_ROOM: dict[str, TournamentRun] = {}
 TOURNAMENT_SESSIONS: dict[str, "Player"] = {}
@@ -462,6 +463,8 @@ class Room:
         self.last_play_hand_before = None
         self.last_play_kind = None
         self.current_turn_id = None
+        self.turn_order_ids = []
+        self.passed_player_ids = set()
         self.first_player_id = None
         self.completed_turns = 0
         self.opening_all_out_failed = False
@@ -613,6 +616,7 @@ class Room:
             "current_turn": current_name,
             "current_turn_id": self.current_turn_id,
             "first_player_id": self.first_player_id,
+            "turn_order_ids": self.turn_order_ids,
             "revolution": self.reverse_order,
             "field_number": str(self.last_number) if self.last_number is not None else None,
             "allow_composite": self.rule.allow_composite,
@@ -706,7 +710,7 @@ class Room:
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
 NEO_BEGINNER_ROOM_IDS = ("room_16", "room_17", "room_18")
 NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
-CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6")
+CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6", "classic_multi_beginner", "classic_multi_normal")
 PLUS_ROOM_IDS = ("room_7", "room_8", "room_9", "hyakki_archive_1")
 HYAKKI_RULE_KEYS = tuple(key for key, rule in PRESETS.items() if rule.hyakki)
 HYAKKI_DEFAULT_RULE_KEY = "hyakki-second-x"
@@ -719,6 +723,8 @@ ROOM_CONFIG = [
     ("room_4", PRESETS["std-11-n-c"], "Classic"),
     ("room_5", PRESETS["std-11-n-c"], "Classic"),
     ("room_6", PRESETS["std-11-n-c"], "Classic"),
+    ("classic_multi_beginner", PRESETS["multi-half-7-1-c"], "Classic"),
+    ("classic_multi_normal", PRESETS["multi-std-11-n-c"], "Classic"),
     ("room_7", PRESETS["std-11-n-c-rev"], "Plus"),
     ("room_8", PRESETS["tetrad-11-n-c"], "Plus"),
     ("room_9", PRESETS["semiprime-11-n-c"], "Plus"),
@@ -915,6 +921,8 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
     penalty_key, penalty_label, penalty_default = penalty_rules[preset.penalty_rule]
     prime_key, prime_label, prime_default = prime_rules[preset.prime_rule]
     summary_parts = []
+    if preset.multiplayer_enabled:
+        summary_parts.append(f"多人数・1～{preset.max_players}人")
     if preset.second_joker_guarantee or preset.match_digits or preset.kjqj_conversion:
         summary_parts.append(preset.label)
     if preset.start_revolution:
@@ -932,6 +940,8 @@ def tournament_rule_payload(preset: RulePreset) -> dict:
         summary_parts.append(f"{preset.burst_hand_size}枚バースト")
     return {
         "match_digits": preset.match_digits,
+        "multiplayer_enabled": preset.multiplayer_enabled,
+        "max_players": preset.max_players,
         "description": preset.description,
         "kjqj_conversion": preset.kjqj_conversion,
         "second_joker_guarantee": preset.second_joker_guarantee,
@@ -1307,6 +1317,15 @@ async def mark_player_disconnected(
     player.ws = None
     if first_notice:
         player.disconnected_at = now or utc_now()
+        if room.rule.multiplayer_enabled and room.state == "playing" and player.status == "waiting":
+            record_score_play_line(room, player, "切断")
+            player.status = "watching"
+            player.clear_hand()
+            log_connection_event("disconnected", player, previous_ws, source=source)
+            await room.log_chat(f"{player.name}の通信が切れたため、対戦から除外しました。")
+            await handle_room_after_player_removed(room, player.id)
+            await room.update_game_state()
+            return True
         run = tournament_run_for_room(room)
         if run and run.flexible and run.status == "running" and player.tournament_participant_id in run.participants:
             run.pause_participant(player.tournament_participant_id, "disconnected", now=player.disconnected_at)
@@ -2741,7 +2760,11 @@ def check_win_condition(room):
     return None
 
 def get_active_players(room) -> List["Player"]:
-    return [p for p in room.players if p.status == "waiting"]
+    players = [p for p in room.players if p.status == "waiting"]
+    if getattr(getattr(room, "rule", None), "multiplayer_enabled", False) and room.state == "playing":
+        order = getattr(room, "turn_order_ids", [])
+        players.sort(key=lambda p: order.index(p.id) if p.id in order else len(order))
+    return players
 
 
 def turn_alternation_participant_ids(players: List["Player"]) -> Tuple[str, ...]:
@@ -3528,6 +3551,7 @@ def flow_field(room: Room) -> None:
     note_field_flow(room)
     room.field = []
     room.last_number = None
+    room.passed_player_ids = set()
     room.last_play_player_id = None
     room.last_play_hand_before = None
     room.last_play_kind = None
@@ -3555,6 +3579,7 @@ def record_field_play(
 ) -> None:
     """Remember the public hand count from immediately before the current play."""
     room.last_play_player_id = player.id
+    room.passed_player_ids = set()
     room.last_play_hand_before = int(hand_before)
     room.last_play_kind = play_kind
 
@@ -5092,7 +5117,7 @@ async def recruitment_notification_loop():
 ################################################
 def default_turn_time_limit_seconds(room: Room) -> Optional[int]:
     """入室前に案内する対人戦の標準制限時間。"""
-    if room.room_id == TOURNAMENT_ROOM_ID or room.tournament_match_id:
+    if room.rule.multiplayer_enabled or room.room_id == TOURNAMENT_ROOM_ID or room.tournament_match_id:
         return TURN_TIME_LIMIT_SECONDS
     if room.rule.hand_size >= 11:
         return TURN_TIME_LIMIT_SECONDS
@@ -5101,7 +5126,7 @@ def default_turn_time_limit_seconds(room: Room) -> Optional[int]:
 
 def game_turn_time_limit_seconds(room: Room, active_players: List["Player"]) -> Optional[int]:
     """大会、または初期手札11枚以上の2人人間対戦だけを時間制限ありにする。"""
-    if room.tournament_match_id:
+    if room.rule.multiplayer_enabled or room.tournament_match_id:
         return TURN_TIME_LIMIT_SECONDS
     if len(active_players) != 2 or any(is_cpu_player(player) for player in active_players):
         return None
@@ -5340,7 +5365,7 @@ async def remove_cpus_if_no_humans(room: Room) -> bool:
 async def handle_room_after_player_removed(room: Room, departed_player_id: str | None = None) -> None:
     if room.state == "playing":
         active_players = get_active_players(room)
-        if len(active_players) == 1:
+        if len(active_players) == 1 and not room.rule.multiplayer_enabled:
             winner_name = active_players[0].name
             room.state = "waiting"
             room.current_turn_id = None
@@ -5362,10 +5387,18 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             await room.log_chat("対戦者がいなくなったためゲームを終了しました")
             await maybe_log_talkative_fish_game_over(room)
             await publish_score_log(room, None, winner_player_id=None)
+        elif room.rule.multiplayer_enabled:
+            leader_id = flow_if_all_passed(room)
+            active_ids = {p.id for p in active_players}
+            if leader_id is not None or room.current_turn_id not in active_ids:
+                await next_turn(room, next_player_id=leader_id)
+            await room.update_game_state()
         elif departed_player_id is not None and room.current_turn_id == departed_player_id:
             await next_turn(room)
 
     if await remove_cpus_if_no_humans(room):
+        if room.rule.multiplayer_enabled and room.state == "playing":
+            await handle_room_after_player_removed(room)
         return
     await room.update_room_status()
 
@@ -5378,6 +5411,10 @@ async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None =
         raise ValueError("unknown cpu profile")
     if not profile.supports_rule(room.rule):
         raise ValueError("cpu profile does not support this rule")
+    if room.rule.multiplayer_enabled and cpu_key != "basic":
+        raise ValueError("多人数戦では汎用テストCPUのみ使用できます。")
+    if room.rule.multiplayer_enabled and len(get_active_players(room)) >= room.rule.max_players:
+        raise ValueError("対戦人数が上限に達しています。")
     cpu_count = sum(1 for p in room.players if is_cpu_player(p))
     base_name = name or profile.label
     cpu = CpuPlayer(
@@ -5573,9 +5610,35 @@ async def draw_card_for_player(player, room: Room) -> bool:
     return True
 
 
+def flow_if_all_passed(room: Room):
+    """Passes apply since the last successful play, without skipping later turns."""
+    active_ids = {p.id for p in get_active_players(room)}
+    leader_id = room.last_play_player_id
+    responders = active_ids - {leader_id} if room.field else active_ids
+    if not active_ids or not responders <= room.passed_player_ids:
+        return None
+    if leader_id not in active_ids:
+        order = room.turn_order_ids
+        index = order.index(leader_id) if leader_id in order else -1
+        leader_id = next((order[(index + offset) % len(order)]
+                          for offset in range(1, len(order) + 1)
+                          if order[(index + offset) % len(order)] in active_ids), None)
+    flow_field(room)
+    return leader_id
+
+
+def record_pass_or_penalty(room: Room, player):
+    if room.rule.multiplayer_enabled:
+        room.passed_player_ids.add(player.id)
+        return flow_if_all_passed(room)
+    flow_field(room)
+    return None
+
+
 async def pass_turn_for_player(player, room: Room, *, timed_out: bool = False) -> None:
     await player.send_hand_update()
-    flow_field(room)
+    score_prefix = score_state_prefix(room)
+    leader_id = record_pass_or_penalty(room, player)
     await room.update_game_state()
     action_payload = {
         "type": "action_result",
@@ -5594,8 +5657,11 @@ async def pass_turn_for_player(player, room: Room, *, timed_out: bool = False) -
         else f"{player.name}がパスしました"
     )
     notation = "%%" if timed_out else "%"
-    record_score_play_line(room, player, f"{score_state_prefix(room)}{notation}")
-    await next_turn(room)
+    record_score_play_line(room, player, f"{score_prefix}{notation}")
+    if leader_id is None:
+        await next_turn(room)
+    else:
+        await next_turn(room, next_player_id=leader_id)
 
 
 async def send_start_game_error(player: "Player", code: str, message: str) -> None:
@@ -5616,8 +5682,11 @@ async def validate_start_game_players(
     if player not in waiting_players:
         await send_start_game_error(player, "not_game_participant", "対戦に参加してから開始してください。")
         return None
-    if len(waiting_players) not in (1, 2):
-        await send_start_game_error(player, "invalid_waiting_count", "対戦待ちは1人または2人必要です。")
+    if not 1 <= len(waiting_players) <= room.rule.max_players:
+        await send_start_game_error(player, "invalid_waiting_count", f"対戦待ちは1～{room.rule.max_players}人必要です。")
+        return None
+    if room.rule.multiplayer_enabled and any(is_cpu_player(p) and p.cpu_key != "basic" for p in waiting_players):
+        await send_start_game_error(player, "unsupported_multiplayer_cpu", "多人数戦では汎用テストCPUのみ使用できます。")
         return None
     disconnected_waiting = [
         item
@@ -5720,7 +5789,7 @@ async def handle_start_game_request(player: "Player", data: dict) -> None:
 
     requested_alternate, first_mode = normalize_turn_order_request(player, data)
     continuation = turn_alternation_continues(room, waiting_players)
-    alternate = (requested_alternate or continuation) and len(waiting_players) == 2
+    alternate = (requested_alternate or continuation) and len(waiting_players) == 2 and not room.rule.multiplayer_enabled
     human_players_in_game = [item for item in waiting_players if not is_cpu_player(item)]
     if alternate and len(human_players_in_game) == 2 and not continuation:
         await create_start_game_approval_request(room, player, waiting_players, first_mode)
@@ -6366,6 +6435,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
                 new_status = data["status"]
+                if new_status not in ("waiting", "watching"):
+                    continue
+                if new_status == "waiting" and player.status != "waiting" and room.rule.multiplayer_enabled and len(get_active_players(room)) >= room.rule.max_players:
+                    await player.send_json({"type": "error", "message": f"対戦参加は最大{room.rule.max_players}人です。"})
+                    continue
                 old_status = player.status
                 player.status = new_status
                 if old_status != new_status and "waiting" in {old_status, new_status}:
@@ -6798,8 +6872,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
                 if hand_is_burst(player, room.rule):
                     break
 
-        # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
-        flow_field(room)
+        leader_id = record_pass_or_penalty(room, player)
 
         await player.send_hand_update()
         await room.update_game_state()
@@ -6831,7 +6904,10 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
             f"{score_prefix}{play_text},P({score_cards_text(drawn_penalties)})"
         )
 
-        await next_turn(room)
+        if leader_id is None:
+            await next_turn(room)
+        else:
+            await next_turn(room, next_player_id=leader_id)
         return
 
     if convert_kjqj:
@@ -7227,7 +7303,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
                 drawn_penalties.append(drawn)
                 if hand_is_burst(player, room.rule):
                     break
-        flow_field(room)
+        leader_id = record_pass_or_penalty(room, player)
         await player.send_hand_update()
         await room.update_game_state()
         await room.broadcast({
@@ -7242,7 +7318,10 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             player,
             f"{score_prefix}{score_composite_text},P({score_cards_text(drawn_penalties)})"
         )
-        await next_turn(room)
+        if leader_id is None:
+            await next_turn(room)
+        else:
+            await next_turn(room, next_player_id=leader_id)
         return
 
     await record_composite_practice_play(player, room, sel_number)
@@ -7447,9 +7526,16 @@ async def start_game(
 
     # 1) 待機中のプレイヤーを確定（1人練習または2人対戦）
     waiting_players = get_active_players(room)
-    if len(waiting_players) not in (1, 2):
+    if not 1 <= len(waiting_players) <= room.rule.max_players:
         return
-    uses_turn_alternation = turn_alternation and len(waiting_players) == 2
+    if room.rule.multiplayer_enabled:
+        if any(is_cpu_player(p) and p.cpu_key != "basic" for p in waiting_players):
+            return
+        random.shuffle(waiting_players)
+        first_player_id = waiting_players[0].id
+    room.turn_order_ids = [p.id for p in waiting_players]
+    room.passed_player_ids = set()
+    uses_turn_alternation = turn_alternation and len(waiting_players) == 2 and not room.rule.multiplayer_enabled
     if uses_turn_alternation:
         participant_ids = turn_alternation_participant_ids(waiting_players)
         active_series_ids = tuple(
@@ -7468,7 +7554,8 @@ async def start_game(
     for p in room.players:
         if p not in waiting_players:
             p.clear_hand()
-            await p.send_hand_update()
+            if not hasattr(p, "ws") or p.ws is not None or is_cpu_player(p):
+                await p.send_hand_update()
 
     # 先後を配札前に確定する。保証する相手を席順と混同しない。
     waiting_player_ids = [p.id for p in waiting_players]
@@ -7550,7 +7637,7 @@ async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer
     if room.tournament_match_id:
         await broadcast_tournament_match_state(room)
 
-async def next_turn(room):
+async def next_turn(room, *, next_player_id=None):
     room.completed_turns = getattr(room, "completed_turns", 0) + 1
     # ターンが変わるので、ドロー済みフラグをリセットする
     room.has_drawn = False
@@ -7565,6 +7652,19 @@ async def next_turn(room):
         return
 
     current_turn_id = room.current_turn_id
+    if room.rule.multiplayer_enabled:
+        active_ids = {p.id for p in active_players}
+        order = room.turn_order_ids
+        if next_player_id not in active_ids:
+            index = order.index(current_turn_id) if current_turn_id in order else -1
+            next_player_id = next((order[(index + offset) % len(order)]
+                                   for offset in range(1, len(order) + 1)
+                                   if order[(index + offset) % len(order)] in active_ids), active_players[0].id)
+        room.current_turn_id = next_player_id
+        next_player = next(p for p in active_players if p.id == next_player_id)
+        await broadcast_turn_update(room, next_player.name)
+        await maybe_schedule_cpu_turn(room)
+        return
     # 現在の手番プレイヤーが active_players の中にいるかを確認
     idx = [i for i, p in enumerate(active_players) if p.id == current_turn_id]
     if not idx:

@@ -239,6 +239,8 @@ class CpuProfile:
     action_selector: Optional[CpuActionSelector] = None
 
     def supports_rule(self, rule) -> bool:
+        if getattr(rule, "multiplayer_enabled", False) and self.key != "basic":
+            return False
         if getattr(rule, "cpu_profile_keys", ()) and self.key not in rule.cpu_profile_keys:
             return False
         if self.rule_keys and getattr(rule, "key", None) not in self.rule_keys:
