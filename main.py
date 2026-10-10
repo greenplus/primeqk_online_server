@@ -521,6 +521,7 @@ class Room:
                         "対戦メンバーが変わったため、開始申請を取り消しました。",
                     )
                 removed_immediately.append(p)
+                record_final_disconnects(self, [p])
                 if p in self.players:
                     self.players.remove(p)
                 if getattr(p, "room", None) is self:
@@ -529,10 +530,6 @@ class Room:
                     p.clear_hand()
             disconnected.append(p)
         if disconnected:
-            if self.state == "playing":
-                for p in disconnected:
-                    if p.status == "waiting":
-                        record_score_play_line(self, p, "切断")
             if removed_immediately:
                 await handle_room_after_player_removed(self)
             else:
@@ -1317,15 +1314,6 @@ async def mark_player_disconnected(
     player.ws = None
     if first_notice:
         player.disconnected_at = now or utc_now()
-        if room.rule.multiplayer_enabled and room.state == "playing" and player.status == "waiting":
-            record_score_play_line(room, player, "切断")
-            player.status = "watching"
-            player.clear_hand()
-            log_connection_event("disconnected", player, previous_ws, source=source)
-            await room.log_chat(f"{player.name}の通信が切れたため、対戦から除外しました。")
-            await handle_room_after_player_removed(room, player.id)
-            await room.update_game_state()
-            return True
         run = tournament_run_for_room(room)
         if run and run.flexible and run.status == "running" and player.tournament_participant_id in run.participants:
             run.pause_participant(player.tournament_participant_id, "disconnected", now=player.disconnected_at)
@@ -1356,9 +1344,14 @@ def room_resume_session(
     session = ROOM_RESUME_SESSIONS.get(hash_resume_token(token))
     if (
         session is None
+        or session.room is None
         or session.room_session_room_id != requested_room_id
         or (session.ws is not None and not allow_connected)
     ):
+        return None
+    if (session.ws is None and session.disconnected_at is not None
+            and (utc_now() - session.disconnected_at).total_seconds()
+            >= room_disconnect_grace_seconds(session.room, session)):
         return None
     return session
 
@@ -2008,6 +2001,14 @@ async def close_tournament_match_room(
 ) -> None:
     room = TOURNAMENT_MATCH_ROOMS.get(match_id)
     winner_name = run.participants[winner_id].display_name if winner_id else None
+    expired_players = []
+    if room is not None:
+        now = utc_now()
+        expired_players = [p for p in room.players if p.ws is None and p.disconnected_at is not None
+                           and (now - p.disconnected_at).total_seconds() >= room_disconnect_grace_seconds(room, p)]
+        match = next((item for item in run.matches if item.match_id == match_id), None)
+        if getattr(match, "resolution", None) in {"forfeit", "auto_skip", "retirement_forfeit", "retirement_skip"}:
+            record_final_disconnects(room, expired_players)
     await finish_tournament_match_view(run, room, match_id, winner_name)
     if room is None:
         return
@@ -2022,6 +2023,10 @@ async def close_tournament_match_room(
         room.players.remove(room_player)
         room_player.clear_hand()
         room_player.status = "watching"
+        if room_player in expired_players:
+            room_player.room = None
+            forget_room_resume_session(room_player)
+            continue
         room_player.room = lobby
         if room_player not in lobby.players:
             lobby.players.append(room_player)
@@ -2246,6 +2251,7 @@ async def expire_disconnected_room_sessions(now: Optional[datetime] = None) -> N
         entry[1].append(player)
 
     for room, expired_players in expired_by_room.values():
+        record_final_disconnects(room, expired_players)
         if any(player.status == "waiting" for player in expired_players):
             await invalidate_turn_alternation(
                 room,
@@ -5362,6 +5368,21 @@ async def remove_cpus_if_no_humans(room: Room) -> bool:
     return True
 
 
+def record_final_disconnects(room: Room, departed_players) -> None:
+    """Only a confirmed disconnect that ends the game belongs in the score."""
+    if room.state != "playing":
+        return
+    participants = [p for p in departed_players if p.status == "waiting"]
+    departed_ids = {p.id for p in departed_players}
+    remaining = [p for p in get_active_players(room) if p.id not in departed_ids]
+    remaining_humans = [p for p in human_players(room) if p.id not in departed_ids]
+    will_end = (not remaining or (not room.rule.multiplayer_enabled and len(remaining) == 1)
+                or (remaining and not remaining_humans))
+    if will_end:
+        for player in participants:
+            record_score_play_line(room, player, "切断")
+
+
 async def handle_room_after_player_removed(room: Room, departed_player_id: str | None = None) -> None:
     if room.state == "playing":
         active_players = get_active_players(room)
@@ -6373,6 +6394,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     rid,
                     allow_connected=data.get("automatic_reconnect") is True,
                 )
+                if resumed_session is None and (data.get("resume_token") or data.get("automatic_reconnect") is True):
+                    await player.send_json({
+                        "type": "room_left", "room_id": rid, "reason": "disconnect_expired",
+                        "message": "復帰できる席がなくなったためメニューへ戻りました。再入室はメニューから行ってください。",
+                    })
+                    continue
                 if resumed_session is not None and resumed_session is not player:
                     player = await bind_room_resume_session(player, resumed_session)
                     active_room = player.room or room
@@ -6616,11 +6643,9 @@ async def websocket_endpoint(websocket: WebSocket):
             room = player.room
             if player.room_resume_token_hash:
                 await mark_player_disconnected(player, expected_ws=websocket, source="receive")
-                if room.state == "playing" and player.status == "waiting":
-                    record_score_play_line(room, player, "切断")
                 await room.update_room_status()
             else:
-                await leave_room(player, notify_client=False)
+                await leave_room(player, notify_client=False, disconnected=True)
     except Exception as exc:
         log_connection_event("handler_error", player, websocket, error_type=type(exc).__name__)
         traceback.print_exc()
@@ -6628,11 +6653,9 @@ async def websocket_endpoint(websocket: WebSocket):
             room = player.room
             if player.room_resume_token_hash:
                 await mark_player_disconnected(player, expected_ws=websocket, source="handler_error")
-                if room.state == "playing" and player.status == "waiting":
-                    record_score_play_line(room, player, "切断")
                 await room.update_room_status()
             else:
-                await leave_room(player, notify_client=False)
+                await leave_room(player, notify_client=False, disconnected=True)
     finally:
         if player.ws is websocket or player.ws is None:
             clear_tournament_match_view(player)
@@ -7417,7 +7440,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 ################################################
 # 部屋からの退出
 ################################################
-async def leave_room(player, notify_client: bool = True):
+async def leave_room(player, notify_client: bool = True, *, disconnected: bool = False):
     clear_tournament_match_view(player)
     if player.room is None:
         if notify_client:
@@ -7458,6 +7481,8 @@ async def leave_room(player, notify_client: bool = True):
 
     if player in room.players:
         departed_player_id = player.id
+        if disconnected:
+            record_final_disconnects(room, [player])
         if player.status == "waiting":
             await invalidate_turn_alternation(
                 room,
@@ -7468,7 +7493,7 @@ async def leave_room(player, notify_client: bool = True):
 
         # 退出通知
         await room.log_chat(f"{player.name}が退室しました")
-        if room.state == "playing" and player.status == "waiting":
+        if room.state == "playing" and player.status == "waiting" and not disconnected:
             record_score_play_line(room, player, "退出")
         player.clear_hand()
 
