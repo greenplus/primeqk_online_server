@@ -252,6 +252,9 @@ class DoubleCeilingSolver(Solver):
         return self.group_cache[key]
 
     def prove_move(self, move, held, locked, opponent_counts, field, preferred, mode, audit=None, limits=None):
+        from .move_safety import uses_spare_natural
+        if uses_spare_natural(move, held):
+            return None, dict(status='unproved', reason='spare-natural-card')
         self.tick()
         rest = subtract(held,move.need)
         if rest is None or (field and (move.size != field[0] or

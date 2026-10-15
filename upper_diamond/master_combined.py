@@ -9,7 +9,7 @@ from copy import deepcopy
 import cpu_player as diamond
 
 
-def _choose_combined(cpu, room, diamond_choice):
+def _choose_previous(cpu, room, diamond_choice):
     cpu.opening_master_trace = None
     cpu.post_all_out_master_trace = None
     cpu.second_opening_master_trace = None
@@ -29,6 +29,41 @@ def _choose_combined(cpu, room, diamond_choice):
     return choose_revolution(cpu, room, normal)
 
 
+def _choose_combined(cpu, room, diamond_choice):
+    from .public_control import choose_public_control
+    from .post_all_out_master import continue_plan as continue_post
+    from .revolution_master import continue_plan as continue_revolution
+    cpu.master_public_control_trace = None
+    cpu.opening_master_trace = None
+    cpu.second_opening_master_trace = None
+    cpu.post_all_out_master_trace = None
+    cpu.revolution_master_trace = None
+    active = getattr(cpu, 'post_all_out_master_active', None)
+    if active and (active.get('branch_certificate') or active.get('model') in
+                   ('same_size_two_step_mate', 'public_control_sequence', 'double_ceiling_mate')):
+        action = continue_post(cpu, room)
+        if action is not None:
+            return action
+    active = getattr(cpu, 'revolution_master_active', None)
+    if active and active.get('model') != 'three_step':
+        action = continue_revolution(cpu, room)
+        if action is not None:
+            return action
+    active = getattr(cpu, 'gold_active_plan', None)
+    if (active and active.get('opening_master_type') == 'certified_win'
+            and active.get('opening_master_reverse_order') == bool(room.reverse_order)):
+        index = int(getattr(cpu, 'gold_plan_step_index', 0))
+        steps = active.get('steps', [])[index:]
+        if not room.field and index == 1 and active.get('dual_wield_pass_tail'):
+            steps = active['dual_wield_pass_tail']
+        ids = [str(c['card_id']) for step in steps for c in diamond.candidate_consumed_cards(step)]
+        if (steps and sorted(ids) == sorted(str(c['card_id']) for c in cpu.hand)
+                and diamond.candidate_is_playable(steps[0], cpu, room)):
+            return _choose_previous(cpu, room, diamond_choice)
+    action = choose_public_control(cpu, room)
+    return action if action is not None else _choose_previous(cpu, room, diamond_choice)
+
+
 def clear_interrupted_plan(cpu):
     diamond.clear_gold_active_plan(cpu)
     diamond.clear_silver_active_plan(cpu)
@@ -36,6 +71,8 @@ def clear_interrupted_plan(cpu):
     cpu.post_all_out_draw_phase = None
     cpu.revolution_master_active = None
     cpu.revolution_master_recovery = None
+    cpu.master_public_control_active = None
+    cpu.master_public_control_draw_finish = None
     # An interrupted evaluator may have partial diagnostic state, but is never
     # allowed to publish it as a complete cached decision on the next turn.
     cpu.opening_master_evaluator = None
@@ -59,10 +96,11 @@ def decision_snapshot(cpu):
 
 def choose_combined(cpu, room, diamond_choice):
     """Default production budget; master_timing_config=None opts into research."""
+    from .move_safety import naturalize_action
     config = getattr(cpu, 'master_timing_config', TimingConfig())
     cpu.master_budget_trace = None
     if config is None:
-        return _choose_combined(cpu, room, diamond_choice)
+        return naturalize_action(cpu, _choose_combined(cpu, room, diamond_choice))
     budget = Budget(time.perf_counter(), config)
     saved, rng_state = decision_snapshot(cpu)
     token = CURRENT.set(budget)
@@ -107,7 +145,7 @@ def choose_combined(cpu, room, diamond_choice):
             raise
         if time.perf_counter() >= budget.total_deadline:
             raise diamond.CpuDecisionDeadline
-        return action
+        return naturalize_action(cpu, action)
     except diamond.CpuDecisionDeadline:
         emergency = True
         traces = {name: getattr(cpu,name,None) for name in

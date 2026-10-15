@@ -16,6 +16,7 @@ import time
 
 import cpu_player as diamond
 from .master_budget import check as check_master_budget
+from .move_safety import special_exposed, uses_spare_natural
 from registered_primes import registered_value_encodings
 
 ROOT = Path(__file__).resolve().parent / "data"
@@ -402,7 +403,8 @@ class Evaluator:
 
     def free_control_certain(self, move, hand):
         """Control from an empty field, where 57 is always legal."""
-        return move.cut or self.hard_certain(move, hand)
+        return (not uses_spare_natural(move, hand) and not special_exposed(move)
+                and (move.cut or self.hard_certain(move, hand)))
 
     def safe_rally(self, lead, trump, hand):
         """All catalog responses must allow T, and none may immediately finish.
@@ -410,7 +412,7 @@ class Evaluator:
         Test both no-draw and one-draw opponent hand sizes. A response ending
         the game, a cut, or a revolution cannot be overridden by T later.
         """
-        if trump.is_57:
+        if trump.is_57 or special_exposed(lead) or special_exposed(trump):
             return False
         available = subtract(CAPACITY, hand)
         if trump.template.kind != "cut" and prime_upper_bound(available, lead.size) >= trump.value:
@@ -507,6 +509,8 @@ class Evaluator:
             remainder = subtract(hand, lead.need)
             if remainder == ZERO:
                 continue
+            if special_exposed(lead) or uses_spare_natural(lead, hand):
+                continue
             for finish in by_need.get(remainder, ()):
                 if self.free_control_certain(lead, hand):
                     plans.append(Plan("certified_win", (lead, finish), 0.0, "public_control_sequence", 12))
@@ -535,6 +539,8 @@ class Evaluator:
                     continue
                 pass_finishes = by_need.get(remainder, ())
                 for trump in trumps:
+                    if special_exposed(trump) or uses_spare_natural(trump, remainder):
+                        continue
                     if trump.template.kind != "cut" and lead.value >= trump.value:
                         continue
                     is_certain = self.hard_certain(trump, remainder) and self.safe_rally(lead, trump, hand)

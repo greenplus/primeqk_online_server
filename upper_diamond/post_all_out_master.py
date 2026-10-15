@@ -15,6 +15,7 @@ import time
 
 import cpu_player as diamond
 from .master_budget import SearchLimit, check as check_master_budget
+from .move_safety import special_exposed, uses_spare_natural, natural_sequence
 from registered_primes import registered_value_encodings
 from .opening_master import (CAPACITY, ZERO, LABELS, Move, Plan, Template,
                              _realizations, bind_move, counts, hand_counts,
@@ -241,7 +242,9 @@ class Solver:
             while mask:
                 self.tick()
                 bit = mask & -mask
-                rows.append(self.moves[bit.bit_length()-1])
+                move = self.moves[bit.bit_length()-1]
+                if not uses_spare_natural(move, held):
+                    rows.append(move)
                 mask ^= bit
             self.fit_cache[key] = tuple(rows)
         return self.fit_cache[key]
@@ -317,7 +320,8 @@ class Solver:
 
     def free_control_certain(self, move, held):
         """57 is a guaranteed cut on an empty field, never a rally ceiling."""
-        return move.cut or self.certain(move, held)
+        return (not uses_spare_natural(move, held) and not special_exposed(move, bool(self.room.reverse_order))
+                and (move.cut or self.certain(move, held)))
 
     def control_tail(self, held):
         if held in self.tail_cache:
@@ -356,7 +360,7 @@ class Solver:
         return None
 
     def safe_lead(self, lead, trump, held_after_lead):
-        if trump.is_57:
+        if trump.is_57 or special_exposed(lead) or special_exposed(trump):
             return False
         trump_value = 10**100 if trump.template.kind == 'cut' else trump.value
         if lead.cut or lead.value >= trump_value or self.opponent_count is None:
@@ -467,6 +471,8 @@ class Solver:
                     self.stats['ceiling_candidates'] += 1
                     found = False
                     for lead, tail in self.partitions(remaining, size):
+                        if not natural_sequence(hand, (lead, trump)):
+                            continue
                         if lead.value >= (10**100 if trump.template.kind == 'cut' else trump.value):
                             continue
                         held = subtract(hand, lead.need)

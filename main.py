@@ -3596,7 +3596,7 @@ def record_failed_cpu_plan(player, room, consumed_cards) -> None:
             {card["card_id"] for card in consumed_cards}
             == {card["card_id"] for card in player.hand}
         )
-    if getattr(player, "cpu_key", None) == "upper_diamond_planner":
+    if getattr(player, "cpu_key", None) in {"upper_diamond_planner", "special_diamond_planner"}:
         player.post_all_out_master_active = None
 
 
@@ -5522,7 +5522,7 @@ async def maybe_schedule_cpu_turn(room: Room) -> None:
 
 
 async def choose_room_cpu_action(room: Room, cpu: CpuPlayer):
-    if cpu.cpu_key != "upper_diamond_planner":
+    if cpu.cpu_key not in {"upper_diamond_planner", "special_diamond_planner"}:
         return choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
 
     from copy import copy, deepcopy

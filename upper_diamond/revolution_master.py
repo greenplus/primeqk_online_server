@@ -14,6 +14,7 @@ from .opening_master import (CAPACITY, ZERO, Move, Template, _realizations,
 from .post_all_out_master import (Config, Solver, knowledge_key,
                                   sequence_key)
 from .master_budget import SearchLimit
+from .move_safety import natural_sequence
 
 
 LISTED = {2: frozenset((10, 11, 12, 13)),
@@ -203,6 +204,8 @@ class RevolutionSolver(Solver):
                     remaining = subtract(hand, trump.need)
                     for lead, tail in self.partitions(remaining, size):
                         self.tick()
+                        if not natural_sequence(hand, (lead, trump)):
+                            continue
                         held = subtract(hand, lead.need)
                         if (not self.certain(trump, held, inclusive=True)
                                 or not self.safe_lead(lead, trump, held)
@@ -248,6 +251,8 @@ class RevolutionSolver(Solver):
                             if tail is None:
                                 continue
                             plan = RevolutionPlan((lead, middle, trump)+tail, 'three_step')
+                            if not natural_sequence(hand, plan.steps):
+                                continue
                             if best is None or sequence_key(plan.steps) < sequence_key(best.steps):
                                 best = plan
         except SearchLimit:

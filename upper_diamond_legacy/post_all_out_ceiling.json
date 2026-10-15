@@ -1,0 +1,13 @@
+{
+  "version": "diamond-knowledge-v1",
+  "scope": "registered knowledge only; numeric order is authoritative",
+  "trumps": [
+    "kkq", "kkk",
+    "kkkq", "kkjq", "kkqt", "kkqk", "kkkt", "kkjk",
+    "kkkqqj", "kkkttj", "kkqqtj", "kkkktj", "kkqqqj", "kkqtjj", "kkqjjj",
+    "kkkqqqj", "kkkqqjj", "kkktttj", "kkqjqtj", "kkkkqtj", "kkkjtqj", "kkqqjjj",
+    "kkkqjtqj", "kkkqtqtj", "kkkkqqtj", "kkkjqjtj", "kkkjjttj", "kkktjttj",
+    "kkkqqttqj", "kkkqtttjj", "kkkqtjqjj", "kkqqtjtjj",
+    "9kkkqqtttj", "9kkkqqqtjj", "9kkqqttjjj", "9kkqqttjqj"
+  ]
+}

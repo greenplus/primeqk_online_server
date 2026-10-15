@@ -7,6 +7,7 @@ import time
 from .opening_master import ZERO, subtract, hand_counts
 from .post_all_out_master import Config, SearchLimit
 from .master_budget import check as check_master_budget
+from .move_safety import special_exposed, natural_sequence
 from .double_ceiling import DoubleCeilingSolver, DoublePlan, add, visible_need
 
 
@@ -193,6 +194,10 @@ class ThreeStepSolver(DoubleCeilingSolver):
                                      budget_ms=self.config.budget_ms)
                 try:
                     for lead, middle, trump, tail, remaining, _ in self.nominal_candidates(hand, size, inclusive=False):
+                        if any(special_exposed(m) for m in (lead, middle, trump)):
+                            continue
+                        if not natural_sequence(hand, (lead, middle, trump)+tail):
+                            continue
                         held = subtract(subtract(hand, lead.need), middle.need)
                         if not self.certain(trump, held):
                             continue

@@ -93,7 +93,8 @@ DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "hand-advantage-lead",
     "hand-advantage-interference",
 })
-DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner", "upper_diamond_planner"})
+MASTER_PLANNING_CPU_KEYS = frozenset({"upper_diamond_planner", "special_diamond_planner"})
+DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner"}) | MASTER_PLANNING_CPU_KEYS
 ADVANCED_PLANNING_CPU_KEYS = DIAMOND_PLANNING_CPU_KEYS | {"platinum_planner"}
 PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS = 9
 PLATINUM_COMPRESSION_MIN_HAND_SIZE = 18
@@ -484,7 +485,7 @@ def choose_profile_cpu_action(
     validator: Optional[NumberValidator] = None,
 ) -> CpuAction:
     profile = get_cpu_profile(getattr(cpu, "cpu_key", "basic"))
-    if profile and profile.key == "upper_diamond_planner":
+    if profile and profile.key in MASTER_PLANNING_CPU_KEYS:
         return profile.action_selector(cpu, room, validator)
     return _choose_profile_cpu_action(cpu, room, validator, profile)
 
@@ -9709,8 +9710,17 @@ def is_semiprime(n: int) -> bool:
 
 
 def choose_upper_diamond_cpu_action(cpu, room, validator=None):
-    from copy import copy
+    from upper_diamond_legacy.master_combined import choose_combined
+    return _choose_master_cpu_action(cpu, room, validator, choose_combined)
+
+
+def choose_special_diamond_cpu_action(cpu, room, validator=None):
     from upper_diamond.master_combined import choose_combined
+    return _choose_master_cpu_action(cpu, room, validator, choose_combined)
+
+
+def _choose_master_cpu_action(cpu, room, validator, choose_combined):
+    from copy import copy
 
     # Virtual draws need an explicit public opponent count; live Room objects
     # normally derive it from players, unlike the league's public state objects.
@@ -9801,6 +9811,18 @@ CPU_PROFILES = {
             sample_key="diamond_prime_table",
         ),
         action_selector=choose_upper_diamond_cpu_action,
+    ),
+    "special_diamond_planner": CpuProfile(
+        key="special_diamond_planner",
+        label="特ダイヤCPU",
+        description="上ダイヤCPUよりも強く、相手の手札が弱くなったときに連続出札で勝ち切る力を高めたCPUです。",
+        rule_keys=("std-11-n-c",),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="diamond_prime_table",
+        ),
+        action_selector=choose_special_diamond_cpu_action,
     ),
     "silver_planner": CpuProfile(
         key="silver_planner",
