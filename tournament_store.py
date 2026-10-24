@@ -24,6 +24,7 @@ class TournamentStore:
         self._memory_runs: dict[str, TournamentRun] = {}
         self._memory_audit: list[dict[str, Any]] = []
         self._room_rules: dict[str, str] = {}
+        self._room_rule_migrations: set[str] = set()
 
     @property
     def persistent(self) -> bool:
@@ -97,8 +98,31 @@ class TournamentStore:
                 rule_key TEXT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS special_room_rule_migrations (
+                migration_key TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
+
+    async def migrate_room_rule_defaults(self, migration_key: str, choices: dict[str, str]) -> None:
+        """Apply a requested room replacement once, preserving later admin choices."""
+        if self.pool is not None:
+            async with self.pool.acquire() as connection:
+                async with connection.transaction():
+                    inserted = await connection.fetchval(
+                        "INSERT INTO special_room_rule_migrations (migration_key) VALUES ($1) "
+                        "ON CONFLICT DO NOTHING RETURNING migration_key", migration_key,
+                    )
+                    if inserted:
+                        await connection.executemany(
+                            "INSERT INTO special_room_rules (room_id, rule_key) VALUES ($1, $2) "
+                            "ON CONFLICT (room_id) DO UPDATE SET rule_key=EXCLUDED.rule_key, updated_at=NOW()",
+                            list(choices.items()),
+                        )
+        elif migration_key not in self._room_rule_migrations:
+            self._room_rules.update(choices)
+            self._room_rule_migrations.add(migration_key)
 
     async def load_room_rules(self) -> dict[str, str]:
         if self.pool is not None:

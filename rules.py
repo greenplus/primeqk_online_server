@@ -66,6 +66,12 @@ class RulePreset:
         return deck_size // self.hand_size
 
 PRESETS: Dict[str, RulePreset] = {
+    "std-3-1": RulePreset(
+        key="std-3-1", label="3枚 / ペナ1",
+        deck_rule=DeckRule.DEFAULT, hand_size=3, penalty_rule=PenaltyRule.ALWAYS_1,
+        allow_composite=True, hyakki=True,
+        description="初期手札3枚・ペナルティ1枚。通常54枚・合成数あり。",
+    ),
     "hyakki-second-x": RulePreset(
         key="hyakki-second-x", label="後手のみX1枚保証",
         deck_rule=DeckRule.DEFAULT, hand_size=11, penalty_rule=PenaltyRule.NORMAL,

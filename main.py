@@ -146,6 +146,10 @@ async def lifespan(_app):
     if CAMPAIGN_SETTINGS.enabled:
         await CAMPAIGN_STORE.connect()
     await TOURNAMENT_STORE.connect()
+    await TOURNAMENT_STORE.migrate_room_rule_defaults(
+        "hyakki-three-cards-20261024",
+        {room_id: HYAKKI_DEFAULT_RULE_KEY for room_id in HYAKKI_YAGYO_ROOM_IDS},
+    )
     for room_id, rule_key in (await TOURNAMENT_STORE.load_room_rules()).items():
         if room_id in HYAKKI_YAGYO_ROOM_IDS and rule_key in HYAKKI_RULE_KEYS:
             rooms[room_id].rule = PRESETS[rule_key]
@@ -710,13 +714,13 @@ NEO_ADVANCED_ROOM_IDS = ("room_14", "room_19", "room_20")
 CLASSIC_ROOM_IDS = ("room_1", "room_2", "room_3", "room_4", "room_5", "room_6", "classic_multi_beginner", "classic_multi_normal")
 PLUS_ROOM_IDS = ("room_7", "room_8", "room_9", "hyakki_archive_1")
 HYAKKI_RULE_KEYS = tuple(key for key, rule in PRESETS.items() if rule.hyakki)
-HYAKKI_DEFAULT_RULE_KEY = "hyakki-second-x"
+HYAKKI_DEFAULT_RULE_KEY = "std-3-1"
 HYAKKI_YAGYO_ROOM_IDS = ("hyakki_yagyo_1", "hyakki_yagyo_2", "hyakki_yagyo_3")
 
 ROOM_CONFIG = [
     ("room_1", PRESETS["half-7-1-c"], "Classic"),
     ("room_2", PRESETS["std-5-1"], "Classic"),
-    ("room_3", PRESETS["std-11-f-c"], "Classic"),
+    ("room_3", PRESETS["std-3-1"], "Classic"),
     ("room_4", PRESETS["std-11-n-c"], "Classic"),
     ("room_5", PRESETS["std-11-n-c"], "Classic"),
     ("room_6", PRESETS["std-11-n-c"], "Classic"),
@@ -1526,6 +1530,7 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         registration_opens_at=parse_datetime(data.get("registration_opens_at")),
         starts_at=parse_datetime(data.get("starts_at")),
         max_participants=int(data.get("max_participants", 10)),
+        wins_required=data.get("wins_required", 1),
         pairing_mode=str(data.get("pairing_mode", "rounds")),
         registration_closes_at=parse_datetime(data["registration_closes_at"]) if data.get("registration_closes_at") else None,
     )
@@ -1538,6 +1543,7 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         "title": run.title,
         "format_key": run.format_key,
         "rule_key": run.rule_key,
+        "wins_required": run.wins_required,
         "registration_opens_at": run.registration_opens_at.isoformat(),
         "starts_at": run.starts_at.isoformat(),
         "pairing_mode": run.pairing_mode,
@@ -1861,6 +1867,9 @@ async def prepare_tournament_match(
 ) -> None:
     if match is None or match.status not in {"called", "playing"}:
         return
+    existing_room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
+    if existing_room is not None and (existing_room.state == "playing" or existing_room.start_in_progress):
+        return
     if not (
         tournament_session_online(match.player1_id)
         and tournament_session_online(match.player2_id)
@@ -1875,7 +1884,6 @@ async def prepare_tournament_match(
         if not tournament_match_both_ready(match) and (run.flexible or not deadline_elapsed):
             return
     run.begin_match(match.match_id, now=current)
-    await TOURNAMENT_STORE.save_run(run)
     player1 = TOURNAMENT_SESSIONS[match.player1_id]
     player2 = TOURNAMENT_SESSIONS[match.player2_id]
     room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
@@ -1888,6 +1896,21 @@ async def prepare_tournament_match(
         room.tournament_run_id = run.run_id
         room.tournament_match_id = match.match_id
         TOURNAMENT_MATCH_ROOMS[match.match_id] = room
+    room.start_in_progress = True
+    try:
+        await start_tournament_game(run, match, room, player1, player2)
+    finally:
+        room.start_in_progress = False
+
+
+async def start_tournament_game(run, match, room, player1, player2) -> None:
+    if match.first_player_id not in {match.player1_id, match.player2_id}:
+        match.first_player_id = random.choice([match.player1_id, match.player2_id])
+    first_id = match.first_player_id
+    if sum(match.game_wins.values()) % 2:
+        first_id = match.player2_id if first_id == match.player1_id else match.player1_id
+    first_player = player1 if first_id == match.player1_id else player2
+    await TOURNAMENT_STORE.save_run(run)
     for match_player in (player1, player2):
         clear_tournament_match_view(match_player)
         old_room = match_player.room
@@ -1911,7 +1934,7 @@ async def prepare_tournament_match(
     )
     await rooms[run.room_id].update_room_status()
     await room.update_room_status()
-    await start_game(room)
+    await start_game(room, first_player_id=first_player.id)
 
 
 async def start_or_prepare_next_tournament_match(run: TournamentRun) -> None:
@@ -2142,6 +2165,8 @@ async def flexible_tournament_tick(run: TournamentRun, now: datetime) -> None:
             await notify_tournament_match_call(run, match)
             continue
         online = [tournament_session_online(pid, match_room) for pid in ids]
+        if all(online) and match_room.state == "waiting" and now >= getattr(match_room, "tournament_next_game_at", now):
+            await prepare_tournament_match(run, match, now=now)
         expired = [tournament_participant_disconnect_expired(TOURNAMENT_SESSIONS.get(pid), connected, now, playing_disconnect_grace_seconds(), match.started_at) for pid, connected in zip(ids, online)]
         if expired[0] and online[1] or expired[1] and online[0] or all(expired):
             winner = ids[1] if expired[0] and online[1] else ids[0] if expired[1] and online[0] else None
@@ -2180,14 +2205,25 @@ async def record_tournament_game_result(room: Room, winner_player: Optional["Pla
     if participant_id not in {match.player1_id, match.player2_id}:
         return
     was_finished = run.status == "finished"
-    match = run.resolve_match(match.match_id, participant_id, resolution="game")
+    if not run.record_game(match.match_id, participant_id, room.game_id):
+        return
     finished_now = not was_finished and run.status == "finished"
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(run.run_id, actor="system", action="game_result", details={
         "match_id": match.match_id,
         "winner_id": participant_id,
         "game_id": room.game_id,
+        "game_wins": dict(match.game_wins),
     })
+    if match.status == "playing":
+        room.tournament_next_game_at = utc_now() + timedelta(seconds=1.5)
+        await room.log_chat(
+            f"{run.participants[match.player1_id].display_name} {match.game_wins.get(match.player1_id, 0)}–"
+            f"{match.game_wins.get(match.player2_id, 0)} {run.participants[match.player2_id].display_name}。"
+            "先後を交代して次の対局を開始します。"
+        )
+        await publish_tournament_state(run)
+        return
     asyncio.create_task(delayed_tournament_match_completion(
         run,
         match.match_id,
@@ -2334,6 +2370,8 @@ async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
                 online1 = tournament_session_online(match.player1_id, expected_room)
                 online2 = tournament_session_online(match.player2_id, expected_room)
                 if online1 and online2:
+                    if match.status == "playing" and match_room.state == "waiting" and current >= getattr(match_room, "tournament_next_game_at", current):
+                        await prepare_tournament_match(run, match, now=current)
                     if match.status == "called":
                         deadline_elapsed = bool(
                             match.ready_deadline_at is not None

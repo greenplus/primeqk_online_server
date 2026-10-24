@@ -99,6 +99,9 @@ class TournamentMatch:
     ready_player_ids: list[str] = field(default_factory=list)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    game_wins: dict[str, int] = field(default_factory=dict)
+    first_player_id: Optional[str] = None
+    last_game_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +118,9 @@ class TournamentMatch:
             "ready_player_ids": list(self.ready_player_ids),
             "started_at": isoformat(self.started_at),
             "completed_at": isoformat(self.completed_at),
+            "game_wins": dict(self.game_wins),
+            "first_player_id": self.first_player_id,
+            "last_game_id": self.last_game_id,
         }
 
     @classmethod
@@ -133,6 +139,9 @@ class TournamentMatch:
             ready_player_ids=[str(item) for item in value.get("ready_player_ids", [])],
             started_at=parse_datetime(value["started_at"]) if value.get("started_at") else None,
             completed_at=parse_datetime(value["completed_at"]) if value.get("completed_at") else None,
+            game_wins={str(pid): int(wins) for pid, wins in value.get("game_wins", {}).items()},
+            first_player_id=value.get("first_player_id"),
+            last_game_id=value.get("last_game_id"),
         )
 
 
@@ -185,6 +194,7 @@ class TournamentRun:
     finished_at: Optional[datetime] = None
     pairing_mode: str = "rounds"
     registration_closes_at: Optional[datetime] = None
+    wins_required: int = 1
 
     @classmethod
     def create(
@@ -197,6 +207,7 @@ class TournamentRun:
         registration_opens_at: datetime,
         starts_at: datetime,
         max_participants: int = 10,
+        wins_required: int = 1,
         pairing_mode: str = "rounds",
         registration_closes_at: Optional[datetime] = None,
         now: Optional[datetime] = None,
@@ -215,6 +226,8 @@ class TournamentRun:
         if not 2 <= int(max_participants) <= 32:
             raise ValueError("参加上限は2〜32人で指定してください。")
         current = now or utc_now()
+        if type(wins_required) is not int or wins_required not in {1, 2}:
+            raise ValueError("先取本数は1または2を指定してください。")
         return cls(
             run_id=str(uuid.uuid4()),
             format_key=format_key.strip(),
@@ -224,6 +237,7 @@ class TournamentRun:
             registration_opens_at=opens_at,
             starts_at=begins_at,
             max_participants=int(max_participants),
+            wins_required=wins_required,
             status="registration" if opens_at <= current < begins_at else "scheduled",
             created_at=current,
             pairing_mode=pairing_mode,
@@ -499,6 +513,24 @@ class TournamentRun:
             raise ValueError("開始できる対戦がありません。")
         return self.begin_match(match.match_id, now=now)
 
+    def record_game(self, match_id: str, winner_id: str, game_id: str) -> bool:
+        match = next(item for item in self.matches if item.match_id == match_id)
+        if match.status != "playing" or match.last_game_id == game_id:
+            return False
+        if winner_id not in {match.player1_id, match.player2_id}:
+            raise ValueError("勝者はこの対戦の参加者から選んでください。")
+        match.last_game_id = game_id
+        match.game_wins[winner_id] = match.game_wins.get(winner_id, 0) + 1
+        if match.game_wins[winner_id] >= self.wins_required:
+            self.resolve_match(match_id, winner_id, resolution="game")
+        return True
+
+    def match_score(self, match: TournamentMatch, participant_id: str) -> int:
+        if match.game_wins:
+            return match.game_wins.get(participant_id, 0)
+        # Older saved runs had no per-game scores and were all first-to-one.
+        return int(match.status == "completed" and match.winner_id == participant_id)
+
     def resolve_match(
         self,
         match_id: str,
@@ -512,6 +544,11 @@ class TournamentRun:
             raise ValueError("対戦が見つかりません。")
         if winner_id is not None and winner_id not in {match.player1_id, match.player2_id}:
             raise ValueError("勝者はこの対戦の参加者から選んでください。")
+        if winner_id is None:
+            match.game_wins = {}
+        elif resolution != "game" or match.game_wins.get(winner_id, 0) < self.wins_required:
+            # Administrative results and forfeits replace the whole match score.
+            match.game_wins = {winner_id: self.wins_required}
         match.status = "completed" if winner_id is not None else "skipped"
         match.winner_id = winner_id
         match.resolution = resolution
@@ -551,6 +588,9 @@ class TournamentRun:
                 "losses": 0,
                 "played": 0,
                 "points": 0,
+                "games_won": 0,
+                "games_lost": 0,
+                "game_difference": 0,
             }
             for participant in self.active_participants
         }
@@ -565,19 +605,45 @@ class TournamentRun:
             if loser_id in rows:
                 rows[loser_id]["losses"] += 1
                 rows[loser_id]["played"] += 1
+            for pid, opponent in ((match.player1_id, match.player2_id), (match.player2_id, match.player1_id)):
+                if pid in rows:
+                    won, lost = self.match_score(match, pid), self.match_score(match, opponent)
+                    rows[pid]["games_won"] += won
+                    rows[pid]["games_lost"] += lost
+                    rows[pid]["game_difference"] += won - lost
 
-        ordered = sorted(
-            rows.values(),
-            key=lambda row: (-row["wins"], row["display_name"].casefold()),
-        )
-        previous_key = None
-        previous_rank = 0
-        for index, row in enumerate(ordered, start=1):
-            key = row["wins"]
-            if key != previous_key:
-                previous_rank = index
-                previous_key = key
-            row["rank"] = previous_rank
+        def partition(ids, key):
+            groups = {}
+            for pid in ids:
+                groups.setdefault(key(pid), []).append(pid)
+            return [groups[k] for k in sorted(groups, reverse=True)]
+
+        def direct_groups(ids):
+            if len(ids) < 2:
+                return [ids]
+            tied = set(ids)
+            scores = {pid: [0, 0] for pid in ids}
+            for match in self.matches:
+                if match.status != "completed" or match.winner_id is None:
+                    continue
+                if {match.player1_id, match.player2_id} <= tied:
+                    scores[match.winner_id][0] += 1
+                    for pid, opponent in ((match.player1_id, match.player2_id), (match.player2_id, match.player1_id)):
+                        scores[pid][1] += self.match_score(match, pid) - self.match_score(match, opponent)
+            groups = partition(ids, lambda pid: tuple(scores[pid]))
+            # Reapply both criteria using only the still-tied subset. Stop if
+            # no split occurred, including a complete three-way cycle.
+            if len(groups) == 1:
+                return groups
+            return [subgroup for group in groups for subgroup in direct_groups(group)]
+
+        ordered = []
+        for group in partition(rows, lambda pid: (rows[pid]["wins"], rows[pid]["game_difference"])):
+            for tied in direct_groups(group):
+                rank = len(ordered) + 1
+                for pid in sorted(tied, key=lambda pid: (rows[pid]["display_name"].casefold(), pid)):
+                    rows[pid]["rank"] = rank
+                    ordered.append(rows[pid])
         return ordered
 
     def league_table(self) -> dict[str, Any]:
@@ -601,12 +667,20 @@ class TournamentRun:
                 player2_result = "win" if match.winner_id == match.player2_id else "loss"
                 player1_label = "○" if player1_result == "win" else "×"
                 player2_label = "○" if player2_result == "win" else "×"
+                if self.wins_required > 1:
+                    left, right = self.match_score(match, match.player1_id), self.match_score(match, match.player2_id)
+                    player1_label += f" {left}–{right}"
+                    player2_label += f" {right}–{left}"
             elif match.status == "skipped":
                 player1_result = player2_result = "skipped"
                 player1_label = player2_label = "–"
             elif match.status == "playing":
                 player1_result = player2_result = "playing"
                 player1_label = player2_label = "対戦中"
+                if self.wins_required > 1:
+                    left, right = self.match_score(match, match.player1_id), self.match_score(match, match.player2_id)
+                    player1_label += f" {left}–{right}"
+                    player2_label += f" {right}–{left}"
             elif match.status == "called":
                 player1_result = player2_result = "called"
                 player1_label = player2_label = "呼出中"
@@ -651,10 +725,11 @@ class TournamentRun:
             "registration_closes_at": isoformat(self.registration_closes_at or self.starts_at),
             "registration_open": self.registration_open(),
             "retirement_grace_seconds": RETIREMENT_GRACE_SECONDS,
-            "ranking_basis": "wins",
+            "ranking_basis": "match_wins_game_difference_recursive_head_to_head",
             "title": self.title,
             "room_id": self.room_id,
             "rule_key": self.rule_key,
+            "wins_required": self.wins_required,
             "registration_opens_at": isoformat(self.registration_opens_at),
             "starts_at": isoformat(self.starts_at),
             "status": self.status,
@@ -690,6 +765,7 @@ class TournamentRun:
             "title": self.title,
             "room_id": self.room_id,
             "rule_key": self.rule_key,
+            "wins_required": self.wins_required,
             "registration_opens_at": isoformat(self.registration_opens_at),
             "starts_at": isoformat(self.starts_at),
             "max_participants": self.max_participants,
@@ -711,6 +787,7 @@ class TournamentRun:
             title=str(value["title"]),
             room_id=str(value["room_id"]),
             rule_key=str(value["rule_key"]),
+            wins_required=int(value.get("wins_required", 1)),
             registration_opens_at=parse_datetime(value["registration_opens_at"]),
             starts_at=parse_datetime(value["starts_at"]),
             pairing_mode=str(value.get("pairing_mode", "rounds")),
