@@ -122,6 +122,7 @@ PLUS_TOURNAMENT_RULE_KEYS = frozenset(
     and not preset.multiplayer_enabled
 )
 TOURNAMENT_RUNS_BY_ROOM: dict[str, TournamentRun] = {}
+TOURNAMENT_QUEUED_RUNS: dict[str, TournamentRun] = {}
 TOURNAMENT_SESSIONS: dict[str, "Player"] = {}
 TOURNAMENT_MATCH_ROOMS: dict[str, "Room"] = {}
 TOURNAMENT_MATCH_VIEWERS: dict[str, set["Player"]] = {}
@@ -156,7 +157,11 @@ async def lifespan(_app):
     await RECRUITMENT_STORE.connect()
     await COMPOSITE_PRACTICE_STATS_STORE.connect()
     for run in await TOURNAMENT_STORE.load_active_runs():
-        TOURNAMENT_RUNS_BY_ROOM[run.room_id] = run
+        if not run.queued and run.room_id not in TOURNAMENT_RUNS_BY_ROOM:
+            TOURNAMENT_RUNS_BY_ROOM[run.room_id] = run
+        else:
+            run.queued = True
+            TOURNAMENT_QUEUED_RUNS[run.run_id] = run
     TOURNAMENT_SCHEDULER_TASK = asyncio.create_task(tournament_scheduler_loop())
     if WEBHOOK_URL:
         RECRUITMENT_NOTIFICATION_TASK = asyncio.create_task(
@@ -860,6 +865,75 @@ async def recruitment_payload(
     return payload
 
 
+def tournament_reservations(room_id: str = TOURNAMENT_ROOM_ID) -> list[dict]:
+    return [
+        {
+            "run_id": run.run_id, "title": run.title, "status": run.status,
+            "rule": tournament_rule_payload(PRESETS[run.rule_key]),
+            "wins_required": run.wins_required,
+            "registration_opens_at": run.registration_opens_at.isoformat(),
+            "starts_at": run.starts_at.isoformat(), "queued": True,
+        }
+        for run in sorted(TOURNAMENT_QUEUED_RUNS.values(), key=lambda item: (item.starts_at, item.created_at, item.run_id))
+        if run.room_id == room_id and run.status in {"scheduled", "registration"}
+    ]
+
+
+def find_admin_tournament(data: dict) -> Optional[TournamentRun]:
+    room_id = str(data.get("room_id", TOURNAMENT_ROOM_ID))
+    current = TOURNAMENT_RUNS_BY_ROOM.get(room_id)
+    run_id = data.get("run_id")
+    if not run_id or current is not None and current.run_id == run_id:
+        return current
+    queued = TOURNAMENT_QUEUED_RUNS.get(str(run_id))
+    return queued if queued is not None and queued.room_id == room_id else None
+
+
+async def promote_tournament_reservation(room_id: str, now: datetime) -> Optional[TournamentRun]:
+    current = TOURNAMENT_RUNS_BY_ROOM.get(room_id)
+    if current is not None:
+        if current.status in {"registration", "running"}:
+            return current
+        if any(room.tournament_run_id == current.run_id for room in TOURNAMENT_MATCH_ROOMS.values()):
+            return current
+    candidates = [run for run in TOURNAMENT_QUEUED_RUNS.values() if run.room_id == room_id and run.status == "scheduled"]
+    if current is not None and current.status == "scheduled":
+        candidates.append(current)
+    if not candidates:
+        return current
+    next_run = min(candidates, key=lambda run: (run.starts_at, run.created_at, run.run_id))
+    if next_run is current:
+        return current
+    if current is not None and current.status == "scheduled":
+        current.queued = True
+        TOURNAMENT_QUEUED_RUNS[current.run_id] = current
+        await TOURNAMENT_STORE.save_run(current)
+    TOURNAMENT_QUEUED_RUNS.pop(next_run.run_id, None)
+    if next_run.registration_opens_at < now:
+        delay = now - next_run.registration_opens_at
+        next_run.registration_opens_at += delay
+        next_run.starts_at += delay
+        if next_run.registration_closes_at is not None:
+            next_run.registration_closes_at += delay
+        next_run.schedule_delay_seconds += delay.total_seconds()
+        await TOURNAMENT_STORE.audit(next_run.run_id, actor="system", action="delay_schedule", details={"delay_seconds": delay.total_seconds()})
+    next_run.queued = False
+    TOURNAMENT_RUNS_BY_ROOM[room_id] = next_run
+    lobby = rooms[room_id]
+    lobby.rule = PRESETS[next_run.rule_key]
+    lobby.tournament_run_id = next_run.run_id
+    if current is not None and current.status in {"finished", "cancelled"}:
+        for pid in current.participants:
+            session = TOURNAMENT_SESSIONS.pop(pid, None)
+            if session is not None:
+                session.tournament_participant_id = None
+                clear_tournament_match_view(session)
+    await TOURNAMENT_STORE.save_run(next_run)
+    await publish_tournament_state(next_run)
+    await lobby.update_room_status()
+    return next_run
+
+
 def tournament_public_payload(
     run: Optional[TournamentRun],
     viewer_participant_id: Optional[str] = None,
@@ -875,6 +949,7 @@ def tournament_public_payload(
             "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
             "turn_time_limit_seconds": TURN_TIME_LIMIT_SECONDS,
             "available_rules": tournament_rule_catalog(),
+            "reservations": tournament_reservations(),
         }
     payload = {
         **run.public_payload(viewer_participant_id=viewer_participant_id),
@@ -887,6 +962,7 @@ def tournament_public_payload(
         "playing_disconnect_grace_seconds": playing_disconnect_grace_seconds(),
         "waiting_disconnect_grace_seconds": waiting_disconnect_grace_seconds(),
         "turn_time_limit_seconds": TURN_TIME_LIMIT_SECONDS,
+        "reservations": tournament_reservations(run.room_id),
     }
     payload["active_matches"] = [
         tournament_match_live_summary(run, match.match_id)
@@ -1512,16 +1588,17 @@ async def send_tournament_status(player: "Player") -> None:
 
 
 async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
+    async with TOURNAMENT_LOCK:
+        return await schedule_tournament_locked(data, actor)
+
+
+async def schedule_tournament_locked(data: dict, actor: str) -> TournamentRun:
     rule_key = str(data.get("rule_key", "std-11-n-c"))
     if rule_key not in PLUS_TOURNAMENT_RULE_KEYS:
         raise ValueError("plus大会で使用できないルールです。")
     room_id = str(data.get("room_id", TOURNAMENT_ROOM_ID))
     if room_id != TOURNAMENT_ROOM_ID:
         raise ValueError("現在指定できる大会ルームはplus大会ルームのみです。")
-    existing = TOURNAMENT_RUNS_BY_ROOM.get(room_id)
-    if existing and existing.status in {"scheduled", "registration", "running"}:
-        raise ValueError("この部屋には進行中または予定済みの大会があります。")
-
     run = TournamentRun.create(
         format_key=str(data.get("format_key", "plus-round-robin-v1")),
         title=str(data.get("title", "素数大富豪＋ 定期大会")),
@@ -1534,10 +1611,18 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
         pairing_mode=str(data.get("pairing_mode", "rounds")),
         registration_closes_at=parse_datetime(data["registration_closes_at"]) if data.get("registration_closes_at") else None,
     )
-    TOURNAMENT_RUNS_BY_ROOM[room_id] = run
     room = rooms[room_id]
-    room.rule = PRESETS[rule_key]
-    room.tournament_run_id = run.run_id
+    existing = TOURNAMENT_RUNS_BY_ROOM.get(room_id)
+    if existing is not None and (existing.status in {"scheduled", "registration", "running"} or any(
+        match_room.tournament_run_id == existing.run_id for match_room in TOURNAMENT_MATCH_ROOMS.values()
+    )) or any(item.room_id == room_id for item in TOURNAMENT_QUEUED_RUNS.values()):
+        run.queued = True
+        run.status = "scheduled"
+        TOURNAMENT_QUEUED_RUNS[run.run_id] = run
+    else:
+        TOURNAMENT_RUNS_BY_ROOM[room_id] = run
+        room.rule = PRESETS[rule_key]
+        room.tournament_run_id = run.run_id
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(run.run_id, actor=actor, action="schedule", details={
         "title": run.title,
@@ -1551,10 +1636,89 @@ async def schedule_tournament(data: dict, actor: str) -> TournamentRun:
     })
     await room.log_chat(f"大会「{run.title}」の日程が設定されました。")
     await notify_tournament_discord(run, "scheduled")
+    await promote_tournament_reservation(room_id, utc_now())
     if run.status == "registration":
         await notify_tournament_discord(run, "registration")
     await room.update_room_status()
     return run
+
+
+async def cancel_tournament(data: dict, actor: str) -> TournamentRun:
+    async with TOURNAMENT_LOCK:
+        if not data.get("run_id"):
+            raise ValueError("中止する開催回を指定してください。")
+        run = find_admin_tournament(data)
+        if run is None:
+            raise ValueError("大会が見つかりません。最新の一覧を取得してください。")
+        if run.status not in {"scheduled", "registration", "running"} or run.cancellation_requested_at is not None:
+            raise ValueError("この大会は中止できません。")
+        if run.status == "running":
+            run.cancellation_requested_at = utc_now()
+            try:
+                await TOURNAMENT_STORE.save_run(run)
+            except Exception:
+                run.cancellation_requested_at = None
+                raise
+            await TOURNAMENT_STORE.audit(run.run_id, actor=actor, action="request_tournament_cancellation", details={"title": run.title})
+            await rooms[run.room_id].log_chat(f"大会「{run.title}」の中止を受け付けました。進行中の対局終了後に中止し、新しい対局は開始しません。")
+            await cancellation_tournament_tick(run, utc_now())
+            await publish_tournament_state(run)
+            return run
+        previous = (run.status, run.finished_at, run.queued)
+        run.status = "cancelled"
+        run.finished_at = utc_now()
+        run.queued = False
+        try:
+            await TOURNAMENT_STORE.save_run(run)
+        except Exception:
+            run.status, run.finished_at, run.queued = previous
+            raise
+        TOURNAMENT_QUEUED_RUNS.pop(run.run_id, None)
+        await TOURNAMENT_STORE.audit(run.run_id, actor=actor, action="cancel_tournament", details={"title": run.title})
+        await rooms[run.room_id].log_chat(f"大会「{run.title}」は管理者により中止されました。")
+        await notify_tournament_discord(run, "cancelled", reason="管理者により中止されました。")
+        await publish_tournament_state(TOURNAMENT_RUNS_BY_ROOM.get(run.room_id) or run)
+        await promote_tournament_reservation(run.room_id, utc_now())
+        await rooms[run.room_id].update_room_status()
+        return run
+
+
+async def cancellation_tournament_tick(run: TournamentRun, now: datetime) -> None:
+    if run.status != "running" or run.cancellation_requested_at is None:
+        return
+    before = run.to_dict()
+    for match in run.matches:
+        room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
+        if room is not None and (room.state == "playing" or room.start_in_progress):
+            ids = (match.player1_id, match.player2_id)
+            online = [tournament_session_online(pid, room) for pid in ids]
+            expired = [tournament_participant_disconnect_expired(TOURNAMENT_SESSIONS.get(pid), connected, now,
+                       playing_disconnect_grace_seconds(), match.started_at) for pid, connected in zip(ids, online)]
+            if expired[0] and online[1] or expired[1] and online[0] or all(expired):
+                winner = ids[1] if expired[0] and online[1] else ids[0] if expired[1] and online[0] else None
+                await resolve_tournament_match(run, match.match_id, winner, resolution="forfeit" if winner else "auto_skip", actor="system", advance=False)
+            continue
+        if room is not None and now < getattr(room, "tournament_next_game_at", now):
+            continue
+        if match.status not in {"completed", "skipped"}:
+            run.skip_cancelled_match(match)
+            await close_tournament_match_room(run, match.match_id, winner_id=match.winner_id, broadcast_result=False)
+        elif room is not None:
+            await close_tournament_match_room(run, match.match_id, winner_id=match.winner_id, broadcast_result=False)
+    if run.to_dict() != before:
+        await TOURNAMENT_STORE.save_run(run)
+    if any(room.tournament_run_id == run.run_id for room in TOURNAMENT_MATCH_ROOMS.values()):
+        return
+    run.status = "cancelled"
+    run.finished_at = now
+    run.active_match_ids = []
+    run.current_match_id = None
+    await TOURNAMENT_STORE.save_run(run)
+    await TOURNAMENT_STORE.audit(run.run_id, actor="system", action="cancel_tournament", details={"after_current_games": True})
+    await rooms[run.room_id].log_chat(f"大会「{run.title}」は進行中の対局が終了したため中止しました。完了済みの試合結果は履歴に残ります。")
+    await notify_tournament_discord(run, "cancelled", reason="進行中の対局終了後、管理者による中止を確定しました。")
+    await publish_tournament_state(run)
+    await rooms[run.room_id].update_room_status()
 
 
 async def bind_tournament_participant(
@@ -1865,7 +2029,7 @@ async def prepare_tournament_match(
     *,
     now: Optional[datetime] = None,
 ) -> None:
-    if match is None or match.status not in {"called", "playing"}:
+    if run.cancellation_requested_at is not None or match is None or match.status not in {"called", "playing"}:
         return
     existing_room = TOURNAMENT_MATCH_ROOMS.get(match.match_id)
     if existing_room is not None and (existing_room.state == "playing" or existing_room.start_in_progress):
@@ -1934,10 +2098,13 @@ async def start_tournament_game(run, match, room, player1, player2) -> None:
     )
     await rooms[run.room_id].update_room_status()
     await room.update_room_status()
-    await start_game(room, first_player_id=first_player.id)
+    if run.cancellation_requested_at is None:
+        await start_game(room, first_player_id=first_player.id)
 
 
 async def start_or_prepare_next_tournament_match(run: TournamentRun) -> None:
+    if run.cancellation_requested_at is not None or run.status != "running":
+        return
     if run.flexible:
         await call_flexible_matches(run, utc_now())
         return
@@ -2105,7 +2272,7 @@ async def expire_flexible_participants(run: TournamentRun, now: datetime) -> Non
 
 
 async def call_flexible_matches(run: TournamentRun, now: datetime) -> None:
-    if run.status != "running":
+    if run.status != "running" or run.cancellation_requested_at is not None:
         return
     # A completed game may still be sending its result; wait until its room is closed.
     available = {pid for pid, session in TOURNAMENT_SESSIONS.items() if pid in run.participants and tournament_session_online(pid) and session.room is rooms[run.room_id]}
@@ -2207,6 +2374,8 @@ async def record_tournament_game_result(room: Room, winner_player: Optional["Pla
     was_finished = run.status == "finished"
     if not run.record_game(match.match_id, participant_id, room.game_id):
         return
+    if run.cancellation_requested_at is not None:
+        room.tournament_next_game_at = utc_now() + timedelta(seconds=1.5)
     finished_now = not was_finished and run.status == "finished"
     await TOURNAMENT_STORE.save_run(run)
     await TOURNAMENT_STORE.audit(run.run_id, actor="system", action="game_result", details={
@@ -2227,7 +2396,7 @@ async def record_tournament_game_result(room: Room, winner_player: Optional["Pla
     asyncio.create_task(delayed_tournament_match_completion(
         run,
         match.match_id,
-        participant_id,
+        match.winner_id,
         1.5,
         announce_finished=finished_now,
     ))
@@ -2242,13 +2411,20 @@ async def delayed_tournament_match_completion(
     announce_finished: bool = False,
 ) -> None:
     await asyncio.sleep(delay_seconds)
+    async with TOURNAMENT_LOCK:
+        await complete_tournament_match_after_delay(run, match_id, winner_id, announce_finished)
+
+
+async def complete_tournament_match_after_delay(run, match_id, winner_id, announce_finished) -> None:
     await close_tournament_match_room(
         run,
         match_id,
         winner_id=winner_id,
         broadcast_result=False,
     )
-    if announce_finished:
+    if run.cancellation_requested_at is not None:
+        await cancellation_tournament_tick(run, utc_now())
+    elif announce_finished:
         await announce_tournament_finished(run)
     elif run.status != "finished":
         await start_or_prepare_next_tournament_match(run)
@@ -2314,7 +2490,12 @@ async def expire_disconnected_room_sessions(now: Optional[datetime] = None) -> N
 async def tournament_scheduler_tick(now: Optional[datetime] = None) -> None:
     current = now or utc_now()
     async with TOURNAMENT_LOCK:
+        for room_id in {run.room_id for run in TOURNAMENT_QUEUED_RUNS.values()}:
+            await promote_tournament_reservation(room_id, current)
         for run in list(TOURNAMENT_RUNS_BY_ROOM.values()):
+            if run.cancellation_requested_at is not None and run.status == "running":
+                await cancellation_tournament_tick(run, current)
+                continue
             old_status = run.status
             transition = run.advance_clock(now=current)
             room = rooms.get(run.room_id)
@@ -6192,14 +6373,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 await player.send_json({
                     "type": "tournament_admin_result",
                     "action": "schedule",
-                    "tournament": tournament_public_payload(run),
+                    "tournament": tournament_public_payload(TOURNAMENT_RUNS_BY_ROOM.get(run.room_id)),
+                    "scheduled_run_id": run.run_id,
+                })
+                continue
+            elif msg_type == "tournament_admin_cancel":
+                if not tournament_admin_authorized(data.get("admin_token")):
+                    await player.send_json({"type": "error", "code": "tournament_admin", "message": "管理トークンが正しくありません。"})
+                    continue
+                try:
+                    cancelled = await cancel_tournament(data, actor="admin")
+                except (TypeError, ValueError) as exc:
+                    await player.send_json({"type": "error", "code": "tournament_admin", "message": str(exc)})
+                    continue
+                except Exception:
+                    await player.send_json({"type": "error", "code": "tournament_admin", "message": "中止処理を完了できませんでした。最新の大会状態を確認してください。"})
+                    continue
+                await player.send_json({
+                    "type": "tournament_admin_result", "action": "cancel", "cancelled_run_id": cancelled.run_id,
+                    "tournament": tournament_public_payload(TOURNAMENT_RUNS_BY_ROOM.get(cancelled.room_id)),
                 })
                 continue
             elif msg_type in {"tournament_admin_resolve", "tournament_admin_skip"}:
                 if not tournament_admin_authorized(data.get("admin_token")):
                     await player.send_json({"type": "error", "code": "tournament_admin", "message": "管理トークンが正しくありません。"})
                     continue
-                run = TOURNAMENT_RUNS_BY_ROOM.get(str(data.get("room_id", TOURNAMENT_ROOM_ID)))
+                run = find_admin_tournament(data)
                 if run is None:
                     await player.send_json({"type": "error", "code": "tournament_admin", "message": "大会が見つかりません。"})
                     continue

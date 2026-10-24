@@ -195,6 +195,9 @@ class TournamentRun:
     pairing_mode: str = "rounds"
     registration_closes_at: Optional[datetime] = None
     wins_required: int = 1
+    queued: bool = False
+    schedule_delay_seconds: float = 0
+    cancellation_requested_at: Optional[datetime] = None
 
     @classmethod
     def create(
@@ -249,6 +252,8 @@ class TournamentRun:
         return self.pairing_mode == "flexible"
 
     def registration_open(self, *, now: Optional[datetime] = None) -> bool:
+        if self.cancellation_requested_at is not None:
+            return False
         current = now or utc_now()
         return self.status in {"registration", "running"} and self.registration_opens_at <= current < (self.registration_closes_at or self.starts_at) and (self.flexible or self.status == "registration")
 
@@ -326,6 +331,8 @@ class TournamentRun:
         participant.withdrawn = True
 
     def advance_clock(self, *, now: Optional[datetime] = None) -> Optional[str]:
+        if self.queued:
+            return None
         current = now or utc_now()
         old_status = self.status
         if self.status == "scheduled" and current >= self.registration_opens_at:
@@ -406,7 +413,7 @@ class TournamentRun:
         return self.settle_retired_pairs(now=current)
 
     def call_available_matches(self, available_ids: set[str], *, now: Optional[datetime] = None, ready_wait_seconds: int = 60) -> list[TournamentMatch]:
-        if not self.flexible or self.status != "running":
+        if self.cancellation_requested_at is not None or not self.flexible or self.status != "running":
             return []
         current = now or utc_now()
         busy = {pid for match in self.current_matches for pid in (match.player1_id, match.player2_id)}
@@ -440,7 +447,7 @@ class TournamentRun:
         now: Optional[datetime] = None,
         ready_wait_seconds: int = 60,
     ) -> Optional[TournamentMatch]:
-        if self.status != "running" or self.current_match_id is not None:
+        if self.cancellation_requested_at is not None or self.status != "running" or self.current_match_id is not None:
             return None
         match = self.next_pending_match()
         if match is None:
@@ -461,7 +468,7 @@ class TournamentRun:
         now: Optional[datetime] = None,
         ready_wait_seconds: int = 60,
     ) -> list[TournamentMatch]:
-        if self.flexible or self.status != "running" or self.current_matches:
+        if self.cancellation_requested_at is not None or self.flexible or self.status != "running" or self.current_matches:
             return []
         pending = [match for match in self.matches if match.status == "pending"]
         if not pending:
@@ -523,7 +530,19 @@ class TournamentRun:
         match.game_wins[winner_id] = match.game_wins.get(winner_id, 0) + 1
         if match.game_wins[winner_id] >= self.wins_required:
             self.resolve_match(match_id, winner_id, resolution="game")
+        elif self.cancellation_requested_at is not None:
+            self.skip_cancelled_match(match)
         return True
+
+    def skip_cancelled_match(self, match: TournamentMatch) -> None:
+        if match.status in TERMINAL_MATCH_STATUSES:
+            return
+        match.status = "skipped"
+        match.resolution = "tournament_cancelled"
+        match.completed_at = utc_now()
+        self.active_match_ids = [mid for mid in self.active_match_ids if mid != match.match_id]
+        if self.current_match_id == match.match_id:
+            self.current_match_id = self.active_match_ids[0] if self.active_match_ids else None
 
     def match_score(self, match: TournamentMatch, participant_id: str) -> int:
         if match.game_wins:
@@ -562,6 +581,8 @@ class TournamentRun:
         return match
 
     def finish_if_complete(self, *, now: Optional[datetime] = None) -> bool:
+        if self.cancellation_requested_at is not None:
+            return False
         if self.status != "running":
             return False
         current = now or utc_now()
@@ -730,6 +751,9 @@ class TournamentRun:
             "room_id": self.room_id,
             "rule_key": self.rule_key,
             "wins_required": self.wins_required,
+            "queued": self.queued,
+            "schedule_delay_seconds": self.schedule_delay_seconds,
+            "cancellation_requested_at": isoformat(self.cancellation_requested_at),
             "registration_opens_at": isoformat(self.registration_opens_at),
             "starts_at": isoformat(self.starts_at),
             "status": self.status,
@@ -766,6 +790,9 @@ class TournamentRun:
             "room_id": self.room_id,
             "rule_key": self.rule_key,
             "wins_required": self.wins_required,
+            "queued": self.queued,
+            "schedule_delay_seconds": self.schedule_delay_seconds,
+            "cancellation_requested_at": isoformat(self.cancellation_requested_at),
             "registration_opens_at": isoformat(self.registration_opens_at),
             "starts_at": isoformat(self.starts_at),
             "max_participants": self.max_participants,
@@ -788,6 +815,9 @@ class TournamentRun:
             room_id=str(value["room_id"]),
             rule_key=str(value["rule_key"]),
             wins_required=int(value.get("wins_required", 1)),
+            queued=bool(value.get("queued", False)),
+            schedule_delay_seconds=float(value.get("schedule_delay_seconds", 0)),
+            cancellation_requested_at=parse_datetime(value["cancellation_requested_at"]) if value.get("cancellation_requested_at") else None,
             registration_opens_at=parse_datetime(value["registration_opens_at"]),
             starts_at=parse_datetime(value["starts_at"]),
             pairing_mode=str(value.get("pairing_mode", "rounds")),
