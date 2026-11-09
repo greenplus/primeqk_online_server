@@ -109,6 +109,8 @@ COMPOSITE_PRACTICE_STATS_STORE = CompositePracticeStatsStore()
 TOURNAMENT_ADMIN_TOKEN = os.getenv("TOURNAMENT_ADMIN_TOKEN", "").strip()
 COMPOSITE_PRACTICE_ACCESS_TOKEN = os.getenv("COMPOSITE_PRACTICE_ACCESS_TOKEN", "").strip()
 COMPOSITE_PRACTICE_ROOM_ID = "composite_practice_1"
+PRIVATE_ROOMS_ACCESS_TOKEN = os.getenv("PRIVATE_ROOMS_ACCESS_TOKEN", "").strip()
+PRIVATE_ROOM_IDS = frozenset(f"private_{index}" for index in range(1, 4))
 COMPOSITE_PRACTICE_ACCESS_SCOPE = "composite_practice_owner"
 TOURNAMENT_ROOM_ID = "plus_tournament_1"
 PLUS_TOURNAMENT_RULE_KEYS = frozenset(
@@ -771,6 +773,7 @@ ROOM_DESCRIPTIONS = {
         "全手札を使う通常の合法手で上がれます。57と1729は合成数出しでのみ発動します。"
     ),
 }
+ROOM_CONFIG.extend((rid, PRESETS["std-11-n-c"], "Private") for rid in sorted(PRIVATE_ROOM_IDS))
 rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
 ROOM_CATEGORIES_BY_CLIENT_SURFACE = {
@@ -778,6 +781,7 @@ ROOM_CATEGORIES_BY_CLIENT_SURFACE = {
     "plus": frozenset({"Classic", "Plus"}),
     "neo": frozenset({"Neo"}),
     "plus_practice": frozenset({"CompositePractice"}),
+    "plus_private": frozenset({"Private"}),
 }
 
 WEBSOCKET_CLIENT_SURFACE_BY_PATH = {
@@ -785,6 +789,7 @@ WEBSOCKET_CLIENT_SURFACE_BY_PATH = {
     "/ws/plus": "plus",
     "/ws/neo": "neo",
     "/ws/plus-practice": "plus_practice",
+    "/ws/plus-private": "plus_private",
 }
 
 
@@ -797,20 +802,23 @@ def room_is_available_to_client(room: Room, client_surface: Optional[str]) -> bo
 def rooms_for_client(
     client_surface: Optional[str] = None,
     practice_authorized: bool = False,
+    private_authorized: bool = False,
 ) -> dict[str, Room]:
     return {
         room_id: room
         for room_id, room in rooms.items()
         if room_is_available_to_client(room, client_surface)
         and (room_id != COMPOSITE_PRACTICE_ROOM_ID or practice_authorized)
+        and (room_id not in PRIVATE_ROOM_IDS or private_authorized)
     }
 
 
 def room_counts_payload(
     client_surface: Optional[str] = None,
     practice_authorized: bool = False,
+    private_authorized: bool = False,
 ) -> dict:
-    visible_rooms = rooms_for_client(client_surface, practice_authorized=practice_authorized)
+    visible_rooms = rooms_for_client(client_surface, practice_authorized=practice_authorized, private_authorized=private_authorized)
     return {
         "type": "room_counts",
         "client_surface": client_surface,
@@ -1465,6 +1473,7 @@ async def bind_room_resume_session(
     session.disconnected_at = None
     session.client_surface = incoming.client_surface
     session.composite_practice_authorized = incoming.composite_practice_authorized
+    session.private_rooms_authorized = incoming.private_rooms_authorized
     if previous_ws is not None and previous_ws is not session.ws:
         try:
             await previous_ws.close(code=4001)
@@ -1550,14 +1559,24 @@ def composite_practice_authorized(value) -> bool:
     )
 
 
+def private_rooms_authorized(value) -> bool:
+    return bool(
+        PRIVATE_ROOMS_ACCESS_TOKEN
+        and isinstance(value, str)
+        and secrets.compare_digest(value, PRIVATE_ROOMS_ACCESS_TOKEN)
+    )
+
+
 def player_can_access_room(player: "Player", room: Room) -> bool:
+    if room.room_id in PRIVATE_ROOM_IDS:
+        return bool(getattr(player, "private_rooms_authorized", False))
     if room.room_id != COMPOSITE_PRACTICE_ROOM_ID:
         return True
     return bool(getattr(player, "composite_practice_authorized", False))
 
 
 def room_discord_join_notifications_enabled(room: Room) -> bool:
-    return room.room_id != COMPOSITE_PRACTICE_ROOM_ID
+    return room.room_id != COMPOSITE_PRACTICE_ROOM_ID and room.room_id not in PRIVATE_ROOM_IDS
 
 
 async def composite_practice_stats_payload() -> dict:
@@ -1797,6 +1816,8 @@ async def register_or_resume_tournament_player(
     player: "Player",
     data: dict,
 ) -> "Player":
+    if data.get("publish_name") is not True:
+        raise ValueError("大会に参加するには「名前を公開」をオンにしてください。")
     run = tournament_for_player(player)
     if run is None:
         raise ValueError("現在この部屋で受付中の大会はありません。")
@@ -2727,6 +2748,7 @@ class Player:
         self.room_session_room_id: Optional[str] = None
         self.client_surface = "legacy"
         self.composite_practice_authorized = False
+        self.private_rooms_authorized = False
         self.small_finish_index = registered_prime_template_index((), max_cards=3)
 
     async def send_json(self, message: dict):
@@ -6192,6 +6214,7 @@ async def handle_end_turn_alternation_series(player: "Player") -> None:
 
 @app.websocket("/ws/neo")
 @app.websocket("/ws/plus")
+@app.websocket("/ws/plus-private")
 @app.websocket("/ws/plus-practice")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -6210,6 +6233,25 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             msg_type = data.get("type")
             room_id = player.room.room_id if player.room else None
+
+            if client_surface == "plus_private":
+                if msg_type == "authorize_private_rooms":
+                    authorized = private_rooms_authorized(data.get("access_token"))
+                    player.private_rooms_authorized = authorized
+                    await player.send_json({
+                        "type": "private_rooms_authorization",
+                        "authorized": authorized,
+                        "message": "認証しました。" if authorized else "合言葉が正しくありません。",
+                    })
+                    if authorized:
+                        await player.send_json(room_counts_payload(client_surface, private_authorized=True))
+                    continue
+                if not player.private_rooms_authorized:
+                    await player.send_json({
+                        "type": "error", "code": "private_authorization_required",
+                        "message": "先にプライベートルームの認証を行ってください。",
+                    })
+                    continue
 
             if (
                 client_surface == "plus_practice"
@@ -6497,6 +6539,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json(room_counts_payload(
                     client_surface,
                     practice_authorized=player.composite_practice_authorized,
+                    private_authorized=player.private_rooms_authorized,
                 ))
 
             elif msg_type == "get_recruitments":
@@ -6533,6 +6576,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "recruitment_error",
                         "code": "unavailable",
                         "message": "このクライアントでは募集掲示板を利用できません。",
+                    })
+                    continue
+                if data.get("publish_name") is not True:
+                    await player.send_json({
+                        "type": "recruitment_error",
+                        "code": "name_publication_required",
+                        "message": "募集を投稿するには「名前を公開」をオンにしてください。",
                     })
                     continue
                 try:
@@ -6666,7 +6716,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 同期処理の後で、バックグラウンドに通知タスクを投げる
                 if room_discord_join_notifications_enabled(room):
                     asyncio.create_task(
-                        notify_discord_join(player.name, room)
+                        notify_discord_join(player.name if data.get("publish_name") is True else "誰か", room)
                     )
 
 
@@ -6823,8 +6873,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     await pass_turn_for_player(player, room)
 
             elif msg_type == "join_global_chat":
-                if client_surface == "plus_practice":
-                    await player.send_json({"type": "error", "message": "練習ページではグローバルチャットを利用できません。"})
+                if client_surface in {"plus_practice", "plus_private"}:
+                    await player.send_json({"type": "error", "message": "非公開ページではグローバルチャットを利用できません。"})
                     continue
                 await subscribe_global_chat(player)
 
@@ -6832,7 +6882,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await unsubscribe_global_chat(player)
 
             elif msg_type == "global_chat":
-                if client_surface == "plus_practice":
+                if client_surface in {"plus_practice", "plus_private"}:
                     await player.send_json({"type": "error", "message": "練習ページではグローバルチャットを利用できません。"})
                     continue
                 await handle_global_chat_message(player, data)
@@ -7684,6 +7734,7 @@ async def leave_room(player, notify_client: bool = True, *, disconnected: bool =
             await player.send_json(room_counts_payload(
                 player.client_surface,
                 practice_authorized=player.composite_practice_authorized,
+                private_authorized=player.private_rooms_authorized,
             ))
         return
 
@@ -7746,6 +7797,7 @@ async def leave_room(player, notify_client: bool = True, *, disconnected: bool =
         await player.send_json(room_counts_payload(
             player.client_surface,
             practice_authorized=player.composite_practice_authorized,
+            private_authorized=player.private_rooms_authorized,
         ))
     if run is not None and tournament_match is not None and run.status == "running":
         await start_or_prepare_next_tournament_match(run)
