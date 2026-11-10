@@ -11,7 +11,8 @@ from itertools import combinations
 
 import cpu_player as diamond
 from .master_budget import check
-from .opening_master import CAPACITY, ZERO, Move, Template, _realizations, bind_move, counts, hand_counts, subtract
+from .opening_master import CAPACITY, ZERO, Move, Template, _realizations, bind_move, counts, hand_counts, physically_possible, subtract
+from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
 from .post_all_out_master import knowledge_key
 from .revolution_master import catalog
 from .after_all_out_planner import public_room, next_known
@@ -42,13 +43,15 @@ def realizations(template, hand):
         return
     requirement = counts(ranks)
     missing = sum(max(0, requirement[r]-hand[r]) for r in range(1, 14))
-    if missing > hand[0]:
+    spare_jokers = hand[0] - requirement[0]
+    if missing > spare_jokers:
         return
     visible = counts(template.visible)
     size = len(template.visible)
     seen = set()
-    for joker_count in range(missing, min(hand[0], len(ranks))+1):
-        for omitted in combinations(range(len(ranks)), joker_count):
+    natural_indices = tuple(i for i, rank in enumerate(ranks) if rank)
+    for joker_count in range(missing, min(spare_jokers, len(natural_indices))+1):
+        for omitted in combinations(natural_indices, joker_count):
             need = list(requirement)
             visible_need = list(visible)
             for i in omitted:
@@ -130,6 +133,9 @@ class ControlSearch:
         self.cpu, self.room = cpu, room
         self.hand = hand_counts(cpu.hand)
         self.reverse = bool(room.reverse_order)
+        self.alpha_replies = (trump_replies(*knowledge_key(cpu, room))
+                              if not self.reverse and getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY
+                              else None)
         self.nodes = 0
         self.failed = set()
         self.fit = {}
@@ -261,6 +267,10 @@ class ControlSearch:
             return False
         if move.size > opponent:
             return True
+        if (self.alpha_replies is not None and move.template.kind == 'prime'
+                and (move.size, move.value) in TRUMP_VALUES):
+            return not any(value > move.value and sum(need) <= opponent and physically_possible(need, pool)
+                           for value, need in self.alpha_replies.get(move.size, ()))
         bound = numerical_bound(pool, move.size, self.reverse)
         return bound is not None and (bound >= move.value if self.reverse else bound <= move.value)
 
@@ -379,6 +389,7 @@ def choose_public_control(cpu, room):
         return draw
     sequence = search.search()
     cpu.master_public_control_trace = dict(reason='proved' if sequence else 'no_plan', nodes=search.nodes,
-        opponent_model='unrestricted_numeric_bound', reverse=bool(room.reverse_order),
+        opponent_model=('master_alpha_listed_trumps_and_numeric_bound' if search.alpha_replies is not None
+                        else 'unrestricted_numeric_bound'), reverse=bool(room.reverse_order),
         steps=[m.summary() for m in sequence] if sequence else [])
     return play(cpu, room, sequence, 'chain') if sequence else None

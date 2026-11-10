@@ -18,6 +18,7 @@ import cpu_player as diamond
 from .master_budget import check as check_master_budget
 from .move_safety import special_exposed, uses_spare_natural
 from registered_primes import registered_value_encodings
+from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
 
 ROOT = Path(__file__).resolve().parent / "data"
 TABLE = ROOT / "pure_trump_return_probabilities.csv"
@@ -244,13 +245,15 @@ def _realizations(template, hand):
         return
     requirement = counts(ranks)
     missing = sum(max(0, requirement[r] - hand[r]) for r in range(1, 14))
-    if missing > hand[0]:
+    spare_jokers = hand[0] - requirement[0]
+    if missing > spare_jokers:
         return
     # Optional X replacements must also be explored: keeping a natural face
     # card can make the other half of a plan possible. Equal-rank suits are equivalent.
     seen = set()
-    for joker_count in range(missing, min(hand[0], len(ranks)) + 1):
-        for omitted in combinations(range(len(ranks)), joker_count):
+    natural_indices = tuple(i for i, rank in enumerate(ranks) if rank)
+    for joker_count in range(missing, min(spare_jokers, len(natural_indices)) + 1):
+        for omitted in combinations(natural_indices, joker_count):
             selected = set(omitted)
             physical = tuple(0 if i in selected else r for i, r in enumerate(ranks))
             need = counts(physical)
@@ -310,8 +313,11 @@ class Evaluator:
         started = time.perf_counter()
         self.profile_ms = defaultdict(float)
         self.profile_counts = Counter()
-        self.catalog = templates(tuple(sorted(cpu.registered_primes)),
-                                 tuple(cpu.registered_composite_entries), room.rule.allow_composite)
+        knowledge = (tuple(sorted(cpu.registered_primes)),
+                     tuple(cpu.registered_composite_entries), room.rule.allow_composite)
+        self.catalog = templates(*knowledge)
+        self.alpha_replies = (trump_replies(*knowledge)
+                              if getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY else None)
         self.responses = response_signatures(self.catalog)
         self.cache = {}
         self.evaluation_cache = {}
@@ -389,6 +395,12 @@ class Evaluator:
         if key in self.certain_cache:
             return self.certain_cache[key]
         available = subtract(CAPACITY, hand)
+        if (self.alpha_replies is not None and move.template.kind == "prime"
+                and (move.size, move.value) in TRUMP_VALUES):
+            certain = not any(value > move.value and physically_possible(need, available)
+                              for value, need in self.alpha_replies.get(move.size, ()))
+            self.certain_cache[key] = certain
+            return certain
         if prime_upper_bound(available, move.size) > move.value:
             self.certain_cache[key] = False
             return False

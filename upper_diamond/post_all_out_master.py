@@ -15,6 +15,7 @@ import time
 
 import cpu_player as diamond
 from .master_budget import SearchLimit, check as check_master_budget
+from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
 from .move_safety import special_exposed, uses_spare_natural, natural_sequence
 from registered_primes import registered_value_encodings
 from .opening_master import (CAPACITY, ZERO, LABELS, Move, Plan, Template,
@@ -138,6 +139,10 @@ class Solver:
         self.policy_hash = hashlib.sha256(POLICY_PATH.read_bytes()).hexdigest()
         self.listed = {(len(token_ranks(t)), int(''.join(map(str, token_ranks(t)))))
                        for t in self.policy['trumps']}
+        self.alpha_replies = None
+        if getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY and not room.reverse_order:
+            self.listed = TRUMP_VALUES
+            self.alpha_replies = trump_replies(*self.knowledge)
         self.responses = defaultdict(list)
         unique = {(len(t.visible), t.value, counts(t.ranks),
                    t.kind == 'cut' or (t.kind == 'prime' and t.value in (57, 1729)))
@@ -283,6 +288,14 @@ class Solver:
         # and Certified tails. Knowledge alone never grants certain status.
         if self.ceiling_reason(move, held, locked=locked, limits=limits) is None:
             return False
+        if (self.alpha_replies is not None and move.template.kind == 'prime'
+                and (move.size, move.value) in self.listed):
+            available = subtract(subtract(CAPACITY, held), locked)
+            return not any(
+                (value >= move.value if inclusive else value > move.value)
+                and resource_fits(need, available, limits)
+                for value, need in self.alpha_replies.get(move.size, ())
+            )
         maximum = self.maximum_response(move.size, held, locked=locked, limits=limits)
         return maximum < move.value if inclusive else maximum <= move.value
 
@@ -517,7 +530,9 @@ class Solver:
 
     def summary(self, best):
         return dict(policy_version=self.policy['version'], policy_sha256=self.policy_hash,
-                    proof_scope='registered-knowledge', elapsed_ms=(time.perf_counter()-self.started)*1000,
+                    proof_scope=('registered-knowledge-and-master-alpha-listed-trumps'
+                                 if self.alpha_replies is not None else 'registered-knowledge'),
+                    elapsed_ms=(time.perf_counter()-self.started)*1000,
                     nodes=self.nodes, timed_out=self.timed_out, exhaustive=not self.timed_out,
                     stats=dict(self.stats), certified_plans=len(self.plans),
                     best=best.summary() if best else None,
