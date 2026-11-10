@@ -21,6 +21,7 @@ from registered_primes import (
 )
 from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from rules import PrimeRule
+from upper_diamond.master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, KKQJ_ENTRY
 
 
 Card = dict
@@ -93,7 +94,7 @@ DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "hand-advantage-lead",
     "hand-advantage-interference",
 })
-MASTER_PLANNING_CPU_KEYS = frozenset({"upper_diamond_planner", "special_diamond_planner"})
+MASTER_PLANNING_CPU_KEYS = frozenset({"upper_diamond_planner", "special_diamond_planner", MASTER_ALPHA_CPU_KEY})
 DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner"}) | MASTER_PLANNING_CPU_KEYS
 ADVANCED_PLANNING_CPU_KEYS = DIAMOND_PLANNING_CPU_KEYS | {"platinum_planner"}
 PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS = 9
@@ -3152,7 +3153,7 @@ def diamond_counter_material_signatures(token: str) -> tuple[tuple[int, ...], ..
     """Return every non-dominated face-display plus material requirement."""
     value = platinum_token_value(token)
     visible = platinum_token_ranks(token)
-    entries = generate_composite_expression_entries(
+    entries = (KKQJ_ENTRY,) if token == KKQJ_ENTRY.pattern else generate_composite_expression_entries(
         value,
         token,
         0,
@@ -3233,7 +3234,7 @@ def diamond_draw_satisfies_requirement(
 ) -> bool:
     required = Counter(signature)
     joker_count = drawn.get(0, 0)
-    deficit = sum(
+    deficit = required.pop(0, 0) + sum(
         max(0, count - drawn.get(rank, 0))
         for rank, count in required.items()
     )
@@ -3301,8 +3302,11 @@ def diamond_counter_return_probability(
         return 1.0
     if not diamond_four_candidate_uses_fixed_counter_catalog(candidate):
         return 0.0
+    catalog = DIAMOND_FOUR_COUNTER_TOKENS
+    if getattr(cpu, "cpu_key", None) == MASTER_ALPHA_CPU_KEY:
+        catalog += (KKQJ_ENTRY.pattern,)
     counter_tokens = tuple(
-        counter for counter in DIAMOND_FOUR_COUNTER_TOKENS
+        counter for counter in catalog
         if (
             platinum_token_value(counter) < value
             if getattr(room, "reverse_order", False)
@@ -9821,6 +9825,18 @@ CPU_PROFILES = {
             source="sample_key",
             load_timing="always",
             sample_key="diamond_prime_table",
+        ),
+        action_selector=choose_special_diamond_cpu_action,
+    ),
+    MASTER_ALPHA_CPU_KEY: CpuProfile(
+        key=MASTER_ALPHA_CPU_KEY,
+        label="マスターCPU-α",
+        description="マスター素数表と専用の切り札表を使う、特ダイヤCPUと同じ探索方式のCPUです。",
+        rule_keys=("std-11-n-c",),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="master_prime_table",
         ),
         action_selector=choose_special_diamond_cpu_action,
     ),

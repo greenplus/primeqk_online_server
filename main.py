@@ -15,6 +15,7 @@ from registered_primes import (
 )
 from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from cpu_player import (
+    MASTER_PLANNING_CPU_KEYS,
     CpuPlayer,
     CpuProfile,
     available_cpu_profile_payloads,
@@ -25,6 +26,7 @@ from cpu_player import (
     is_cpu_player,
     reset_cpu_game_state,
 )
+from upper_diamond.master_alpha import KKQJ_ENTRY
 from assist_recommendation import (
     RECOMMENDATION_CACHE_VERSION,
     rank_recommended_assist_candidates,
@@ -91,6 +93,7 @@ GOLD_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "gold_prime_table_memory.json"
 NEO_BEGINNER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "neo_beginner_prime_table_memory.json"
 PLATINUM_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "platinum_prime_table_memory.json"
 DIAMOND_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "diamond_prime_table_memory.json"
+MASTER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "master_prime_table_memory.json"
 COMPOSITE_PRACTICE_COUNTERMEASURES_JSON = (
     KNOWLEDGE_DIR / "composite_practice_countermeasures_v1.json"
 )
@@ -3837,7 +3840,7 @@ def record_failed_cpu_plan(player, room, consumed_cards) -> None:
             {card["card_id"] for card in consumed_cards}
             == {card["card_id"] for card in player.hand}
         )
-    if getattr(player, "cpu_key", None) in {"upper_diamond_planner", "special_diamond_planner"}:
+    if getattr(player, "cpu_key", None) in MASTER_PLANNING_CPU_KEYS:
         player.post_all_out_master_active = None
 
 
@@ -3940,6 +3943,13 @@ REGISTERED_SAMPLE_DEFS = {
         "prime_json": DIAMOND_PRIME_TABLE_JSON,
         "composite_text": None,
     },
+    "master_prime_table": {
+        "label": "マスター素数表",
+        "prime_json": MASTER_PRIME_TABLE_JSON,
+        "composite_text": None,
+        "extra_composite_entries": (KKQJ_ENTRY,),
+        "visible": False,
+    },
     "silver_prime_table": {
         "label": "サンプル：シルバー素数表",
         "prime_json": SILVER_PRIME_TABLE_JSON,
@@ -3989,6 +3999,7 @@ def load_sample_memory_from_files(
     prime_json: Path,
     composite_text_path: Optional[Path] = None,
     supplemental_composite_json: Optional[Path] = None,
+    extra_composite_entries: tuple = (),
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
     if not prime_json.exists():
         return (), (), (), "", ""
@@ -4017,7 +4028,10 @@ def load_sample_memory_from_files(
     return (
         prime_result.prime_values,
         composite_result.composite_values,
-        composite_result.entries,
+        composite_result.entries + tuple(
+            entry for entry in extra_composite_entries
+            if entry.value in composite_result.composite_values
+        ),
         prime_text,
         composite_text,
     )
@@ -4034,6 +4048,7 @@ def load_registered_samples() -> dict:
                 definition["prime_json"],
                 definition.get("composite_text"),
                 definition.get("supplemental_composite_json"),
+                definition.get("extra_composite_entries", ()),
             ),
         }
     return samples
@@ -5763,7 +5778,7 @@ async def maybe_schedule_cpu_turn(room: Room) -> None:
 
 
 async def choose_room_cpu_action(room: Room, cpu: CpuPlayer):
-    if cpu.cpu_key not in {"upper_diamond_planner", "special_diamond_planner"}:
+    if cpu.cpu_key not in MASTER_PLANNING_CPU_KEYS:
         return choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
 
     from copy import copy, deepcopy
