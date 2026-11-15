@@ -94,13 +94,15 @@ def decision_snapshot(cpu):
     return saved, rng_state
 
 
-def choose_combined(cpu, room, diamond_choice):
+def choose_combined(cpu, room, diamond_choice, *, selector=None):
     """Default production budget; master_timing_config=None opts into research."""
     from .move_safety import naturalize_action
+    if selector is None:
+        selector = _choose_combined
     config = getattr(cpu, 'master_timing_config', TimingConfig())
     cpu.master_budget_trace = None
     if config is None:
-        return naturalize_action(cpu, _choose_combined(cpu, room, diamond_choice))
+        return naturalize_action(cpu, selector(cpu, room, diamond_choice))
     budget = Budget(time.perf_counter(), config)
     saved, rng_state = decision_snapshot(cpu)
     token = CURRENT.set(budget)
@@ -136,7 +138,7 @@ def choose_combined(cpu, room, diamond_choice):
 
     try:
         try:
-            action = _choose_combined(cpu, room, fallback)
+            action = selector(cpu, room, fallback)
         except MasterDeadline:
             budget.expired = True
             clear_interrupted_plan(cpu)

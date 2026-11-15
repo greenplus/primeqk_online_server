@@ -12,7 +12,7 @@ from itertools import combinations
 import cpu_player as diamond
 from .master_budget import check
 from .opening_master import CAPACITY, ZERO, Move, Template, _realizations, bind_move, counts, hand_counts, physically_possible, subtract
-from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
+from .master_alpha import ALPHA_POLICY_KEYS, TRUMP_VALUES, trump_replies
 from .post_all_out_master import knowledge_key
 from .revolution_master import catalog
 from .after_all_out_planner import public_room, next_known
@@ -134,7 +134,7 @@ class ControlSearch:
         self.hand = hand_counts(cpu.hand)
         self.reverse = bool(room.reverse_order)
         self.alpha_replies = (trump_replies(*knowledge_key(cpu, room))
-                              if not self.reverse and getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY
+                              if not self.reverse and getattr(cpu, 'cpu_key', None) in ALPHA_POLICY_KEYS
                               else None)
         self.nodes = 0
         self.failed = set()

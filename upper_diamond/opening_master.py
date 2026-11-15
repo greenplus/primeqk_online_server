@@ -18,7 +18,7 @@ import cpu_player as diamond
 from .master_budget import check as check_master_budget
 from .move_safety import special_exposed, uses_spare_natural
 from registered_primes import registered_value_encodings
-from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
+from .master_alpha import ALPHA_POLICY_KEYS, TRUMP_VALUES, trump_replies
 
 ROOT = Path(__file__).resolve().parent / "data"
 TABLE = ROOT / "pure_trump_return_probabilities.csv"
@@ -317,7 +317,7 @@ class Evaluator:
                      tuple(cpu.registered_composite_entries), room.rule.allow_composite)
         self.catalog = templates(*knowledge)
         self.alpha_replies = (trump_replies(*knowledge)
-                              if getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY else None)
+                              if getattr(cpu, 'cpu_key', None) in ALPHA_POLICY_KEYS else None)
         self.responses = response_signatures(self.catalog)
         self.cache = {}
         self.evaluation_cache = {}

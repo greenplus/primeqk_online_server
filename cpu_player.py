@@ -21,7 +21,9 @@ from registered_primes import (
 )
 from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from rules import PrimeRule
-from upper_diamond.master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, KKQJ_ENTRY
+from upper_diamond.master_alpha import (
+    ALPHA_POLICY_KEYS, CPU_KEY as MASTER_ALPHA_CPU_KEY, EPSILON_CPU_KEY as MASTER_EPSILON_CPU_KEY, KKQJ_ENTRY,
+)
 
 
 Card = dict
@@ -94,7 +96,9 @@ DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "hand-advantage-lead",
     "hand-advantage-interference",
 })
-MASTER_PLANNING_CPU_KEYS = frozenset({"upper_diamond_planner", "special_diamond_planner", MASTER_ALPHA_CPU_KEY})
+MASTER_PLANNING_CPU_KEYS = frozenset({
+    "upper_diamond_planner", "special_diamond_planner", MASTER_ALPHA_CPU_KEY, MASTER_EPSILON_CPU_KEY,
+})
 DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner"}) | MASTER_PLANNING_CPU_KEYS
 ADVANCED_PLANNING_CPU_KEYS = DIAMOND_PLANNING_CPU_KEYS | {"platinum_planner"}
 PLATINUM_OPENING_MULTI_PLAY_MIN_CARDS = 9
@@ -1612,7 +1616,7 @@ def choose_diamond_planning_cpu_action(
     revolution = diamond_1729_revolution_candidate(cpu, room)
     if (
         revolution is not None
-        and not diamond_has_current_certain_trump(cpu, room)
+        and not diamond_revolution_blocked_by_certain(cpu, room)
         and diamond_lead_candidate_avoids_opponent_finish(
             revolution,
             cpu,
@@ -2026,9 +2030,33 @@ def diamond_1729_revolution_candidate(cpu: CpuPlayer, room) -> Optional[dict]:
         return None
     if getattr(getattr(room, "rule", None), "special_numbers_composite_only", False):
         return None
-    if not diamond_has_aaax(cpu):
+    has_aaxx = (
+        getattr(cpu, "cpu_key", None) == MASTER_EPSILON_CPU_KEY
+        and sum(is_joker(card) for card in cpu.hand) >= 2
+        and sum(not is_joker(card) and int(card.get("rank", 0)) == 1 for card in cpu.hand) >= 2
+    )
+    if not (diamond_has_aaax(cpu) or has_aaxx):
         return None
     return diamond_exact_1729_candidate(cpu)
+
+
+def diamond_revolution_blocked_by_certain(cpu: CpuPlayer, room) -> bool:
+    if getattr(cpu, "cpu_key", None) != MASTER_EPSILON_CPU_KEY:
+        return diamond_has_current_certain_trump(cpu, room)
+
+    held_kx = sum(is_joker(card) or int(card.get("rank", 0)) == 13 for card in cpu.hand)
+    if held_kx > 2:
+        return diamond_has_current_certain_trump(cpu, room)
+
+    known = getattr(room, "public_known_deck_bottom", ()) or ()
+    unknown_kx, _, unknown_count = platinum_unaccounted_kx_distribution(cpu, room)
+    # A draw before the all-out increases both cards drawn and the penalty by one.
+    reach = min(len(room.deck), len(cpu.hand) + (0 if room.has_drawn else 2))
+    can_gain_kx = (reach > 0 and unknown_count > 0 and unknown_kx > 0) or any(
+        is_joker(card) or int(card.get("rank", 0)) == 13
+        for card in known[:max(0, reach - unknown_count)]
+    )
+    return diamond_has_current_certain_trump(cpu, room, ignore_kk=not can_gain_kx)
 
 
 def diamond_opponent_kjqj_probability(cpu: CpuPlayer, room) -> float:
@@ -3303,7 +3331,7 @@ def diamond_counter_return_probability(
     if not diamond_four_candidate_uses_fixed_counter_catalog(candidate):
         return 0.0
     catalog = DIAMOND_FOUR_COUNTER_TOKENS
-    if getattr(cpu, "cpu_key", None) == MASTER_ALPHA_CPU_KEY:
+    if getattr(cpu, "cpu_key", None) in ALPHA_POLICY_KEYS:
         catalog += (KKQJ_ENTRY.pattern,)
     counter_tokens = tuple(
         counter for counter in catalog
@@ -6066,7 +6094,7 @@ def diamond_plan_sort_key(plan: dict, cpu: CpuPlayer, room) -> tuple:
     )
 
 
-def diamond_has_current_certain_trump(cpu: CpuPlayer, room) -> bool:
+def diamond_has_current_certain_trump(cpu: CpuPlayer, room, *, ignore_kk: bool = False) -> bool:
     empty_room = room_without_field(room)
     candidates = knowledge_prime_candidates(
         cpu,
@@ -6078,6 +6106,7 @@ def diamond_has_current_certain_trump(cpu: CpuPlayer, room) -> bool:
     return any(
         diamond_candidate_is_certain_fast(candidate, cpu, room)
         for candidate in candidates
+        if not ignore_kk or platinum_candidate_token(candidate) != "kk"
     )
 
 
@@ -9723,6 +9752,11 @@ def choose_special_diamond_cpu_action(cpu, room, validator=None):
     return _choose_master_cpu_action(cpu, room, validator, choose_combined)
 
 
+def choose_master_epsilon_cpu_action(cpu, room, validator=None):
+    from upper_diamond.master_epsilon import choose_epsilon
+    return _choose_master_cpu_action(cpu, room, validator, choose_epsilon)
+
+
 def _choose_master_cpu_action(cpu, room, validator, choose_combined):
     from copy import copy
 
@@ -9744,13 +9778,35 @@ CPU_PROFILES = {
     "basic": CpuProfile(
         key="basic",
         label="汎用テストCPU",
-        description="弱めですが、通常・四つ子・半素数・登録制限の各ルールで最低限の動作確認に使えるCPUです。",
+        description="通常・四つ子・半素数・登録制限など、各ルールの動作確認に使えるCPUです。一覧は下に行くほど強くなるので、手ごたえのある対戦をしたいときは下のCPUを選んでください。",
         knowledge=CpuKnowledgeSpec(source="sample", load_timing="registration"),
+    ),
+    "silver_planner": CpuProfile(
+        key="silver_planner",
+        label="シルバーCPU",
+        description="シルバー素数表を使い、浅いラリー戦術と偶数消費を優先するCPUです。",
+        rule_keys=(
+            "std-5-1",
+            "std-7-1",
+            "std-11-f",
+            "std-11-f-c",
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+            "half-7-1-c-assist",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="silver_prime_table",
+        ),
+        action_selector=choose_silver_planning_cpu_action,
     ),
     "gold_planner": CpuProfile(
         key="gold_planner",
         label="ゴールドCPU",
-        description="GOLD素数表だけを基本知識として参照し、切り札を温存しながら枚数別に候補を探す試作CPUです。",
+        description="ゴールド素数表を使うCPUです。切り札を温存しながら、枚数ごとにラリーから上がりまでの手順を探します。",
         rule_keys=(
             "std-5-1",
             "std-7-1",
@@ -9765,10 +9821,31 @@ CPU_PROFILES = {
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
     ),
+    "talkative_fish": CpuProfile(
+        key="talkative_fish",
+        label="饒舌な魚CPU",
+        description="シルバー素数表に343入り素数を足し、刺身チャンスを優先するジョークCPUです。",
+        rule_keys=(
+            "std-5-1",
+            "std-7-1",
+            "std-11-f",
+            "std-11-f-c",
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="fish_silver",
+            load_timing="always",
+            sample_key="silver_prime_table",
+        ),
+        action_selector=choose_talkative_fish_cpu_action,
+    ),
     "platinum_planner": CpuProfile(
         key="platinum_planner",
         label="プラチナCPU",
-        description="プラチナ素数表と5手探索を使い、弱い手札の全出し・既知山札の回収・絶対的切り札への切替を行うCPUです。",
+        description="プラチナ素数表を使うCPUです。これ以上の強さのCPUは、積極的に全出しや合成数カマトトを試み、手札を強くすることがあります。",
         rule_keys=(
             "std-11-n-c",
             "std-11-n-no-c",
@@ -9819,7 +9896,7 @@ CPU_PROFILES = {
     "special_diamond_planner": CpuProfile(
         key="special_diamond_planner",
         label="特ダイヤCPU",
-        description="上ダイヤCPUよりも強く、相手の手札が弱くなったときに連続出札で勝ち切る力を高めたCPUです。",
+        description="ダイヤ素数表を使うCPUです。上ダイヤCPUより強く、場に出た札や相手の残り枚数をもとに、返されにくい手を連ねて上がりを狙います。",
         rule_keys=("std-11-n-c",),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",
@@ -9831,7 +9908,7 @@ CPU_PROFILES = {
     MASTER_ALPHA_CPU_KEY: CpuProfile(
         key=MASTER_ALPHA_CPU_KEY,
         label="マスターCPU-α",
-        description="マスター素数表と専用の切り札表を使う、特ダイヤCPUと同じ探索方式のCPUです。",
+        description="マスター素数表を使うCPUです。特ダイヤCPUと同じ方法の探索で、より多くの知識を用いて組み切りを狙います。",
         rule_keys=("std-11-n-c",),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",
@@ -9840,48 +9917,17 @@ CPU_PROFILES = {
         ),
         action_selector=choose_special_diamond_cpu_action,
     ),
-    "silver_planner": CpuProfile(
-        key="silver_planner",
-        label="シルバーCPU",
-        description="シルバー素数表を使い、浅いラリー戦術と偶数消費を優先するCPUです。",
-        rule_keys=(
-            "std-5-1",
-            "std-7-1",
-            "std-11-f",
-            "std-11-f-c",
-            "std-11-n-c",
-            "std-11-n-no-c",
-            "registered-11-n-assist",
-            "neo-assist-11-n-unlimited",
-            "half-7-1-c-assist",
-        ),
+    MASTER_EPSILON_CPU_KEY: CpuProfile(
+        key=MASTER_EPSILON_CPU_KEY,
+        label="マスターCPU-ε",
+        description="マスター素数表εを使うCPUです。マスターCPU-αと比べて、革命を起こす基準や革命中の切り札の使い方、AやXの温存などが改善しています。",
+        rule_keys=("std-11-n-c",),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",
             load_timing="always",
-            sample_key="silver_prime_table",
+            sample_key="master_epsilon_prime_table",
         ),
-        action_selector=choose_silver_planning_cpu_action,
-    ),
-    "talkative_fish": CpuProfile(
-        key="talkative_fish",
-        label="饒舌な魚CPU",
-        description="シルバー素数表に343入り素数を足し、刺身チャンスを優先するジョークCPUです。",
-        rule_keys=(
-            "std-5-1",
-            "std-7-1",
-            "std-11-f",
-            "std-11-f-c",
-            "std-11-n-c",
-            "std-11-n-no-c",
-            "registered-11-n-assist",
-            "neo-assist-11-n-unlimited",
-        ),
-        knowledge=CpuKnowledgeSpec(
-            source="fish_silver",
-            load_timing="always",
-            sample_key="silver_prime_table",
-        ),
-        action_selector=choose_talkative_fish_cpu_action,
+        action_selector=choose_master_epsilon_cpu_action,
     ),
     "composite_practice": CpuProfile(
         key="composite_practice",

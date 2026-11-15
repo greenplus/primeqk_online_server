@@ -15,7 +15,7 @@ import time
 
 import cpu_player as diamond
 from .master_budget import SearchLimit, check as check_master_budget
-from .master_alpha import CPU_KEY as MASTER_ALPHA_CPU_KEY, TRUMP_VALUES, trump_replies
+from .master_alpha import ALPHA_POLICY_KEYS, TRUMP_VALUES, trump_replies
 from .move_safety import special_exposed, uses_spare_natural, natural_sequence
 from registered_primes import registered_value_encodings
 from .opening_master import (CAPACITY, ZERO, LABELS, Move, Plan, Template,
@@ -140,7 +140,7 @@ class Solver:
         self.listed = {(len(token_ranks(t)), int(''.join(map(str, token_ranks(t)))))
                        for t in self.policy['trumps']}
         self.alpha_replies = None
-        if getattr(cpu, 'cpu_key', None) == MASTER_ALPHA_CPU_KEY and not room.reverse_order:
+        if getattr(cpu, 'cpu_key', None) in ALPHA_POLICY_KEYS and not room.reverse_order:
             self.listed = TRUMP_VALUES
             self.alpha_replies = trump_replies(*self.knowledge)
         self.responses = defaultdict(list)

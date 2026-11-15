@@ -94,6 +94,7 @@ NEO_BEGINNER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "neo_beginner_prime_table_memory
 PLATINUM_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "platinum_prime_table_memory.json"
 DIAMOND_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "diamond_prime_table_memory.json"
 MASTER_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "master_prime_table_memory.json"
+MASTER_EPSILON_PRIME_TABLE_JSON = KNOWLEDGE_DIR / "master_epsilon_prime_table_memory.json"
 COMPOSITE_PRACTICE_COUNTERMEASURES_JSON = (
     KNOWLEDGE_DIR / "composite_practice_countermeasures_v1.json"
 )
@@ -3946,6 +3947,13 @@ REGISTERED_SAMPLE_DEFS = {
     "master_prime_table": {
         "label": "マスター素数表",
         "prime_json": MASTER_PRIME_TABLE_JSON,
+        "composite_text": None,
+        "extra_composite_entries": (KKQJ_ENTRY,),
+        "visible": False,
+    },
+    "master_epsilon_prime_table": {
+        "label": "マスター素数表ε",
+        "prime_json": MASTER_EPSILON_PRIME_TABLE_JSON,
         "composite_text": None,
         "extra_composite_entries": (KKQJ_ENTRY,),
         "visible": False,
