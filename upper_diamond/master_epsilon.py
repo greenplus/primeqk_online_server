@@ -800,12 +800,17 @@ def select(cpu, room, _fallback):
 
 
 def choose_epsilon(cpu, room, diamond_choice):
+    if cpu.cpu_key == diamond.MASTER_KAPPA_CPU_KEY:
+        cpu.master_kappa_recovery_trace = []
     if not room.reverse_order:
         cpu.master_epsilon_rally = None
         cpu.master_epsilon_recovery = None
         cpu.master_epsilon_generalized = None
         return master_combined.choose_combined(cpu, room, diamond_choice)
 
+    if cpu.cpu_key == diamond.MASTER_KAPPA_CPU_KEY:
+        cpu.master_kappa_comeback = None
+        cpu.master_kappa_recovery = None
     cpu.master_epsilon_deadline_move = None
 
     def on_deadline(player, state):

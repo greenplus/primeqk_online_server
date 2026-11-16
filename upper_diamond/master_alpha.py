@@ -11,7 +11,9 @@ from registered_primes import (
 
 CPU_KEY = "master_alpha_planner"
 EPSILON_CPU_KEY = "master_epsilon_planner"
-ALPHA_POLICY_KEYS = frozenset((CPU_KEY, EPSILON_CPU_KEY))
+KAPPA_CPU_KEY = "master_kappa_planner"
+EPSILON_POLICY_KEYS = frozenset((EPSILON_CPU_KEY, KAPPA_CPU_KEY))
+ALPHA_POLICY_KEYS = frozenset((CPU_KEY, *EPSILON_POLICY_KEYS))
 
 TRUMP_TOKENS = (
     "kkk kkq kkj "

@@ -271,7 +271,7 @@ def commit_hnp(cpu, room, plan, audit):
     return diamond.platinum_commit_play(cpu, diamond.candidate_to_action(candidate))
 
 
-def choose_after_all_out(cpu, room, fallback, config):
+def choose_after_all_out(cpu, room, fallback, config, *, before_fallback=None):
     cpu.post_all_out_master_trace = None
     action = continue_plan(cpu, room)
     if action is not None:
@@ -299,6 +299,10 @@ def choose_after_all_out(cpu, room, fallback, config):
         and (len(cpu.hand) in config.hand_sizes or phase is not None)
         and getattr(cpu, 'platinum_all_out_attempts', 0) > 0)
     if not eligible:
+        if before_fallback is not None:
+            action = before_fallback(cpu, room)
+            if action is not None:
+                return action
         return fallback(cpu, room)
     current_config = replace(config, hand_sizes=(len(cpu.hand),))
     base, owner, best, trace = evaluate_current_state(cpu, room, current_config)
@@ -359,6 +363,10 @@ def choose_after_all_out(cpu, room, fallback, config):
         trace['reason'] = 'PRE_HNP_FOUND'
         trace['planner'] = deepcopy(phase['log'])
         return commit_hnp(cpu, room, hnp, audit)
+    if before_fallback is not None:
+        action = before_fallback(cpu, room)
+        if action is not None:
+            return action
     started = time.perf_counter()
     # A rejected known series must not be drawn anyway by the fallback.
     fallback_room = copy(room) if config.draw_57 else room

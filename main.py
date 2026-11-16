@@ -477,6 +477,7 @@ class Room:
         self.last_play_player_id = None
         self.last_play_hand_before = None
         self.last_play_kind = None
+        self.last_play_materials = ()
         self.current_turn_id = None
         self.turn_order_ids = []
         self.passed_player_ids = set()
@@ -3806,6 +3807,7 @@ def flow_field(room: Room) -> None:
     room.last_play_player_id = None
     room.last_play_hand_before = None
     room.last_play_kind = None
+    room.last_play_materials = ()
     if room.reserve:
         ensure_public_deck_tracker(room)
         room.public_known_deck_bottom.extend(room.reserve)
@@ -3827,12 +3829,14 @@ def record_field_play(
     hand_before: int,
     *,
     play_kind: str,
+    materials=(),
 ) -> None:
     """Remember the public hand count from immediately before the current play."""
     room.last_play_player_id = player.id
     room.passed_player_ids = set()
     room.last_play_hand_before = int(hand_before)
     room.last_play_kind = play_kind
+    room.last_play_materials = tuple(materials)
 
 def record_failed_cpu_plan(player, room, consumed_cards) -> None:
     """Record adjudicated, public failures before adding penalty cards."""
@@ -5815,6 +5819,7 @@ async def choose_room_cpu_action(room: Room, cpu: CpuPlayer):
         last_number=room.last_number, reverse_order=room.reverse_order,
         last_play_hand_before=room.last_play_hand_before,
         last_play_kind=room.last_play_kind, last_play_player_id=room.last_play_player_id,
+        last_play_materials=deepcopy(room.last_play_materials),
         opening_all_out_failed=room.opening_all_out_failed,
         revolution_recovery_context=deepcopy(getattr(room, 'revolution_recovery_context', None)),
     )
@@ -7694,7 +7699,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         room.reverse_order = not room.reverse_order
         from upper_diamond.revolution_context import note_revolution
         note_revolution(room, sel_cards)
-        record_field_play(room, player, hand_before, play_kind="composite")
+        record_field_play(room, player, hand_before, play_kind="composite", materials=con_only)
         room.field = sel_cards
         room.last_number = sel_number
         await room.update_game_state()
@@ -7714,12 +7719,12 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 
     # 7) すべてOK → 札を「出した順」でreserveに積む → 手札から除去
     #    出した順は UI から渡す順序（selected→consume）で良ければそのまま。必要なら tokens から順序を決める。
-    record_field_play(room, player, len(player.hand), play_kind="composite")
     push_to_reserve(room, sel_cards)
 
     # selected と重複するカードは deck に戻さない
     sel_ids = {c["card_id"] for c in sel_cards}
     con_only = [c for c in con_cards if c["card_id"] not in sel_ids]
+    record_field_play(room, player, len(player.hand), play_kind="composite", materials=con_only)
     return_cards_to_deck_bottom(room, con_only)
 
 
@@ -7914,6 +7919,7 @@ async def start_game(
     room.last_play_player_id = None
     room.last_play_hand_before = None
     room.last_play_kind = None
+    room.last_play_materials = ()
     room.score_log = []
     score_players = sorted(waiting_players, key=lambda player: player.id != first_player_id)
     for player in score_players:

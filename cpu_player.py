@@ -22,7 +22,12 @@ from registered_primes import (
 from hnp_challenge import build_hnp_tokens, choose_hnp_permutation
 from rules import PrimeRule
 from upper_diamond.master_alpha import (
-    ALPHA_POLICY_KEYS, CPU_KEY as MASTER_ALPHA_CPU_KEY, EPSILON_CPU_KEY as MASTER_EPSILON_CPU_KEY, KKQJ_ENTRY,
+    ALPHA_POLICY_KEYS,
+    CPU_KEY as MASTER_ALPHA_CPU_KEY,
+    EPSILON_CPU_KEY as MASTER_EPSILON_CPU_KEY,
+    EPSILON_POLICY_KEYS,
+    KAPPA_CPU_KEY as MASTER_KAPPA_CPU_KEY,
+    KKQJ_ENTRY,
 )
 
 
@@ -97,7 +102,7 @@ DIAMOND_POST_ALL_OUT_CONTEXTS = frozenset({
     "hand-advantage-interference",
 })
 MASTER_PLANNING_CPU_KEYS = frozenset({
-    "upper_diamond_planner", "special_diamond_planner", MASTER_ALPHA_CPU_KEY, MASTER_EPSILON_CPU_KEY,
+    "upper_diamond_planner", "special_diamond_planner", *ALPHA_POLICY_KEYS,
 })
 DIAMOND_PLANNING_CPU_KEYS = frozenset({"diamond_planner"}) | MASTER_PLANNING_CPU_KEYS
 ADVANCED_PLANNING_CPU_KEYS = DIAMOND_PLANNING_CPU_KEYS | {"platinum_planner"}
@@ -408,6 +413,8 @@ def is_cpu_player(player) -> bool:
 
 
 def reset_cpu_game_state(cpu: CpuPlayer, initial_hand_size: Optional[int] = None) -> None:
+    cpu.master_kappa_comeback = None
+    cpu.master_kappa_recovery = None
     """Reset per-game planner state while preserving the CPU's learned knowledge."""
     # Master evaluators and committed branches contain the previous game's hand
     # and public context. Keep configuration, but never reuse them in a rematch.
@@ -1613,20 +1620,9 @@ def choose_diamond_planning_cpu_action(
     if contextual is not None:
         return contextual
 
-    revolution = diamond_1729_revolution_candidate(cpu, room)
-    if (
-        revolution is not None
-        and not diamond_revolution_blocked_by_certain(cpu, room)
-        and diamond_lead_candidate_avoids_opponent_finish(
-            revolution,
-            cpu,
-            room,
-        )
-    ):
-        clear_gold_active_plan(cpu)
-        cpu.diamond_revolution_strategy_active = True
-        action = platinum_commit_play(cpu, candidate_to_action(revolution))
-        return diamond_record_action(cpu, action, room, "revolution-1729", revolution)
+    revolution = diamond_choose_normal_revolution(cpu, room)
+    if revolution is not None:
+        return revolution
 
     action = choose_platinum_planning_cpu_action(cpu, room, validator)
     avoided_opponent_finish_count = False
@@ -2031,7 +2027,7 @@ def diamond_1729_revolution_candidate(cpu: CpuPlayer, room) -> Optional[dict]:
     if getattr(getattr(room, "rule", None), "special_numbers_composite_only", False):
         return None
     has_aaxx = (
-        getattr(cpu, "cpu_key", None) == MASTER_EPSILON_CPU_KEY
+        getattr(cpu, "cpu_key", None) in EPSILON_POLICY_KEYS
         and sum(is_joker(card) for card in cpu.hand) >= 2
         and sum(not is_joker(card) and int(card.get("rank", 0)) == 1 for card in cpu.hand) >= 2
     )
@@ -2041,7 +2037,7 @@ def diamond_1729_revolution_candidate(cpu: CpuPlayer, room) -> Optional[dict]:
 
 
 def diamond_revolution_blocked_by_certain(cpu: CpuPlayer, room) -> bool:
-    if getattr(cpu, "cpu_key", None) != MASTER_EPSILON_CPU_KEY:
+    if getattr(cpu, "cpu_key", None) not in EPSILON_POLICY_KEYS:
         return diamond_has_current_certain_trump(cpu, room)
 
     held_kx = sum(is_joker(card) or int(card.get("rank", 0)) == 13 for card in cpu.hand)
@@ -2057,6 +2053,17 @@ def diamond_revolution_blocked_by_certain(cpu: CpuPlayer, room) -> bool:
         for card in known[:max(0, reach - unknown_count)]
     )
     return diamond_has_current_certain_trump(cpu, room, ignore_kk=not can_gain_kx)
+
+
+def diamond_choose_normal_revolution(cpu, room, route="revolution-1729"):
+    candidate = diamond_1729_revolution_candidate(cpu, room)
+    if (candidate is None or diamond_revolution_blocked_by_certain(cpu, room)
+            or not diamond_lead_candidate_avoids_opponent_finish(candidate, cpu, room)):
+        return None
+    clear_gold_active_plan(cpu)
+    cpu.diamond_revolution_strategy_active = True
+    action = platinum_commit_play(cpu, candidate_to_action(candidate))
+    return diamond_record_action(cpu, action, room, route, candidate)
 
 
 def diamond_opponent_kjqj_probability(cpu: CpuPlayer, room) -> float:
@@ -5768,6 +5775,16 @@ def choose_diamond_context_action(
     )
     tier = diamond_post_all_out_plan_tier(best, cpu, room)
 
+    switched_count = False
+    if cpu.cpu_key == MASTER_KAPPA_CPU_KEY and not room.reverse_order and not has_field:
+        from upper_diamond.master_kappa import choose_rally_switch
+
+        replacement = choose_rally_switch(best, tier, eligible, cpu, room)
+        if replacement is not None:
+            best = replacement
+            tier = diamond_post_all_out_plan_tier(best, cpu, room)
+            switched_count = True
+
     # A current certain/strong complete response takes precedence over drawing
     # for a possible four-card overtrump.  This preserves the turn when the
     # opponent is already close to finishing.
@@ -5822,7 +5839,7 @@ def choose_diamond_context_action(
         cpu,
         action,
         room,
-        f"post-all-out-tier-{tier}",
+        "master-kappa-rally-switch" if switched_count else f"post-all-out-tier-{tier}",
     )
     cpu.diamond_last_certainty = diamond_post_all_out_plan_certainty(
         best,
@@ -6832,11 +6849,12 @@ def platinum_deck_has_expected_trump_contribution(cpu: CpuPlayer, room) -> bool:
     )
 
 
-def platinum_interference_danger_active(cpu: CpuPlayer, room) -> bool:
+def platinum_interference_danger_active(cpu: CpuPlayer, room, *, rally_threat=None) -> bool:
     """Whether the opponent's finish risk calls for interference over all-out."""
     if (
         getattr(cpu, "cpu_key", "") in DIAMOND_PLANNING_CPU_KEYS
-        and getattr(cpu, "diamond_opponent_rally_threat", "none")
+        and (rally_threat if rally_threat is not None else
+             getattr(cpu, "diamond_opponent_rally_threat", "none"))
         == "certain-likely"
     ):
         return True
@@ -9921,6 +9939,18 @@ CPU_PROFILES = {
         key=MASTER_EPSILON_CPU_KEY,
         label="マスターCPU-ε",
         description="マスター素数表εを使うCPUです。マスターCPU-αと比べて、革命を起こす基準や革命中の切り札の使い方、AやXの温存などが改善しています。",
+        rule_keys=("std-11-n-c",),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="master_epsilon_prime_table",
+        ),
+        action_selector=choose_master_epsilon_cpu_action,
+    ),
+    MASTER_KAPPA_CPU_KEY: CpuProfile(
+        key=MASTER_KAPPA_CPU_KEY,
+        label="マスターCPU-κ",
+        description="マスター素数表εを使う試験版CPUです。山札からの札の回収と、不利な手札から逆転を狙う立ち回りを改善しています。",
         rule_keys=("std-11-n-c",),
         knowledge=CpuKnowledgeSpec(
             source="sample_key",

@@ -13,12 +13,17 @@ def _choose_previous(cpu, room, diamond_choice):
     cpu.opening_master_trace = None
     cpu.post_all_out_master_trace = None
     cpu.second_opening_master_trace = None
+    before_fallback = None
+    if cpu.cpu_key == diamond.MASTER_KAPPA_CPU_KEY:
+        from .kappa_recovery import choose_before_diamond
+        before_fallback = choose_before_diamond
 
     def after_opening(player, state):
         def after_second(subject, public):
             return choose_post_all_out(subject, public, diamond_choice,
                                        getattr(subject, 'post_all_out_master_config',
-                                               MateConfig(max_nodes=None, double_max_nodes=None)))
+                                               MateConfig(max_nodes=None, double_max_nodes=None)),
+                                       before_fallback=before_fallback)
         return choose_second_opening(player, state, after_second)
 
     # choose_opening already restricts initial searches to the first player.
@@ -61,6 +66,14 @@ def _choose_combined(cpu, room, diamond_choice):
                 and diamond.candidate_is_playable(steps[0], cpu, room)):
             return _choose_previous(cpu, room, diamond_choice)
     action = choose_public_control(cpu, room)
+    if cpu.cpu_key == diamond.MASTER_KAPPA_CPU_KEY:
+        if action is not None:
+            cpu.master_kappa_recovery = None
+            cpu.master_kappa_comeback = None
+        else:
+            from .kappa_recovery import continue_recovery
+            from .kappa_comeback import continue_plan as continue_comeback
+            action = continue_recovery(cpu, room) or continue_comeback(cpu, room)
     return action if action is not None else _choose_previous(cpu, room, diamond_choice)
 
 
@@ -73,6 +86,8 @@ def clear_interrupted_plan(cpu):
     cpu.revolution_master_recovery = None
     cpu.master_public_control_active = None
     cpu.master_public_control_draw_finish = None
+    cpu.master_kappa_comeback = None
+    cpu.master_kappa_recovery = None
     # An interrupted evaluator may have partial diagnostic state, but is never
     # allowed to publish it as a complete cached decision on the next turn.
     cpu.opening_master_evaluator = None

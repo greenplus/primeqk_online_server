@@ -636,6 +636,6 @@ def commit_current_plan(cpu, room, owner, best):
     return play_next(cpu, room, active, best.steps)
 
 
-def choose_post_all_out(cpu, room, fallback, config=Config()):
+def choose_post_all_out(cpu, room, fallback, config=Config(), *, before_fallback=None):
     from .after_all_out_planner import choose_after_all_out
-    return choose_after_all_out(cpu, room, fallback, config)
+    return choose_after_all_out(cpu, room, fallback, config, before_fallback=before_fallback)
